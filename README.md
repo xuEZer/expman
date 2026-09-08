@@ -2,7 +2,7 @@
 
 用可组合的 `Pipeline` 和 `Stage` 组织实验流程，并统一记录阶段耗时、执行状态、指标和进度。
 
-开发版本：**0.1.0**（尚未发布）。Python ≥ 3.10，运行时仅依赖标准库。
+开发版本：**0.1.0**（尚未发布）。Python ≥ 3.10；执行核心使用标准库，YAML 配置加载使用 PyYAML。
 
 ## 安装与运行
 
@@ -13,6 +13,7 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
 python examples/basic_pipeline.py
+python examples/load_experiments.py
 ```
 
 使用 uv 时，可以通过 `uv venv` 创建环境，再执行 `uv pip install -e .`。
@@ -58,6 +59,47 @@ for event in recorder.events:
 - 默认记录器将事件保存在内存。长实验可实现 `Recorder.record(event)`，将事件写入文件或数据库。记录器的普通异常会通过 Python logging 报告，业务执行继续。
 
 耗时采用单调时钟，表示主机端经过时间。执行期间的内部上报和子阶段监测开销包含在内；GPU 异步计算的精确计时需要用户在业务代码中建立同步边界。
+
+## 配置实验集合
+
+使用 YAML 自由定义配置字段，`!choice` 表示候选值，普通列表保留为完整的参数值：
+
+```yaml
+# experiment.yaml
+seed: !choice [0, 1, 2]
+models:
+  forecasting:
+    name: patchtst
+    patch_len: !choice [8, 16]
+    hidden_sizes: [128, 64, 32]
+```
+
+`name` 触发默认参数查找。例如上述节点会加载实验 YAML 所在目录下的 `configs/models/forecasting/patchtst.yaml`：
+
+```yaml
+patch_len: 32
+d_model: 128
+```
+
+```python
+from expman import load_configs
+
+configs = load_configs("experiment.yaml")
+assert len(configs) == 6
+assert configs[0]["models"]["forecasting"]["patch_len"] == 8
+assert configs[0]["models"]["forecasting"]["d_model"] == 128
+```
+
+每个字典表示一次具体运行，用户可以据此构建各自的 Pipeline。没有 `!choice` 时返回只含一个字典的列表。
+
+- 独立候选按笛卡尔积展开，顺序遵循 YAML 字段和候选值的书写顺序。候选内部的选择只参与该分支的展开。
+- 先展开实验配置，再查找默认文件；参数与 `name` 并列。字典递归合并，实验配置优先；列表整体替换，显式 `null` 覆盖默认值。
+- 默认文件只允许固定参数，出现 `!choice` 会抛出 `ConfigError`。解析错误、重复键、非映射顶层也会报错，并包含来源文件。
+- 缺失默认文件发出 `MissingConfigWarning` 并保留显式参数继续；同一次加载对同一路径只警告一次。
+- `name` 在所有层次都是查找约定字段，默认参数中新增的嵌套 `name` 也会按最终层次解析。列表中的节点使用字段层次查找，列表索引不加入目录路径。
+- 各个 Run 的字典及嵌套对象互相独立。函数一次性生成全部配置，参数组合很多时需留意内存占用。
+
+完整的双模型配置见 [examples/experiment.yaml](examples/experiment.yaml)，加载示例见 [examples/load_experiments.py](examples/load_experiments.py)。
 
 ## 开发
 

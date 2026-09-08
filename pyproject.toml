@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Composable experiment pipelines with execution monitoring"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["PyYAML>=6.0,<7"]
 
 [project.optional-dependencies]
 dev = ["pre-commit==4.6.2", "ruff==0.16.6"]

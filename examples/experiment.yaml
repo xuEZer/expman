@@ -1,0 +1,10 @@
+seed: !choice [0, 1]
+
+models:
+  imputation: !choice
+    - name: saits
+      hidden_size: 128
+    - name: brits
+  forecasting:
+    name: patchtst
+    patch_len: !choice [8, 16]

@@ -1,0 +1,299 @@
+import tempfile
+import unittest
+import warnings
+from pathlib import Path
+
+from expman import ConfigError, MissingConfigWarning, load_configs
+
+
+class ConfigTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.experiment = self.root / "experiment.yaml"
+
+    def write(self, name, content):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def load(self, content):
+        self.write("experiment.yaml", content)
+        return load_configs(self.experiment)
+
+    def test_plain_config_and_lists_produce_one_run(self):
+        self.assertEqual(
+            self.load("seed: 42\nhidden_sizes: [128, 64, 32]\noptional: null\n"),
+            [{"seed": 42, "hidden_sizes": [128, 64, 32], "optional": None}],
+        )
+        self.assertEqual(self.load("{}"), [{}])
+
+    def test_independent_choices_have_stable_product_order(self):
+        runs = self.load("seed: !choice [0, 1]\ntrain:\n  lr: !choice [0.1, 0.2]\n")
+        self.assertEqual(
+            [(run["seed"], run["train"]["lr"]) for run in runs],
+            [(0, 0.1), (0, 0.2), (1, 0.1), (1, 0.2)],
+        )
+
+    def test_nested_choices_only_expand_selected_branch(self):
+        runs = self.load("""
+seed: !choice [0, 1]
+model: !choice
+  - kind: saits
+    lr: !choice [0.001, 0.0001]
+  - kind: brits
+""")
+        self.assertEqual(len(runs), 6)
+        self.assertEqual(
+            [run["model"] for run in runs[:3]],
+            [
+                {"kind": "saits", "lr": 0.001},
+                {"kind": "saits", "lr": 0.0001},
+                {"kind": "brits"},
+            ],
+        )
+
+    def test_choices_can_contain_lists_and_null(self):
+        self.assertEqual(
+            self.load("widths: !choice [[128, 64], [32], null]"),
+            [{"widths": [128, 64]}, {"widths": [32]}, {"widths": None}],
+        )
+        self.assertEqual(
+            self.load("items: [fixed, !choice [a, b]]"),
+            [{"items": ["fixed", "a"]}, {"items": ["fixed", "b"]}],
+        )
+
+    def test_two_model_roles_load_after_selection_without_parameter_leaks(self):
+        self.write(
+            "configs/models/imputation/saits.yaml", "width: 64\nonly_saits: true"
+        )
+        self.write("configs/models/imputation/brits.yaml", "width: 32")
+        self.write(
+            "configs/models/forecasting/patchtst.yaml", "patch_len: 32\nd_model: 128"
+        )
+        runs = self.load("""
+seed: !choice [0, 1, 2]
+models:
+  imputation: !choice
+    - name: saits
+      width: 128
+    - name: brits
+  forecasting:
+    name: patchtst
+    patch_len: !choice [8, 16]
+""")
+        self.assertEqual(len(runs), 12)
+        for run in runs:
+            model = run["models"]["imputation"]
+            if model["name"] == "saits":
+                self.assertEqual(
+                    model, {"name": "saits", "width": 128, "only_saits": True}
+                )
+            else:
+                self.assertEqual(model, {"name": "brits", "width": 32})
+            self.assertEqual(run["models"]["forecasting"]["d_model"], 128)
+
+    def test_recursive_merge_replaces_lists_scalars_and_null(self):
+        defaults = self.write(
+            "configs/model/a.yaml",
+            """
+optimizer:
+  lr: 0.001
+  weight_decay: 0.01
+layers: [128, 64]
+optional: {enabled: true}
+replace_mapping: {value: 1}
+replace_scalar: 1
+""",
+        )
+        original = defaults.read_bytes()
+        runs = self.load("""
+model:
+  name: a
+  optimizer:
+    lr: 0.0005
+  layers: [32]
+  optional: null
+  replace_mapping: false
+  replace_scalar: {value: 2}
+""")
+        self.assertEqual(
+            runs[0]["model"],
+            {
+                "name": "a",
+                "optimizer": {"lr": 0.0005, "weight_decay": 0.01},
+                "layers": [32],
+                "optional": None,
+                "replace_mapping": False,
+                "replace_scalar": {"value": 2},
+            },
+        )
+        self.assertEqual(defaults.read_bytes(), original)
+
+    def test_runs_and_aliases_are_independent(self):
+        self.write("configs/model/a.yaml", "layers: [128, 64]")
+        runs = self.load("""
+seed: !choice [0, 1]
+left: &shared {items: [1, 2]}
+right: *shared
+model: {name: a}
+""")
+        runs[0]["left"]["items"].append(3)
+        runs[0]["model"]["layers"].append(32)
+        self.assertEqual(runs[0]["right"]["items"], [1, 2])
+        self.assertEqual(runs[1]["left"]["items"], [1, 2])
+        self.assertEqual(runs[1]["model"]["layers"], [128, 64])
+
+    def test_missing_defaults_warn_once_per_file_and_preserve_explicit(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            runs = self.load(
+                "seed: !choice [0, 1, 2]\nmodel: {name: missing, width: 32}"
+            )
+        self.assertEqual(len(caught), 1)
+        self.assertIs(caught[0].category, MissingConfigWarning)
+        self.assertIn(
+            str(self.root / "configs/model/missing.yaml"), str(caught[0].message)
+        )
+        self.assertIn("$.model.name", str(caught[0].message))
+        self.assertTrue(
+            all(run["model"] == {"name": "missing", "width": 32} for run in runs)
+        )
+
+    def test_name_itself_can_be_a_choice(self):
+        self.write("configs/model/a.yaml", "width: 1")
+        self.write("configs/model/b.yaml", "width: 2")
+        self.assertEqual(
+            self.load("model: {name: !choice [a, b]}"),
+            [
+                {"model": {"width": 1, "name": "a"}},
+                {"model": {"width": 2, "name": "b"}},
+            ],
+        )
+
+    def test_defaults_paths_are_relative_to_experiment_and_follow_field_keys(self):
+        path = self.write("nested/experiment.yaml", "items: [{name: a}]\n")
+        self.write("nested/configs/items/a.yaml", "value: 42")
+        self.assertEqual(
+            load_configs(str(path)), [{"items": [{"name": "a", "value": 42}]}]
+        )
+
+    def test_nested_name_from_defaults_is_resolved(self):
+        self.write("configs/model/a.yaml", "optimizer: {name: adam}")
+        self.write("configs/model/optimizer/adam.yaml", "lr: 0.001")
+        self.assertEqual(
+            self.load("model: {name: a}")[0]["model"],
+            {
+                "name": "a",
+                "optimizer": {"name": "adam", "lr": 0.001},
+            },
+        )
+
+    def test_root_name_follows_same_convention(self):
+        self.write("configs/demo.yaml", "value: 1")
+        self.assertEqual(self.load("name: demo"), [{"name": "demo", "value": 1}])
+
+    def test_defaults_cache_is_local_to_each_load(self):
+        path = self.write("configs/model/a.yaml", "value: 1")
+        self.assertEqual(self.load("model: {name: a}")[0]["model"]["value"], 1)
+        path.write_text("value: 2")
+        self.assertEqual(load_configs(self.experiment)[0]["model"]["value"], 2)
+
+    def test_invalid_documents_report_source(self):
+        cases = [
+            "",
+            "null",
+            "[1, 2]",
+            "x: [",
+            "x: 1\nx: 2",
+            "x: {a: 1, a: 2}",
+            "1: value",
+            "x: !unknown [1]",
+            "x: !choice []",
+            "x: !choice scalar",
+            "x: !choice {a: 1}",
+            "x: &a {nested: *a}",
+            "x: {<<: {a: 1}}",
+            "x: !!python/object:builtins.object {}",
+            "x: 1\n---\nx: 2",
+        ]
+        for content in cases:
+            with (
+                self.subTest(content=content),
+                self.assertRaises(ConfigError) as raised,
+            ):
+                self.load(content)
+            self.assertIn(str(self.experiment), str(raised.exception))
+
+    def test_default_choice_is_rejected_even_when_explicitly_overridden(self):
+        path = self.write("configs/model/a.yaml", "width: !choice [32, 64]")
+        with self.assertRaises(ConfigError) as raised:
+            self.load("model: {name: a, width: 128}")
+        self.assertIn(str(path), str(raised.exception))
+        self.assertIn("!choice", str(raised.exception))
+
+    def test_malformed_defaults_are_errors_not_missing_warnings(self):
+        for content in ("x: [", "[1, 2]", "x: 1\nx: 2"):
+            path = self.write("configs/model/a.yaml", content)
+            with (
+                self.subTest(content=content),
+                warnings.catch_warnings(record=True) as caught,
+            ):
+                with self.assertRaises(ConfigError) as raised:
+                    self.load("model: {name: a}")
+                self.assertIn(str(path), str(raised.exception))
+                self.assertEqual(caught, [])
+
+    def test_missing_experiment_is_an_error(self):
+        with self.assertRaises(ConfigError) as raised:
+            load_configs(self.experiment)
+        self.assertIn(str(self.experiment), str(raised.exception))
+
+    def test_invalid_names_and_traversal_are_rejected(self):
+        for name in (
+            "null",
+            "42",
+            "[]",
+            "''",
+            "'../outside'",
+            "'a/b'",
+            "'a\\b'",
+            "'.'",
+        ):
+            with self.subTest(name=name), self.assertRaises(ConfigError):
+                self.load(f"model: {{name: {name}}}")
+        with self.assertRaises(ConfigError):
+            self.load("'../model': {name: a}")
+
+    def test_directory_instead_of_defaults_file_is_an_error(self):
+        path = self.root / "configs/model/a.yaml"
+        path.mkdir(parents=True)
+        with self.assertRaises(ConfigError) as raised:
+            self.load("model: {name: a}")
+        self.assertIn(str(path), str(raised.exception))
+
+    def test_defaults_symlink_cannot_escape_config_root(self):
+        outside = self.write("outside.yaml", "secret: 1")
+        link = self.root / "configs/model/a.yaml"
+        link.parent.mkdir(parents=True)
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            self.skipTest("symlink creation is unavailable")
+        with self.assertRaisesRegex(ConfigError, "outside"):
+            self.load("model: {name: a}")
+
+    def test_recursive_defaults_through_directory_alias_are_rejected(self):
+        path = self.write("configs/model/a.yaml", "child: {name: a}")
+        try:
+            (path.parent / "child").symlink_to(path.parent, target_is_directory=True)
+        except OSError:
+            self.skipTest("symlink creation is unavailable")
+        with self.assertRaisesRegex(ConfigError, "cyclic defaults"):
+            self.load("model: {name: a}")
+
+
+if __name__ == "__main__":
+    unittest.main()
