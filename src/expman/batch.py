@@ -4,14 +4,17 @@ import gc
 import warnings
 from collections import deque
 from pathlib import Path
+from threading import RLock
 from typing import Any
 from uuid import uuid4
 
 from .config import load_configs
 from .context import _nonnegative_integer
+from .estimation import TimeEstimate, TimeEstimator, validate_coverage
 from .events import Status
 from .experiment import AttemptResult, Experiment, ExperimentResult
 from .pipeline import Pipeline
+from .progress import BatchProgress
 from .recorders import InMemoryRecorder, Recorder
 from .storage import (
     PickleSerializer,
@@ -36,6 +39,7 @@ class Batch:
         cfg: str | Path | dict[str, Any],
         *,
         max_retries: int = 1,
+        estimate_coverage: float = 0.8,
         recorder: Recorder | None = None,
         output_dir: str | Path | None = None,
         serializer: Serializer | None = None,
@@ -47,6 +51,7 @@ class Batch:
             raise TypeError(
                 "cfg must be a YAML path or a concrete configuration dictionary"
             )
+        self.estimate_coverage = validate_coverage(estimate_coverage)
         configs = [cfg] if isinstance(cfg, dict) else load_configs(cfg)
         self.output_dir = (
             Path("runs") / uuid4().hex if output_dir is None else Path(output_dir)
@@ -65,8 +70,10 @@ class Batch:
             )
             for config in configs
         )
+        self._time_estimator = TimeEstimator(self.experiments)
         self.max_retries = max_retries
         self.recorder = InMemoryRecorder() if recorder is None else recorder
+        self._state_lock = RLock()
         self._started = False
         self._queue = deque(experiment.run_id for experiment in self.experiments)
         self._active = None
@@ -93,6 +100,11 @@ class Batch:
             "experiments": experiments,
             "queue": list(self._queue),
             "active": self._active,
+            "estimation": {
+                "version": 1,
+                "execution": "sequential",
+                "coverage": self.estimate_coverage,
+            },
         }
         write_record(self.output_dir / "batch.pkl", manifest, self._serializer)
         self._expected_manifest = manifest
@@ -122,6 +134,16 @@ class Batch:
             or not isinstance(manifest.get("queue"), list)
         ):
             raise StorageError("unsupported or invalid batch manifest")
+        estimation = manifest.get(
+            "estimation", {"version": 1, "execution": "sequential", "coverage": 0.8}
+        )
+        if (
+            not isinstance(estimation, dict)
+            or estimation.get("version") != 1
+            or estimation.get("execution") != "sequential"
+        ):
+            raise StorageError("unsupported estimation environment or version")
+        self.estimate_coverage = validate_coverage(estimation.get("coverage"))
         self._signature = pipeline.signature()
         if manifest.get("pipeline") != self._signature:
             raise StorageError(
@@ -130,6 +152,7 @@ class Batch:
         self.max_retries = manifest["max_retries"]
         _nonnegative_integer(self.max_retries, "max_retries")
         self.recorder = InMemoryRecorder() if recorder is None else recorder
+        self._state_lock = RLock()
         self._started = False
         experiments = []
         for entry in manifest["experiments"]:
@@ -173,6 +196,7 @@ class Batch:
                 )
             experiments.append(experiment)
         self.experiments = tuple(experiments)
+        self._time_estimator = TimeEstimator(self.experiments)
         ids = {experiment.run_id for experiment in self.experiments}
         self._queue = deque(manifest["queue"])
         active = manifest["active"]
@@ -206,11 +230,39 @@ class Batch:
     def results(self) -> tuple[ExperimentResult, ...]:
         return tuple(experiment.result for experiment in self.experiments)
 
-    def run(self) -> tuple[ExperimentResult, ...]:
+    def estimate(self, *, coverage: float | None = None) -> TimeEstimate:
+        """Read a remaining-time interval; may be polled while run() executes."""
+        level = (
+            self.estimate_coverage if coverage is None else validate_coverage(coverage)
+        )
+        with self._state_lock:
+            pending = set(self._queue)
+            if self._active is not None:
+                pending.add(self._active)
+        return self._time_estimator.estimate(pending, level)
+
+    def _next_experiment(self) -> str:
+        # Resume an interrupted member first. Failed attempts keep their tail retry
+        # order; information-based scheduling applies to fresh experiments.
+        by_id = {item.run_id: item for item in self.experiments}
+        if by_id[self._queue[0]].result.status is Status.CANCELLED:
+            return self._queue.popleft()
+        fresh = [run_id for run_id in self._queue if not by_id[run_id].result.attempts]
+        if not fresh:
+            return self._queue.popleft()
+        chosen = self._time_estimator.choose(fresh, remaining_ids=list(self._queue))
+        self._queue.remove(chosen)
+        return chosen
+
+    def run(
+        self, *, progress: bool = True, refresh_interval: float = 1.0
+    ) -> tuple[ExperimentResult, ...]:
+        """Execute the queue, displaying live progress and ETA on stderr."""
         if self._started:
             raise RuntimeError(
                 "a Batch can only run once; use Batch.resume to continue"
             )
+        display = BatchProgress(self, enabled=progress, interval=refresh_interval)
         with RunLock(self.output_dir):
             if (
                 read_record(self.output_dir / "batch.pkl", self._serializer)
@@ -218,19 +270,29 @@ class Batch:
             ):
                 raise StorageError("batch records changed; reload with Batch.resume")
             self._started = True
-            return self._run_queue()
+            error = None
+            try:
+                display.start()
+                return self._run_queue()
+            except BaseException as caught:
+                error = caught
+                raise
+            finally:
+                display.stop(error)
 
     def _run_queue(self) -> tuple[ExperimentResult, ...]:
         experiments = {experiment.run_id: experiment for experiment in self.experiments}
         while self._queue:
-            self._active = self._queue.popleft()
+            with self._state_lock:
+                self._active = self._next_experiment()
             experiment = experiments[self._active]
             self._save()
             try:
                 result = experiment.run(recorder=self.recorder)
             except BaseException:
-                self._queue.appendleft(self._active)
-                self._active = None
+                with self._state_lock:
+                    self._queue.appendleft(self._active)
+                    self._active = None
                 try:
                     self._save()
                 except Exception as error:
@@ -246,7 +308,9 @@ class Batch:
                     item.status is Status.FAILED for item in experiment.result.attempts
                 )
                 if failures <= self.max_retries:
-                    self._queue.append(experiment.run_id)
-            self._active = None
+                    with self._state_lock:
+                        self._queue.append(experiment.run_id)
+            with self._state_lock:
+                self._active = None
             self._save()
         return self.results

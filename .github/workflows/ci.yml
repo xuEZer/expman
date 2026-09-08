@@ -35,3 +35,4 @@ jobs:
       - run: python examples/load_experiments.py
       - run: python examples/batch_pipeline.py
       - run: python examples/checkpoint_pipeline.py
+      - run: python examples/estimate_time.py

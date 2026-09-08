@@ -4,6 +4,10 @@
 
 ### Added
 
+- `Batch.run()` 默认实时显示 CLI 进度、已运行时间与剩余时间，支持刷新间隔、关闭显示及中断收尾。
+- `Batch.estimate()` / `TimeEstimate`：整个实验的剩余时间预测区间，覆盖水平默认 0.8，显示 `DD:HH:MM～DD:HH:MM`。
+- 自动配置特征、支持未完成观测的贝叶斯耗时模型、信息价值调度及估计设置恢复。
+
 - `ctx.log_metrics()`：嵌套数值指标按完整路径事务写入 SQLite，同键覆盖、跨重试及恢复保留，每个 Batch 共用数据库。
 
 - 位置标识的阶段结果/state 原子快照、两份 checkpoint 和阶段状态自动更新。
@@ -22,6 +26,8 @@
 - 固定版本的 Ruff lint、格式检查、每次提交自动执行的 pre-commit hook 和 CI 检查。
 
 ### Changed
+
+- 新实验按估时信息价值选择执行顺序，取消成员优先续跑、失败成员保持队尾重试，结果顺序保持配置展开顺序。
 
 - `ctx.cfg` 深层只读，运行时可变数据使用 `ctx.state`。重试恢复已完成阶段和最新可用 checkpoint。
 - Pipeline 接收 Stage 类，每次执行创建独立实例。迁移时将 `Pipeline([MyStage()])` 改为 `Pipeline([MyStage])`，阶段以无参构造函数初始化，并在 `process()` 中通过 `ctx.cfg` 读取参数。

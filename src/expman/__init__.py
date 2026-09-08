@@ -3,6 +3,7 @@
 from .batch import Batch
 from .config import ConfigError, MissingConfigWarning, load_configs
 from .context import RunContext
+from .estimation import TimeEstimate
 from .events import Event, ExecutionEvent, MetricEvent, ProgressEvent, Status
 from .experiment import AttemptResult, Experiment, ExperimentResult
 from .pipeline import Pipeline
@@ -38,5 +39,6 @@ __all__ = [
     "Serializer",
     "StorageError",
     "Status",
+    "TimeEstimate",
     "load_configs",
 ]

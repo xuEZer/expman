@@ -3,6 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
@@ -73,6 +74,8 @@ class Experiment:
         self._run_id = uuid4().hex if run_id is None else run_id
         _name(self._run_id, "run_id")
         self._attempts: list[AttemptResult] = []
+        self._timing_lock = RLock()
+        self._active_started: float | None = None
         self.output_dir = (
             Path("runs") / self.run_id if output_dir is None else Path(output_dir)
         )
@@ -100,10 +103,21 @@ class Experiment:
     def result(self) -> ExperimentResult:
         return ExperimentResult(self.run_id, tuple(self._attempts))
 
+    def _timing_snapshot(self) -> tuple[tuple[AttemptResult, ...], float]:
+        with self._timing_lock:
+            elapsed = (
+                0.0
+                if self._active_started is None
+                else max(0.0, perf_counter() - self._active_started)
+            )
+            return tuple(self._attempts), elapsed
+
     def run(self, *, recorder: Recorder | None = None) -> AttemptResult:
         """Execute once, restoring completed stages and the latest checkpoint."""
         attempt = len(self._attempts) + 1
         started = perf_counter()
+        with self._timing_lock:
+            self._active_started = started
         status = Status.SUCCEEDED
         output = None
         error_type = None
@@ -135,5 +149,7 @@ class Experiment:
                 error_type=error_type,
                 error_message=error_message,
             )
-            self._attempts.append(result)
+            with self._timing_lock:
+                self._attempts.append(result)
+                self._active_started = None
         return result
