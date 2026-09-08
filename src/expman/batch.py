@@ -61,6 +61,7 @@ class Batch:
                 run_id=(run_id := uuid4().hex),
                 output_dir=self.output_dir / "experiments" / run_id,
                 serializer=self._serializer,
+                _metrics_path=self.output_dir / "metrics.sqlite3",
             )
             for config in configs
         )
@@ -147,6 +148,7 @@ class Batch:
                 run_id=run_id,
                 output_dir=root,
                 serializer=self._serializer,
+                _metrics_path=self.output_dir / "metrics.sqlite3",
                 _resume=True,
             )
             for attempt in entry["attempts"]:

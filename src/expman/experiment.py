@@ -10,6 +10,7 @@ from uuid import uuid4
 from .context import RunContext, _error_message, _name
 from .events import Status
 from .frozen import freeze
+from .metrics import MetricStore
 from .pipeline import Pipeline
 from .recorders import InMemoryRecorder, Recorder
 from .storage import RunStore, Serializer, write_record
@@ -60,6 +61,7 @@ class Experiment:
         output_dir: str | Path | None = None,
         serializer: Serializer | None = None,
         _resume: bool = False,
+        _metrics_path: Path | None = None,
     ) -> None:
         if not isinstance(pipeline, Pipeline):
             raise TypeError("pipeline must be a Pipeline")
@@ -73,6 +75,11 @@ class Experiment:
         self._attempts: list[AttemptResult] = []
         self.output_dir = (
             Path("runs") / self.run_id if output_dir is None else Path(output_dir)
+        )
+        self._metrics = MetricStore(
+            self.output_dir / "metrics.sqlite3"
+            if _metrics_path is None
+            else _metrics_path
         )
         self._store = RunStore(self.output_dir, serializer)
         if not _resume:
@@ -108,6 +115,7 @@ class Experiment:
                 cfg=deepcopy(self._cfg),
                 attempt=attempt,
                 _store=self._store,
+                _metrics=self._metrics,
             )
             with ctx.observe(self.pipeline.name, kind="experiment") as context:
                 output = self.pipeline.run(ctx=context)

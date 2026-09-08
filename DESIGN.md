@@ -104,6 +104,7 @@ RunContext 保存 `run_id`、尝试编号 `attempt`、只读完整配置 `cfg`�
 |---|---|
 | `observe(name, kind=...)` | 创建子作用域并记录生命周期事件 |
 | `report_metric(name, value, step=...)` | 上报有限实数指标 |
+| `log_metrics(mapping, step=...)` | 将嵌套数值指标事务写入 SQLite |
 | `report_progress(completed, total=..., unit=...)` | 上报绝对完成量，可省略总量 |
 | `emit(event)` | 将事件发送给记录器并隔离普通记录故障 |
 | `checkpoint.save(step=...)` | 同步保存当前阶段 state，保留最近两份 checkpoint |
@@ -296,3 +297,11 @@ Batch 清单原子记录待执行队列、当前活动成员及尝试摘要。Ct
 批量与恢复测试覆盖队尾顺序、尝试预算、阶段复用、只读配置、state 恢复、两份 checkpoint、损坏回退、保存失败、进程锁、Pipeline 匹配，以及独立子进程的 SIGINT 和突然退出恢复。
 
 版本记录见 [CHANGELOG.md](CHANGELOG.md)，开发和 Git 约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 数值指标持久化
+
+`RunContext.log_metrics(mapping, step=None)` 在受管阶段中提供同步持久化接口。`metrics.py` 负责整树校验、路径编码和 SQLite 事务写入；Experiment 注入存储服务，Batch 在创建及恢复时为全部实验指定同一个 `metrics.sqlite3`。连接按调用关闭，不进入 checkpoint 或阶段快照。
+
+`metrics` 表字段为 `run_id`、`stage_path`、`step`、`metric_path`、`value`、`attempt`、`updated_at`。前四项构成主键；位置路径与指标路径使用 JSON 数组文本，汇总 step 使用非空哨兵值 `-1`。指标值保存为 REAL，更新时间为 UTC ISO 8601。UPSERT 只更新传入的叶子指标，恢复不删除历史行。执行次数是最近一次写入的元数据，不参与唯一键。
+
+所有叶子先验证为有限实数，再开始同一次调用的事务。数据库写入错误包装为 `StorageError` 并传播给阶段，触发已有失败及队尾重试机制。SQLite 指标事务与阶段快照、队列清单分别提交；快照失败后已提交指标保留，重试以相同唯一键覆盖。可选 Recorder 的错误隔离策略继续只适用于观测事件。

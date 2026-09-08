@@ -194,3 +194,36 @@ python -m unittest discover -s tests -v
 每次 Git 提交前必须通过 Ruff lint 和格式检查，提交 hook 会自动执行这两项检查。
 
 源码布局、接口契约和扩展方向见 [架构设计](DESIGN.md)；分支、提交和版本发布约定见 [贡献指南](CONTRIBUTING.md)；版本变更见 [CHANGELOG](CHANGELOG.md)。
+
+### 持久化数值指标
+
+在由 `Batch` 或 `Experiment` 管理的阶段内，使用 `ctx.log_metrics()` 保存嵌套指标：
+
+```python
+ctx.log_metrics(
+    {"train": {"mse": 0.1, "mae": 0.2}, "val": {"mse": 0.15}},
+    step=epoch,
+)
+ctx.log_metrics({"test": {"mse": 0.08}})  # 汇总指标
+```
+
+Batch 内所有实验共用输出目录中的 `metrics.sqlite3`；独立 Experiment 使用自身输出目录。数据库在首次非空写入时创建。每次调用先校验整棵字典，再以一个事务写入，返回即已提交。写入失败会使阶段失败，并进入 Batch 的重试流程。
+
+指标名为非空字符串，叶子为有限实数（不接受布尔值、NaN 和无穷值），统一保存为 SQLite REAL（双精度浮点数）。`step` 为非负的 64 位有符号整数或省略。空字典不产生记录。嵌套深度受 Python 递归限制。
+
+唯一键为实验 ID、完整阶段位置路径、step 和完整指标路径。同键写入覆盖数值、尝试编号和 UTC 更新时间；本次未传入的指标保留。恢复时保留所有旧记录，包括 checkpoint 之后的指标，重新运行到相同位置时再覆盖。已完成阶段复用快照时不会重新记录指标。
+
+可使用 SQLite 工具或 Python 查询 `metrics` 表：
+
+```python
+import sqlite3
+
+with sqlite3.connect(batch.output_dir / "metrics.sqlite3") as db:
+    rows = db.execute(
+        "SELECT run_id, stage_path, step, metric_path, value, attempt, updated_at "
+        "FROM metrics WHERE run_id = ? ORDER BY stage_path, step, metric_path",
+        (batch.experiments[0].run_id,),
+    ).fetchall()
+```
+
+`stage_path` 和 `metric_path` 保存为 JSON 数组文本，例如 `[0]` 和 `["train", "mse"]`，可用 `json.loads()` 解码。嵌套 Pipeline 的位置路径包含调用序号，避免阶段冲突。省略 step 的汇总指标在数据库中使用 `-1`。`report_metric()` 仍用于向 Recorder 上报观测事件；持久化数值使用 `log_metrics()`。

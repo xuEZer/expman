@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from .events import Event, ExecutionEvent, MetricEvent, ProgressEvent, Status
 from .frozen import freeze
+from .metrics import MetricStore, flatten_metrics
 from .recorders import InMemoryRecorder, Recorder
 from .storage import Checkpoint, RunStore
 
@@ -54,6 +55,7 @@ class RunContext:
     cfg: Mapping[str, Any] = field(default_factory=dict, kw_only=True)
     state: dict[str, Any] = field(default_factory=dict, kw_only=True)
     stage_id: int | None = field(default=None, kw_only=True)
+    _metrics: MetricStore | None = field(default=None, kw_only=True, repr=False)
     _store: RunStore | None = field(default=None, kw_only=True, repr=False)
     _stage_path: tuple[int, ...] = field(default=(), kw_only=True, repr=False)
     _checkpoint: Checkpoint | None = field(default=None, kw_only=True, repr=False)
@@ -152,6 +154,21 @@ class RunContext:
                     reused=reused,
                 )
             )
+
+    def log_metrics(
+        self, metrics: Mapping[str, Any], *, step: int | None = None
+    ) -> None:
+        """Commit nested scalar metrics; storage errors fail the current stage."""
+        if self._metrics is None or not self._stage_path:
+            raise RuntimeError(
+                "log_metrics requires a stage managed by Experiment or Batch"
+            )
+        if step is not None:
+            _nonnegative_integer(step, "step")
+            if step > 2**63 - 1:
+                raise ValueError("step must fit a SQLite signed 64-bit integer")
+        rows = flatten_metrics(metrics)
+        self._metrics.log(self.run_id, self._stage_path, step, self.attempt, rows)
 
     def report_metric(
         self, name: str, value: float, *, step: int | None = None
