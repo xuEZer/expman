@@ -2,17 +2,19 @@
 
 import logging
 import math
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from numbers import Real
 from time import perf_counter
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from .events import Event, ExecutionEvent, MetricEvent, ProgressEvent, Status
+from .frozen import freeze
 from .recorders import InMemoryRecorder, Recorder
+from .storage import Checkpoint, RunStore
 
 _logger = logging.getLogger(__name__)
 
@@ -31,6 +33,13 @@ def _name(value: str, name: str) -> None:
         raise ValueError(f"{name} must be a nonempty string")
 
 
+def _error_message(error: BaseException) -> str:
+    try:
+        return str(error)
+    except Exception:
+        return "<exception message unavailable>"
+
+
 @dataclass(frozen=True)
 class RunContext:
     """Shared recorder and identity, with an immutable execution scope.
@@ -42,10 +51,34 @@ class RunContext:
 
     run_id: str = field(default_factory=lambda: uuid4().hex)
     recorder: Recorder = field(default_factory=InMemoryRecorder)
+    cfg: Mapping[str, Any] = field(default_factory=dict, kw_only=True)
+    state: dict[str, Any] = field(default_factory=dict, kw_only=True)
+    stage_id: int | None = field(default=None, kw_only=True)
+    _store: RunStore | None = field(default=None, kw_only=True, repr=False)
+    _stage_path: tuple[int, ...] = field(default=(), kw_only=True, repr=False)
+    _checkpoint: Checkpoint | None = field(default=None, kw_only=True, repr=False)
+    _pipeline_calls: dict = field(default_factory=dict, kw_only=True, repr=False)
+    attempt: int = field(default=1, kw_only=True)
     _execution_id: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _name(self.run_id, "run_id")
+        _nonnegative_integer(self.attempt, "attempt")
+        if self.attempt == 0:
+            raise ValueError("attempt must be at least 1")
+        if not isinstance(self.cfg, Mapping):
+            raise TypeError("cfg must be a mapping")
+        object.__setattr__(self, "cfg", freeze(self.cfg))
+        if not isinstance(self.state, dict):
+            raise TypeError("state must be a dictionary")
+
+    @property
+    def checkpoint(self) -> Checkpoint:
+        if self._checkpoint is None:
+            raise RuntimeError(
+                "checkpoint requires a stage managed by Experiment or Batch"
+            )
+        return self._checkpoint
 
     @property
     def execution_id(self) -> str | None:
@@ -59,12 +92,16 @@ class RunContext:
 
     @contextmanager
     def observe(
-        self, name: str, *, kind: Literal["pipeline", "stage"]
+        self,
+        name: str,
+        *,
+        kind: Literal["experiment", "pipeline", "stage"],
+        reused: bool = False,
     ) -> Iterator["RunContext"]:
         """Record start and finish, preserving the original business exception."""
         _name(name, "execution name")
-        if kind not in ("pipeline", "stage"):
-            raise ValueError("kind must be 'pipeline' or 'stage'")
+        if kind not in ("experiment", "pipeline", "stage"):
+            raise ValueError("kind must be 'experiment', 'pipeline' or 'stage'")
         child = replace(self, _execution_id=uuid4().hex)
         execution_id = child.execution_id
         assert execution_id is not None
@@ -77,6 +114,9 @@ class RunContext:
                 name=name,
                 status=Status.RUNNING,
                 timestamp=_now(),
+                attempt=self.attempt,
+                stage_id=self.stage_id,
+                reused=reused,
             )
         )
         # Exclude this execution's start/end recorder calls from its duration.
@@ -88,16 +128,10 @@ class RunContext:
             yield child
         except BaseException as error:
             status = (
-                Status.CANCELLED
-                if isinstance(error, (KeyboardInterrupt, SystemExit))
-                else Status.FAILED
+                Status.CANCELLED if not isinstance(error, Exception) else Status.FAILED
             )
             error_type = type(error).__qualname__
-            try:
-                error_message = str(error)
-            except Exception:
-                # A user-defined exception may itself fail to render.
-                error_message = "<exception message unavailable>"
+            error_message = _error_message(error)
             raise
         finally:
             duration = perf_counter() - started
@@ -113,6 +147,9 @@ class RunContext:
                     duration_seconds=duration,
                     error_type=error_type,
                     error_message=error_message,
+                    attempt=self.attempt,
+                    stage_id=self.stage_id,
+                    reused=reused,
                 )
             )
 
@@ -137,6 +174,8 @@ class RunContext:
                 value=float(value),
                 step=step,
                 timestamp=_now(),
+                attempt=self.attempt,
+                stage_id=self.stage_id,
             )
         )
 
@@ -158,5 +197,7 @@ class RunContext:
                 total=total,
                 unit=unit,
                 timestamp=_now(),
+                attempt=self.attempt,
+                stage_id=self.stage_id,
             )
         )

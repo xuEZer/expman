@@ -12,8 +12,9 @@ OutputT = TypeVar("OutputT")
 class Stage(ABC, Generic[InputT, OutputT]):
     """Override process and use run as the monitored execution entry point.
 
-    Stage instances may hold state. Reusing an instance preserves that state;
-    callers should create a fresh instance when an independent run is needed.
+    Stage instances may hold state. Pipeline constructs them with no arguments
+    on each execution; read the current experiment configuration from ctx.cfg.
+    Calling an instance directly through run preserves that instance's state.
     """
 
     def __init__(self, *, name: str | None = None) -> None:
@@ -29,7 +30,12 @@ class Stage(ABC, Generic[InputT, OutputT]):
         """Execute process once, with stage-level timing and outcome events."""
         context = RunContext() if ctx is None else ctx
         with context.observe(self.name, kind="stage") as stage_context:
-            return self.process(data, stage_context)
+            output = self.process(data, stage_context)
+            if context._store is not None:
+                context._store.complete(
+                    context._stage_path, output, context.state, self.name
+                )
+            return output
 
     @abstractmethod
     def process(self, data: InputT, ctx: RunContext) -> OutputT:

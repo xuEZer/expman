@@ -11,14 +11,10 @@ class LoadNumbers(Stage[None, list[float]]):
 
 
 class Scale(Stage[list[float], list[float]]):
-    def __init__(self, factor: float) -> None:
-        super().__init__()
-        self.factor = factor
-
     def process(self, data: list[float], ctx: RunContext) -> list[float]:
         result = []
         for index, value in enumerate(data, start=1):
-            result.append(value * self.factor)
+            result.append(value * ctx.cfg["factor"])
             ctx.report_progress(index, total=len(data), unit="item")
         return result
 
@@ -38,8 +34,8 @@ class Summarize(Stage[list[float], Summary]):
 
 def main() -> None:
     recorder = InMemoryRecorder()
-    context = RunContext(recorder=recorder)
-    pipeline = Pipeline([LoadNumbers(), Scale(0.5), Summarize()], name="numbers")
+    context = RunContext(recorder=recorder, cfg={"factor": 0.5})
+    pipeline = Pipeline([LoadNumbers, Scale, Summarize], name="numbers")
     print(pipeline.run(ctx=context))
     for event in recorder.events:
         if isinstance(event, ExecutionEvent) and event.status is Status.SUCCEEDED:

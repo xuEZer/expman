@@ -6,23 +6,25 @@
 
 expman 用可组合的阶段组织实验流程，让用户专注于每个阶段的数据处理逻辑，并提供一致的执行观测。
 
-当前实现支持 YAML 配置展开与默认参数合并，以及定义阶段 → 组合 Pipeline → 执行 → 获得业务结果和观测事件。用户根据每个展开的配置构建独立的 Pipeline，批量调度在此基础上逐步扩展。
+当前实现支持 YAML 配置展开与默认参数合并，以及 Pipeline 流程定义 → Batch 创建 Experiment → 顺序执行和队尾重试 → 获得业务结果和观测事件。
 
 核心设计遵循以下原则：
 
 | 原则 | 具体落点 |
 |---|---|
-| 单一职责 | Stage 处理一个阶段；Pipeline 组织顺序；RunContext 提供运行服务；Recorder 接收事件 |
+| 单一职责 | Stage 处理一个阶段；Pipeline 定义顺序；Experiment 管理具体配置和尝试；Batch 管理执行队列；Recorder 接收事件 |
 | 开闭原则 | 新增业务阶段继承 Stage；新增存储适配器实现 Recorder |
 | 依赖倒置 | 执行层依赖 Recorder 协议，不依赖具体数据库或监控平台 |
-| 组合与显式依赖 | Pipeline 组合阶段实例；业务对象通过输入输出传递；阶段配置通过构造函数注入 |
+| 组合与显式依赖 | Pipeline 组合阶段类型；业务对象通过输入输出传递；用户通过 ctx.cfg 读取完整实验配置 |
 | 最小可用抽象 | 先稳定同步顺序执行与监测契约，再基于实际需求增加调度等能力 |
 
 ## 2. 组件关系
 
 ```mermaid
 flowchart LR
-    U[用户代码] --> P[Pipeline]
+    U[用户代码] --> BATCH[Batch]
+    BATCH --> E[Experiment]
+    E --> P[Pipeline]
     P --> S[Stage.run]
     S --> B[用户实现的 process]
     P --> C[RunContext]
@@ -38,6 +40,10 @@ flowchart LR
 src/expman/
     __init__.py     公共 API
     config.py       YAML 加载、候选组合展开与命名默认配置合并
+    batch.py        实验集合、顺序队列和有界重试
+    experiment.py   具体实验、隔离执行及尝试结果
+    storage.py      原子快照、两份 checkpoint、保存器协议与运行锁
+    frozen.py       配置的只读映射和序列
     pipeline.py     阶段组合与顺序执行
     stage.py        业务扩展基类
     context.py      运行标识、执行作用域、计时与事件发送
@@ -60,24 +66,25 @@ class Stage(Generic[InputT, OutputT], ABC):
 - `run()` 是基类提供的执行入口，通过 RunContext 统一包装生命周期监测。
 - `run()` 使用 `typing.final` 标记，供静态工具检查覆盖行为；Python 运行时不会阻止子类覆盖，因此扩展契约要求用户只覆盖 `process()`。
 - 名称默认使用子类名，可通过 `super().__init__(name="...")` 设置。自定义构造函数须调用基类构造函数。
-- 阶段可持有模型、优化器、缓存等实例状态，也可在 `process()` 中组织自己的循环、验证与早停。
-- Stage 可以独立执行，也可以放入 Pipeline。同一实例重复使用会保留状态；需要隔离的实验应构造独立实例。
+- 阶段可持有模型、优化器、缓存等实例状态，也可在 `process()` 中组织自己的循环、验证与早停。通过 `ctx.cfg` 读取完整实验配置。
+- Pipeline 接收 Stage 类，并通过无参构造函数创建实例。模型等依赖当前配置的对象在 `process()` 内构建。
+- Stage 实例也可直接调用 `run()`，这时实例状态由调用方管理。
 
 计时实现集中在 RunContext，Stage 和 Pipeline 共用同一套生命周期语义。
 
 ## 4. Pipeline：组合与数据流
 
 ```python
-pipeline = Pipeline([LoadData(), Train(), Evaluate()], name="experiment")
+pipeline = Pipeline([LoadData, Train, Evaluate], name="experiment")
 result = pipeline.run(data=None, ctx=context)
 ```
 
-Pipeline 在构造时将阶段序列保存为 tuple，防止调用方后续修改原列表影响组合；阶段对象本身仍可持有可变状态。
+Pipeline 在构造时将 Stage 类序列保存为 tuple，防止调用方后续修改原列表影响组合。它是可复用的流程定义，需要执行的阶段按顺序创建新实例。
 
 执行规则：
 
 1. 创建 Pipeline 执行作用域，记录开始事件。
-2. 按声明顺序调用每个阶段的 `run()`。
+2. 按位置检查已完成快照；可复用时恢复输出和 state 并跳过构造，否则无参构造 Stage 并调用 `run()`。
 3. 将每个阶段返回的对象直接传给下一个阶段。
 4. 返回最后一个阶段的输出，记录成功事件。
 
@@ -87,11 +94,11 @@ Pipeline 在构造时将阶段序列保存为 tuple，防止调用方后续修�
 
 相邻阶段的数据类型兼容性由用户保证。Stage 泛型描述单个阶段的输入输出；当前异构 Pipeline 使用 `Any`，不会自动静态推导整条链，也不会在运行前验证数据 schema。
 
-阶段可在自己的 `process()` 中调用另一个 Pipeline，并传入当前上下文；父子执行标识保留嵌套关系。当前执行为同步串行，Stage 实例与内存记录器按单线程使用设计。
+阶段可在自己的 `process()` 中调用另一个 Pipeline，并传入当前上下文；父子执行标识保留嵌套关系。当前执行为同步串行，Experiment、Batch 和内存记录器按单线程使用设计。
 
 ## 5. RunContext：运行身份与公共服务
 
-RunContext 保存 `run_id`、Recorder 和当前执行作用域，提供：
+RunContext 保存 `run_id`、尝试编号 `attempt`、只读完整配置 `cfg`、可变 `state`、位置标识 `stage_id`、Recorder 和当前执行作用域，提供：
 
 | 接口 | 用途 |
 |---|---|
@@ -99,31 +106,32 @@ RunContext 保存 `run_id`、Recorder 和当前执行作用域，提供：
 | `report_metric(name, value, step=...)` | 上报有限实数指标 |
 | `report_progress(completed, total=..., unit=...)` | 上报绝对完成量，可省略总量 |
 | `emit(event)` | 将事件发送给记录器并隔离普通记录故障 |
+| `checkpoint.save(step=...)` | 同步保存当前阶段 state，保留最近两份 checkpoint |
 
-业务依赖通过阶段输入输出和构造参数传递，RunContext 承载执行服务。
+业务数据通过阶段输入输出传递，RunContext 承载配置和执行服务。`ctx.cfg` 是当前尝试的完整配置，用户自行读取其中需要的字段。
 
 每次顶层调用省略 `ctx` 时自动创建独立 RunContext。需要检查记录或接入自己的存储时，由调用方显式创建并传入上下文。显式复用同一个上下文表示这些调用属于同一 `run_id`；每次具体执行仍获得不同的 `execution_id`。
 
-上下文本身为 frozen dataclass。创建子作用域得到新的上下文对象，并共享 Recorder；父作用域不会被修改，嵌套执行结束后可以继续在原作用域上报事件。
+上下文本身为 frozen dataclass。配置递归包装为只读映射和序列，同一次尝试的阶段共享可变的 state；需要恢复的模型数据、循环位置等由用户放入 state。每次尝试先创建新的上下文，再从持久化快照恢复业务状态。运行时的尝试编号、执行 ID 和 Recorder 使用本次执行的信息。
 
 ## 6. 观测契约
 
 ### 6.1 生命周期
 
-每次 Pipeline 或 Stage 执行产生一个开始事件和一个终止事件，使用相同 `execution_id`：
+每次 Experiment 尝试、Pipeline 或 Stage 执行产生一个开始事件和一个终止事件，使用相同 `execution_id`：
 
 ```text
 running → succeeded | failed | cancelled
 ```
 
-事件包含 run ID、执行 ID、父执行 ID、名称、执行种类和 UTC 时间戳。终止事件还包含耗时；失败事件记录异常类型和文本。
+事件包含 run ID、尝试编号、执行 ID、父执行 ID、名称、执行种类和 UTC 时间戳。终止事件还包含耗时；失败事件记录异常类型和文本。指标和进度事件也带有尝试编号。
 
 - 普通业务异常记为 `failed`，保留原异常继续抛出。
-- `KeyboardInterrupt` 和 `SystemExit` 记为 `cancelled`，继续抛出。
+- `KeyboardInterrupt`、`SystemExit` 等不属于 Exception 的 BaseException 记为 `cancelled`，继续抛出。
 - 子阶段失败或取消会使所在 Pipeline 以相应状态结束。
-- 进程被强制杀死或机器断电时，进程内代码无法保证产生终止事件；未来持久化和执行管理层需要处理未结束记录。
+- 进程被强制杀死时不能保证产生终止事件；恢复时依据持久化队列，将未结束尝试记为 cancelled，再从已成功写入的快照继续。
 
-Stage 名称允许重复。每次调用生成独立执行 ID，事件按调用顺序记录，支持同一实例在 Pipeline 中出现多次。
+Stage 名称允许重复。每次调用生成独立执行 ID，事件按调用顺序记录，支持同一 Stage 类在 Pipeline 中出现多次，每次使用独立实例。
 
 ### 6.2 计时与进度
 
@@ -191,17 +199,85 @@ models.forecasting.name: patchtst
 - 缺失实验文件、已有文件解析失败、读取失败等抛出 `ConfigError`，包含来源路径；解析错误还携带 YAML 位置信息。
 - 缺失默认文件发出 `MissingConfigWarning` 并继续，同一次加载对同一路径只警告一次；调用方可使用 Python warnings 机制控制展示或提升为错误。
 
-`load_configs()` 一次性返回整个列表。加载失败时不返回部分结果；该接口负责解析配置，Pipeline 的构建、运行身份分配、配置快照持久化和调度由上层处理。
+`load_configs()` 一次性返回整个列表。加载失败时不返回部分结果；该接口负责解析配置，运行身份分配和执行队列由 Batch 与 Experiment 处理。
 
-## 8. 扩展顺序
+## 8. Experiment 与 Batch
+
+```python
+pipeline = Pipeline([Impute, Forecast, Evaluate])
+batch = Batch(pipeline, cfg="experiment.yaml", max_retries=1)
+results = batch.run()
+```
+
+### 8.1 实验身份与隔离
+
+Experiment 保存一份具体配置、稳定的 `run_id` 和独立目录。首次执行从 `None` 输入开始；每次尝试使用新的上下文，复用已完成阶段的快照，并自动恢复待执行阶段最新可用的 checkpoint。只实例化仍需执行的阶段。
+
+阶段收到完整的 `ctx.cfg`，尝试编号 `ctx.attempt` 从 1 开始递增。`experiment.cfg` 返回配置副本，调用方不能通过该属性修改实验的初始配置。用户的类变量、模块全局变量、外部服务和文件不在实例隔离范围内。
+
+### 8.2 顺序队列与重试
+
+Batch 构造时加载 YAML，并按展开顺序创建 Experiment；也接受一份已解析的配置字典作为单成员集合。配置加载错误在执行前抛出。
+
+执行时依次取队首成员：成功则完成；任意普通异常记录失败，并在重试预算未耗尽时放到队尾。默认 `max_retries=1` 表示最多两次尝试；该参数必须为非负整数。
+
+例如 A 首次失败、B 和 C 成功，则尝试顺序为 `A1 → B1 → C1 → A2`。A2 再失败就标记最终失败。Stage 构造异常采用同一策略，单个实验失败不终止整组。
+
+重试保留实验 ID、递增尝试编号，恢复已保存进度。业务阶段需要自行管理重复执行带来的文件或外部系统副作用。失败后仅保存错误类型和文本，不保存异常对象或 traceback；Batch 在失败后执行垃圾回收以释放不可达的用户对象。
+
+中断信号记录取消状态后继续抛出，立即停止队列；该实验保留在队首供恢复。中断后可通过 `batch.results` 查看部分结果。使用 `Batch.resume(pipeline, output_dir)` 从持久化队列恢复，中断次数不计入失败重试预算。每个 Batch 对象只执行一次。
+
+### 8.3 结果与观测
+
+`Batch.run()` 返回按配置顺序排列的 `tuple[ExperimentResult, ...]`，不受实际重试顺序影响。每个结果包含稳定 `run_id` 和全部 `AttemptResult`。
+
+AttemptResult 记录尝试编号、状态、耗时、输出及错误摘要。ExperimentResult 的状态和输出取最后一次尝试，耗时为全部尝试耗时之和；尚未执行时状态为 `pending`、输出为 `None`。结果是尝试历史的快照，输出对象本身保留用户返回值。
+
+Batch 默认使用一个内存 Recorder 收集所有实验事件，可传入自定义记录器。事件层次为 Experiment 尝试 → Pipeline → Stage，通过 `run_id`、`attempt` 和父子执行 ID 关联。记录器普通故障继续采用尽力交付语义，不将一次成功业务执行转为重试。
+
+## 9. 持久化与恢复契约
+
+默认以 `runs/<batch-id>/` 作为 Batch 目录。用户可指定新的 `output_dir`；已有目录通过 resume 打开，创建操作不会覆盖历史数据。
+
+```text
+<batch>/
+    batch.pkl                      配置清单、Pipeline 签名、队列、活动实验、尝试摘要
+    run.lock                       进程级互斥锁
+    experiments/<run-id>/
+        config.pkl                 最终配置，只保存一次
+        stages/
+            pipeline.pkl           当前流程签名
+            0/
+                status.pkl         框架维护的阶段状态
+                completed.pkl      返回值 + state 的完整快照
+                checkpoints/
+                    000...001.pkl  state + 进度 + 内部调用位置
+                    000...002.pkl
+```
+
+Stage ID 直接取局部位置 `0、1、2…`，名称只用于展示。嵌套流程使用父阶段位置、调用序号和子阶段位置形成数字路径；checkpoint 同步保存内部调用计数，避免恢复循环中的嵌套 Pipeline 时混用结果。
+
+阶段完成快照是返回值和 state 的单个保存事务。写入临时文件、flush/fsync 后原子替换目标路径，成功后才算完成。保存失败按普通阶段失败处理；未完成的临时文件不参与恢复。状态文件自动记录 running、succeeded、failed 或 cancelled，恢复复用时记录 reused 标记，执行事件也带有该标记和 stage_id。
+
+Checkpoint 通过 `ctx.checkpoint.save(step=...)` 同步保存当前 state，保留最近两份成功写入记录。进入 process 前先恢复阶段入口的输出/state，再用最新可读取 checkpoint 的 state 覆盖；最新损坏时 warning 并尝试上一份，两份都不可用则使用入口状态。已完成阶段快照损坏会报 StorageError，避免静默传递错误的阶段输入。
+
+Batch 清单原子记录待执行队列、当前活动成员及尝试摘要。Ctrl+C 会将当前成员放回队首并保存取消记录；进程突然结束时，resume 根据活动成员补记中断尝试，其未知耗时记为 0。已完成成员保持完成，失败预算依据已持久化的 failed 尝试数计算。快照和清单不能构成跨文件的单次事务；若进程在结果保存后、清单更新前结束，恢复会复用已保存阶段结果补完该实验。
+
+恢复读取保存的配置而非原 YAML，并校验阶段类、顺序及可获取的源码摘要；默认模块和类标识不等同于完整依赖环境指纹。实例已加载后如果清单被另一执行者更新，会拒绝使用陈旧队列。运行期间持有操作系统锁，进程退出后锁自动释放。
+
+默认 PickleSerializer 保存可 pickle 的 Python 对象，加载只适用于可信文件和兼容的依赖、设备环境。Serializer 协议允许替换 dump/load，创建与恢复时须使用匹配的实现。用户负责填充和应用 model/optimizer state_dict、随机数和数据位置等业务状态；框架不会自动捕获活跃模型的内部执行状态。配置中的字典、列表、集合转换为只读包装，任意可变业务对象应放进 state。
+
+这里的状态快照与清单用于恢复，Recorder 事件仍由用户选择存储适配器；默认内存 Recorder 不提供跨进程指标历史。
+
+## 10. 扩展顺序
 
 以下为后续需求，具体 API 和实现将在对应迭代确定：
 
 | 层次 | 候选能力 | 需要先明确的契约 |
 |---|---|---|
-| 单次运行管理 | 配置快照、日志、产物目录、结果持久化与查询 | 配置序列化、产物归属、存储 schema |
-| 批量执行 | 配置到 Pipeline 的构建、机器环境覆盖、本地验证与远端运行 | 单个 Run 描述、运行环境、实验实例工厂 |
-| 失败恢复 | 失败分类、重试、完成跳过、checkpoint 恢复 | 阶段幂等性、用户状态保存与恢复、外部副作用 |
+| 运行查询 | 指标历史、日志、产物检索与对比报告 | 查询与事件存储 schema |
+| 批量运行环境 | 机器环境覆盖、本地验证与远端运行 | 运行环境及进程边界 |
+| 恢复扩展 | 保存器集成、异步保存及跨环境迁移 | 数据一致性、依赖环境及外部副作用 |
 | 数据复用 | 可选阶段缓存、跨 Run 共享产物 | 输入身份、相关配置、阶段版本、随机性与序列化 |
 | 时间评估 | 根据阶段历史耗时和进度计算 ETA、批量可行性 | 总工作量、工作负载差异、预估质量评估 |
 | 调度与资源 | 多进程、设备分配、显存观测、自适应并发 | 进程隔离、资源需求、OOM 分类、并发时的成本变化 |
@@ -211,10 +287,12 @@ models.forecasting.name: patchtst
 
 扩展时优先增加独立服务或适配器，保持 Stage 的业务接口稳定。
 
-## 9. 验证与演进
+## 11. 验证与演进
 
 0.1.0 的行为测试覆盖顺序执行、对象传递、空管道、异常与取消、重复实例、运行隔离、嵌套作用域、指标与进度校验、记录器故障隔离和计时。
 
 配置测试覆盖候选组合、分支独立性、普通列表、模型切换、默认合并、文件路径解析、缺失警告、错误输入和 Run 数据隔离。
+
+批量与恢复测试覆盖队尾顺序、尝试预算、阶段复用、只读配置、state 恢复、两份 checkpoint、损坏回退、保存失败、进程锁、Pipeline 匹配，以及独立子进程的 SIGINT 和突然退出恢复。
 
 版本记录见 [CHANGELOG.md](CHANGELOG.md)，开发和 Git 约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。

@@ -23,13 +23,12 @@ class Add(Stage[int, int]):
         return data + self.amount
 
 
-class Raise(Stage):
-    def __init__(self, error):
-        super().__init__()
-        self.error = error
+def raising(error):
+    class Raise(Stage):
+        def process(self, data, ctx):
+            raise error
 
-    def process(self, data, ctx):
-        raise self.error
+    return Raise
 
 
 class Report(Stage):
@@ -50,11 +49,15 @@ class PipelineTests(unittest.TestCase):
         self.ctx = RunContext(recorder=self.recorder)
 
     def test_order_and_execution_hierarchy(self):
+        class AddThree(Add):
+            def __init__(self):
+                super().__init__(3)
+
         class Double(Stage):
             def process(self, data, ctx):
                 return data * 2
 
-        result = Pipeline([Add(3), Double()]).run(2, self.ctx)
+        result = Pipeline([AddThree, Double]).run(2, self.ctx)
         self.assertEqual(result, 10)
         events = self.recorder.events
         self.assertEqual(
@@ -91,15 +94,20 @@ class PipelineTests(unittest.TestCase):
             def process(self, data, ctx):
                 return {"value": data}
 
-        self.assertEqual(Pipeline([Clear(), Wrap()]).run(object()), {"value": None})
+        self.assertEqual(Pipeline([Clear, Wrap]).run(object()), {"value": None})
 
     def test_failure_stops_downstream_and_preserves_exception(self):
         error = ValueError("bad input")
-        downstream = Add()
+        calls = []
+
+        class Downstream(Stage):
+            def process(self, data, ctx):
+                calls.append(data)
+
         with self.assertRaises(ValueError) as raised:
-            Pipeline([Raise(error), downstream]).run(1, self.ctx)
+            Pipeline([raising(error), Downstream]).run(1, self.ctx)
         self.assertIs(raised.exception, error)
-        self.assertEqual(downstream.calls, 0)
+        self.assertEqual(calls, [])
         finished = self.recorder.events[-2:]
         self.assertEqual([event.status for event in finished], [Status.FAILED] * 2)
         for event in finished:
@@ -112,7 +120,7 @@ class PipelineTests(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 recorder = InMemoryRecorder()
                 with self.assertRaises(type(error)) as raised:
-                    Pipeline([Raise(error)]).run(ctx=RunContext(recorder=recorder))
+                    Pipeline([raising(error)]).run(ctx=RunContext(recorder=recorder))
                 self.assertIs(raised.exception, error)
                 self.assertEqual(
                     [event.status for event in recorder.events[-2:]],
@@ -126,31 +134,38 @@ class PipelineTests(unittest.TestCase):
 
         error = UnprintableError()
         with self.assertRaises(UnprintableError) as raised:
-            Pipeline([Raise(error)]).run(ctx=self.ctx)
+            Pipeline([raising(error)]).run(ctx=self.ctx)
         self.assertIs(raised.exception, error)
         self.assertEqual(self.recorder.events[-1].status, Status.FAILED)
         self.assertEqual(
             self.recorder.events[-1].error_message, "<exception message unavailable>"
         )
 
-    def test_repeated_instance_has_unique_executions_and_retains_state(self):
-        stage = Add()
-        pipeline = Pipeline([stage, stage])
+    def test_repeated_class_has_fresh_instances_and_unique_executions(self):
+        instances = []
+
+        class Capture(Add):
+            def process(self, data, ctx):
+                instances.append(self)
+                return super().process(data, ctx)
+
+        pipeline = Pipeline([Capture, Capture])
         self.assertEqual(pipeline.run(0, self.ctx), 2)
         self.assertEqual(pipeline.run(0, self.ctx), 2)
-        self.assertEqual(stage.calls, 4)
+        self.assertEqual(len({id(stage) for stage in instances}), 4)
+        self.assertTrue(all(stage.calls == 1 for stage in instances))
         starts = [
             event for event in self.recorder.events if event.status is Status.RUNNING
         ]
         self.assertEqual(len({event.execution_id for event in starts}), 6)
 
     def test_pipeline_snapshots_stage_sequence(self):
-        stages = [Add(2)]
+        stages = [Add]
         pipeline = Pipeline(stages)
-        stages.append(Add(100))
+        stages.append(Add)
         self.assertIsInstance(pipeline.stages, tuple)
-        self.assertEqual(pipeline.run(0), 2)
-        self.assertEqual(Pipeline(stage for stage in stages).run(0), 102)
+        self.assertEqual(pipeline.run(0), 1)
+        self.assertEqual(Pipeline(stage for stage in stages).run(0), 2)
 
     def test_stage_can_run_independently_with_monotonic_timing(self):
         with patch("expman.context.perf_counter", side_effect=[10.0, 12.5]):
@@ -161,7 +176,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIsNotNone(start.timestamp.tzinfo)
 
     def test_metrics_and_progress_belong_to_stage(self):
-        Pipeline([Report()]).run(ctx=self.ctx)
+        Pipeline([Report]).run(ctx=self.ctx)
         stage = self.recorder.events[1]
         metric, progress = self.recorder.events[2:4]
         self.assertIsInstance(metric, MetricEvent)
@@ -176,11 +191,11 @@ class PipelineTests(unittest.TestCase):
     def test_nested_pipeline_preserves_parent_scopes(self):
         class Nested(Stage):
             def process(self, data, ctx):
-                result = Pipeline([Add()], name="inner").run(data, ctx)
+                result = Pipeline([Add], name="inner").run(data, ctx)
                 ctx.report_metric("result", result)
                 return result
 
-        self.assertEqual(Pipeline([Nested()]).run(1, self.ctx), 2)
+        self.assertEqual(Pipeline([Nested]).run(1, self.ctx), 2)
         outer, stage, inner, inner_stage = self.recorder.events[:4]
         self.assertEqual(stage.parent_id, outer.execution_id)
         self.assertEqual(inner.parent_id, stage.execution_id)
@@ -192,7 +207,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_recorder_failure_does_not_change_success(self):
         with self.assertLogs("expman.context", level="WARNING"):
-            result = Pipeline([Report(), Add()]).run(
+            result = Pipeline([Report, Add]).run(
                 2, RunContext(recorder=BrokenRecorder())
             )
         self.assertEqual(result, 3)
@@ -203,7 +218,7 @@ class PipelineTests(unittest.TestCase):
             self.assertLogs("expman.context", level="WARNING"),
             self.assertRaises(ValueError) as raised,
         ):
-            Pipeline([Raise(error)]).run(ctx=RunContext(recorder=BrokenRecorder()))
+            Pipeline([raising(error)]).run(ctx=RunContext(recorder=BrokenRecorder()))
         self.assertIs(raised.exception, error)
 
     def test_default_run_contexts_are_independent(self):
@@ -214,7 +229,7 @@ class PipelineTests(unittest.TestCase):
                 contexts.append(ctx)
                 return data
 
-        pipeline = Pipeline([Capture()])
+        pipeline = Pipeline([Capture])
         pipeline.run()
         pipeline.run()
         self.assertNotEqual(contexts[0].run_id, contexts[1].run_id)
@@ -225,6 +240,8 @@ class PipelineTests(unittest.TestCase):
             Stage()
         with self.assertRaises(TypeError):
             Pipeline([lambda data: data])
+        with self.assertRaises(TypeError):
+            Pipeline([Add()])
         for name in ("", " ", 42):
             with self.subTest(name=name):
                 with self.assertRaises(ValueError):
