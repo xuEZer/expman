@@ -1,6 +1,7 @@
-"""Durable sequential experiment queues with bounded retries and recovery."""
+"""Durable experiment queues with bounded retries and recovery."""
 
 import gc
+import math
 import warnings
 from collections import deque
 from pathlib import Path
@@ -10,6 +11,7 @@ from uuid import uuid4
 
 from .config import load_configs
 from .context import _nonnegative_integer
+from .devices import configured_devices
 from .estimation import TimeEstimate, TimeEstimator, validate_coverage
 from .events import Status
 from .experiment import AttemptResult, Experiment, ExperimentResult
@@ -53,6 +55,12 @@ class Batch:
             )
         self.estimate_coverage = validate_coverage(estimate_coverage)
         configs = [cfg] if isinstance(cfg, dict) else load_configs(cfg)
+        self.devices = configured_devices(configs)
+        self._active_gpu = {}
+        self._gpu_history = []
+        self._gpu_memory = {}
+        self._gpu_running_info = {}
+        self._gpu_launch_times = {}
         self.output_dir = (
             Path("runs") / uuid4().hex if output_dir is None else Path(output_dir)
         ).resolve()
@@ -100,9 +108,11 @@ class Batch:
             "experiments": experiments,
             "queue": list(self._queue),
             "active": self._active,
+            "active_gpu": dict(self._active_gpu),
+            "gpu_history": list(self._gpu_history),
             "estimation": {
                 "version": 1,
-                "execution": "sequential",
+                "execution": "gpu" if self.devices else "sequential",
                 "coverage": self.estimate_coverage,
             },
         }
@@ -140,7 +150,7 @@ class Batch:
         if (
             not isinstance(estimation, dict)
             or estimation.get("version") != 1
-            or estimation.get("execution") != "sequential"
+            or estimation.get("execution") not in ("sequential", "gpu")
         ):
             raise StorageError("unsupported estimation environment or version")
         self.estimate_coverage = validate_coverage(estimation.get("coverage"))
@@ -196,6 +206,36 @@ class Batch:
                 )
             experiments.append(experiment)
         self.experiments = tuple(experiments)
+        self.devices = configured_devices([item.cfg for item in experiments])
+        if bool(self.devices) != (estimation["execution"] == "gpu"):
+            raise StorageError(
+                "device configuration does not match execution environment"
+            )
+        self._active_gpu = {}
+        self._gpu_memory = {}
+        self._gpu_running_info = {}
+        self._gpu_launch_times = {}
+        history = manifest.get("gpu_history", [])
+        attempts_by_id = {
+            item.run_id: len(item.result.attempts) for item in experiments
+        }
+        if not isinstance(history, list) or any(
+            not isinstance(item, dict)
+            or item.get("run_id") not in attempts_by_id
+            or type(item.get("attempt")) is not int
+            or not 1 <= item["attempt"] <= attempts_by_id[item["run_id"]]
+            or item.get("device") not in self.devices
+            or not isinstance(item.get("uuid"), str)
+            or any(
+                type(item.get(key)) not in (int, float)
+                or not math.isfinite(item[key])
+                or item[key] < 0
+                for key in ("concurrency", "duration")
+            )
+            for item in history
+        ):
+            raise StorageError("invalid persisted GPU observations")
+        self._gpu_history = list(history)
         self._time_estimator = TimeEstimator(self.experiments)
         ids = {experiment.run_id for experiment in self.experiments}
         self._queue = deque(manifest["queue"])
@@ -207,7 +247,18 @@ class Batch:
             or (active is not None and (active not in ids or active in self._queue))
         ):
             raise StorageError("invalid persisted experiment queue")
-        if active is not None:
+        active_gpu = manifest.get("active_gpu", {})
+        if (
+            not isinstance(active_gpu, dict)
+            or any(
+                run_id not in ids or run_id in self._queue or device not in self.devices
+                for run_id, device in active_gpu.items()
+            )
+            or (active is not None and active_gpu)
+        ):
+            raise StorageError("invalid persisted GPU workers")
+        interrupted = list(active_gpu) if active_gpu else ([active] if active else [])
+        for active in reversed(interrupted):
             experiment = next(
                 item for item in self.experiments if item.run_id == active
             )
@@ -239,6 +290,11 @@ class Batch:
             pending = set(self._queue)
             if self._active is not None:
                 pending.add(self._active)
+            pending.update(self._active_gpu)
+        if self.devices:
+            from .parallel_estimation import estimate_parallel
+
+            return estimate_parallel(self, level)
         return self._time_estimator.estimate(pending, level)
 
     def _next_experiment(self) -> str:
@@ -273,6 +329,10 @@ class Batch:
             error = None
             try:
                 display.start()
+                if self.devices:
+                    from .scheduling import GpuScheduler
+
+                    return GpuScheduler(self).run()
                 return self._run_queue()
             except BaseException as caught:
                 error = caught

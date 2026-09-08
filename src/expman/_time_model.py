@@ -164,7 +164,7 @@ class DurationModel:
         scale = max(1e-9, 1 + 0.5 * (dot(ys, ys) - dot(rhs, mean)))
         return mean, scale
 
-    def draws(self, pending, *, count=768):
+    def draws(self, pending, *, count=768, components=False):
         """Joint draws preserve coefficient/scale uncertainty across experiments."""
         rng = random.Random(0)
         beta = self.mean
@@ -184,7 +184,7 @@ class DurationModel:
             beta = [value + sigma * z for value, z in zip(mean, noise, strict=True)]
             if iteration < 192:
                 continue
-            total = 0.0
+            durations = []
             for index, elapsed in pending:
                 mu = dot(self.vectors[index], beta)
                 log_time = (
@@ -192,8 +192,8 @@ class DurationModel:
                     if elapsed > 0
                     else rng.gauss(mu, sigma)
                 )
-                total += max(0.0, seconds(log_time) - elapsed)
-            yield total
+                durations.append(max(0.0, seconds(log_time) - elapsed))
+            yield durations if components else sum(durations)
 
     def priorities(self, pending):
         """Approximate reduction in uncertainty of the sum of pending durations."""

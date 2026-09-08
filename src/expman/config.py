@@ -214,5 +214,10 @@ def load_configs(path: str | Path) -> list[dict[str, Any]]:
         data = _read_yaml(experiment, allow_choices=True)
     except FileNotFoundError as error:
         raise ConfigError(f"experiment file not found: {experiment}") from error
+    if "device" in data:
+        # A Batch resource list is never an experiment choice.
+        from .devices import configured_devices
+
+        configured_devices([data])
     defaults = _Defaults(experiment)
     return [defaults.resolve(run) for run in _expand(data)]

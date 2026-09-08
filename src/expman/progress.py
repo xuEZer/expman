@@ -71,6 +71,7 @@ class BatchProgress:
     def _snapshot(self):
         with self.batch._state_lock:
             pending = set(self.batch._queue)
+            pending.update(self.batch._active_gpu)
             active = self.batch._active
             if active is not None:
                 pending.add(active)
@@ -83,13 +84,17 @@ class BatchProgress:
                 failed += status is Status.FAILED and experiment.run_id not in pending
                 if experiment.run_id == active:
                     current = index
-            return len(self.batch.experiments), succeeded, failed, current
+            cards = " ".join(
+                f"GPU{device}:{sum(value == device for value in self.batch._active_gpu.values())}运行"
+                for device in self.batch.devices
+            )
+            return len(self.batch.experiments), succeeded, failed, current, cards
 
     def _render(self, *, label="运行中", final=False) -> None:
         if self.disabled:
             return
         try:
-            total, succeeded, failed, current = self._snapshot()
+            total, succeeded, failed, current, cards = self._snapshot()
             try:
                 remaining = str(self.batch.estimate())
             except Exception:
@@ -104,6 +109,8 @@ class BatchProgress:
             completed = succeeded + failed
             percent = 100 if total == 0 else completed * 100 // total
             position = f" | 当前 {current}/{total}" if current is not None else ""
+            if cards:
+                position += f" | {cards}"
             now = self.finished_at if self.finished_at is not None else monotonic()
             minutes = int(max(0, now - self.started_at) // 60)
             days, minutes = divmod(minutes, 24 * 60)

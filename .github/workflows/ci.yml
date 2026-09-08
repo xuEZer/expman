@@ -36,3 +36,4 @@ jobs:
       - run: python examples/batch_pipeline.py
       - run: python examples/checkpoint_pipeline.py
       - run: python examples/estimate_time.py
+      - run: python examples/multi_gpu.py

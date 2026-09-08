@@ -79,7 +79,10 @@ class MetricStore:
             for path, value in rows
         ]
         try:
-            with closing(sqlite3.connect(self.path)) as connection, connection:
+            with (
+                closing(sqlite3.connect(self.path, timeout=30)) as connection,
+                connection,
+            ):
                 connection.execute(
                     """CREATE TABLE IF NOT EXISTS metrics (
                         run_id TEXT NOT NULL,

@@ -1,0 +1,3 @@
+# Use NVIDIA GPU indices from nvidia-smi. [] selects sequential CPU execution.
+device: []
+epochs: !choice [2, 3, 4]
