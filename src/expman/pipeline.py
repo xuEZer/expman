@@ -62,6 +62,11 @@ class Pipeline:
             base = (*base, invocation)
         if context._store is not None:
             context._store.bind_pipeline(base, self.signature())
+        shared = (
+            context._store.shared if context._store is not None and not base else None
+        )
+        parent = "root"
+        lookup = True
         with context.observe(self.name, kind="pipeline") as pipeline_context:
             for index, stage_type in enumerate(self.stages):
                 position = (*base, index)
@@ -72,6 +77,9 @@ class Pipeline:
                     _checkpoint=None,
                 )
                 store = scoped._store
+                if shared is not None:
+                    store.cache_position = position
+                    store.cache_parent = parent
                 if store is not None:
                     completed = store.completed(position)
                     if completed is not None:
@@ -88,13 +96,50 @@ class Pipeline:
                                 context.attempt,
                                 reused=True,
                             )
+                        if shared is not None:
+                            reference = completed.get("_cache_ref")
+                            parent = reference[2] if reference is not None else None
+                            lookup = lookup and completed.get("_shared_reused", False)
                         continue
+                if shared is not None and lookup:
+                    # Own in-progress work has priority over another run's result.
+                    started = (store.stage_dir(position) / "status.pkl").exists()
+                    if not started and not store.checkpoints(position):
+                        candidate = shared.find(parent, position, store.reads.config)
+                        if candidate is not None:
+                            reference, completed = candidate
+                            store.restore_random(completed)
+                            store.metrics.restore(
+                                store.run_id,
+                                context.attempt,
+                                completed.get("metrics", []),
+                            )
+                            store.reference(position, reference, reused=True)
+                            with scoped.observe(
+                                completed["name"], kind="stage", reused=True
+                            ):
+                                scoped.state.clear()
+                                scoped.state.update(completed["state"])
+                                data = completed["output"]
+                                store.status(
+                                    position,
+                                    Status.SUCCEEDED.value,
+                                    context.attempt,
+                                    reused=True,
+                                )
+                            parent = reference[2]
+                            continue
+                    lookup = False
                 checkpoint = None
+                if shared is not None:
+                    store.reads.begin()
                 try:
                     if store is not None:
                         store.status(position, Status.RUNNING.value, context.attempt)
                         checkpoint = store.latest(position, restore_random=True)
                         if checkpoint is not None:
+                            if store.reads is not None:
+                                store.reads.record(())
                             scoped.state.clear()
                             scoped.state.update(checkpoint["state"])
                             scoped._pipeline_calls.update(
@@ -118,6 +163,9 @@ class Pipeline:
                     data = stage.run(data, scoped)
                     if store is not None:
                         store.status(position, Status.SUCCEEDED.value, context.attempt)
+                        if shared is not None:
+                            reference = store.completed_reference(position)
+                            parent = reference[2] if reference is not None else None
                 except BaseException as error:
                     if store is not None:
                         status = (
@@ -134,4 +182,9 @@ class Pipeline:
                                 stacklevel=2,
                             )
                     raise
+                finally:
+                    if shared is not None:
+                        store.reads.end()
+                        store.cache_position = None
+                        store.cache_parent = None
             return data

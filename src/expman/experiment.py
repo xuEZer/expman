@@ -9,10 +9,12 @@ from typing import Any
 from uuid import uuid4
 
 from .context import RunContext, _error_message, _name
+from .dependencies import ConfigurationReads
 from .events import Status
-from .frozen import freeze
+from .frozen import FrozenDict, freeze
 from .metrics import MetricStore
 from .pipeline import Pipeline
+from .prefix_cache import PrefixCache
 from .randomness import RandomStateManager, validate_seed
 from .recorders import InMemoryRecorder, Recorder
 from .storage import RunStore, Serializer, read_record, write_record
@@ -64,6 +66,7 @@ class Experiment:
         serializer: Serializer | None = None,
         _resume: bool = False,
         _metrics_path: Path | None = None,
+        _cache_root: Path | None = None,
     ) -> None:
         if not isinstance(pipeline, Pipeline):
             raise TypeError("pipeline must be a Pipeline")
@@ -87,6 +90,18 @@ class Experiment:
             else _metrics_path
         )
         self._store = RunStore(self.output_dir, serializer)
+        self._cache_root = _cache_root
+        self._reads = ConfigurationReads(self._cfg)
+        if _cache_root is not None:
+            self._store.shared = PrefixCache(
+                _cache_root,
+                pipeline.signature(),
+                self._cfg.get("seed", 0),
+                self._store.serializer,
+            )
+            self._store.reads = self._reads
+            self._store.metrics = self._metrics
+            self._store.run_id = self._run_id
         if not _resume:
             self.output_dir.mkdir(parents=True, exist_ok=False)
             write_record(
@@ -136,7 +151,7 @@ class Experiment:
             ctx = RunContext(
                 run_id=self.run_id,
                 recorder=InMemoryRecorder() if recorder is None else recorder,
-                cfg=deepcopy(self._cfg),
+                cfg=FrozenDict(self._cfg, tracker=self._reads),
                 attempt=attempt,
                 _store=self._store,
                 _metrics=self._metrics,

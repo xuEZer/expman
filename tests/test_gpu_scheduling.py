@@ -20,22 +20,20 @@ class GpuWork(Stage):
         ctx.state["saved"] = ctx.state.get("saved", 0) + 1
         ctx.checkpoint.save()
         (root / f"{ctx.run_id}.checkpoint").touch()
-        if ctx.cfg.get("crash"):
+        if ctx.cfg["crash"]:
             os._exit(7)
-        if ctx.cfg.get("fail_once") and ctx.attempt == 1:
+        if ctx.cfg["fail_once"] and ctx.attempt == 1:
             raise ValueError("retry me")
         for step in range(10):
             ctx.log_metrics({"train": {"loss": step}}, step=step)
         try:
             if ctx.attempt == 1:
                 deadline = monotonic() + 5
-                while (
-                    ctx.cfg.get("wait_for_release") and not (root / "release").exists()
-                ):
+                while ctx.cfg["wait_for_release"] and not (root / "release").exists():
                     if monotonic() > deadline:
                         raise RuntimeError("test release timed out")
                     sleep(0.01)
-                sleep(ctx.cfg.get("delay", 0.1))
+                sleep(ctx.cfg["delay"])
             (root / f"{ctx.run_id}.finished").touch()
             return {
                 "device": os.environ.get("CUDA_VISIBLE_DEVICES"),
@@ -46,6 +44,13 @@ class GpuWork(Stage):
             }
         finally:
             (root / f"{ctx.run_id}.finally").touch()
+
+
+class SharedWork(Stage):
+    def process(self, data, ctx):
+        ctx.state["producer"] = os.getpid()
+        ctx.log_metrics({"loss": 0.25}, step=0)
+        return os.getpid()
 
 
 class Memory:
@@ -80,6 +85,10 @@ class GpuSchedulingTests(unittest.TestCase):
         cfg = {
             "device": [0, 1] if devices is None else devices,
             "markers": str(self.root),
+            "crash": False,
+            "fail_once": False,
+            "wait_for_release": False,
+            "delay": 0.1,
             **options,
         }
         path = self.root / "experiments.yaml"
@@ -114,6 +123,25 @@ class GpuSchedulingTests(unittest.TestCase):
         )
         self.assertEqual(resumed.devices, (0, 1))
 
+    def test_shared_prefix_is_loaded_by_a_new_worker(self):
+        # Use two distinct configs whose difference is irrelevant to SharedWork.
+        path = self.root / "shared.yaml"
+        path.write_text("device: [0]\nunused: !choice [1, 2]\n")
+        batch = Batch(Pipeline([SharedWork]), path, output_dir=self.root / "shared-two")
+        with patch("expman.devices.LAUNCH_INTERVAL", 1.0):
+            results = batch.run(progress=False)
+        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
+        self.assertEqual(results[0].output, results[1].output)
+        references = [
+            experiment._store.completed_reference((0,))
+            for experiment in batch.experiments
+        ]
+        self.assertEqual(references[0], references[1])
+        self.assertEqual(
+            batch.experiments[1]._store.completed((0,))["state"]["producer"],
+            results[0].output,
+        )
+
     def test_failure_and_unexpected_process_exit_get_one_retry(self):
         for crash in (False, True):
             with self.subTest(crash=crash), tempfile.TemporaryDirectory() as temporary:
@@ -122,6 +150,8 @@ class GpuSchedulingTests(unittest.TestCase):
                     {
                         "device": [0],
                         "markers": temporary,
+                        "wait_for_release": False,
+                        "delay": 0.1,
                         "crash": crash,
                         "fail_once": not crash,
                     },

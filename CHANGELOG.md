@@ -4,6 +4,8 @@
 
 ### Added
 
+- 同 Batch 连续前缀自动复用，保守配置读取追踪、共享快照引用、state/RNG/数值指标恢复及 GPU worker 接入。配置 get 和成员存在性查询改为显式报错。
+
 - 根部 seed（默认 0）初始化和 seed_everything()；Python、可选 NumPy/PyTorch 的全局随机状态随阶段快照与 checkpoint 原子保存、重试及进程恢复。
 
 - YAML `device` 驱动的多卡/同卡多进程执行，显存门槛准入、退出门控补位、直接 kill 及跨进程恢复。

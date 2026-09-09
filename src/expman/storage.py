@@ -62,6 +62,12 @@ class RunStore:
         self.root = root
         self.serializer = PickleSerializer() if serializer is None else serializer
         self.rng = None
+        self.shared = None
+        self.reads = None
+        self.metrics = None
+        self.run_id = None
+        self.cache_parent = None
+        self.cache_position = None
 
     def random_snapshot(self) -> dict:
         return {} if self.rng is None else {"rng_state": self.rng.capture()}
@@ -107,6 +113,14 @@ class RunStore:
         if not path.exists():
             return None
         record = read_record(path, self.serializer)
+        if isinstance(record, dict) and "cache_ref" in record:
+            if self.shared is None or record.get("position") != position:
+                raise StorageError(f"cannot resolve shared snapshot: {path}")
+            reference = record["cache_ref"]
+            snapshot = self.shared.load(reference, position)
+            snapshot["_cache_ref"] = reference
+            snapshot["_shared_reused"] = record["shared_reused"]
+            return snapshot
         if (
             not isinstance(record, dict)
             or record.get("position") != position
@@ -117,18 +131,39 @@ class RunStore:
             raise StorageError(f"invalid stage snapshot: {path}")
         return record
 
-    def complete(self, position, output, state, name) -> None:
+    def completed_reference(self, position):
+        record = read_record(
+            self.stage_dir(position) / "completed.pkl", self.serializer
+        )
+        return record.get("cache_ref")
+
+    def reference(self, position, reference, *, reused):
         write_record(
             self.stage_dir(position) / "completed.pkl",
-            {
-                "position": position,
-                "name": name,
-                "output": output,
-                "state": state,
-                **self.random_snapshot(),
-            },
+            {"position": position, "cache_ref": reference, "shared_reused": reused},
             self.serializer,
         )
+
+    def complete(self, position, output, state, name) -> None:
+        record = {
+            "position": position,
+            "name": name,
+            "output": output,
+            "state": state,
+            **self.random_snapshot(),
+        }
+        if (
+            self.shared is not None
+            and self.cache_position == position
+            and self.cache_parent is not None
+        ):
+            record["metrics"] = self.metrics.snapshot(self.run_id, position)
+            reference = self.shared.publish(self.cache_parent, record, self.reads)
+            self.reference(position, reference, reused=False)
+        else:
+            write_record(
+                self.stage_dir(position) / "completed.pkl", record, self.serializer
+            )
 
     def checkpoints(self, position) -> list[Path]:
         directory = self.stage_dir(position) / "checkpoints"
@@ -174,6 +209,8 @@ class Checkpoint:
             isinstance(step, bool) or not isinstance(step, int) or step < 0
         ):
             raise ValueError("step must be a nonnegative integer or None")
+        if self._store.reads is not None:
+            self._store.reads.record(())
         existing = self._store.checkpoints(self._position)
         sequence = int(existing[0].stem) + 1 if existing else 1
         path = (

@@ -78,6 +78,9 @@ class MetricStore:
             )
             for path, value in rows
         ]
+        self._write(parameters)
+
+    def _write(self, parameters):
         try:
             with (
                 closing(sqlite3.connect(self.path, timeout=30)) as connection,
@@ -106,3 +109,35 @@ class MetricStore:
             raise StorageError(
                 f"could not save metrics to {self.path}: {error}"
             ) from error
+
+    def snapshot(self, run_id, prefix):
+        if not self.path.exists():
+            return []
+        try:
+            with closing(sqlite3.connect(self.path, timeout=30)) as connection:
+                if not connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name='metrics'"
+                ).fetchone():
+                    return []
+                rows = connection.execute(
+                    "SELECT stage_path, step, metric_path, value FROM metrics WHERE run_id=?",
+                    (run_id,),
+                ).fetchall()
+            return [
+                row
+                for row in rows
+                if tuple(json.loads(row[0]))[: len(prefix)] == prefix
+            ]
+        except (sqlite3.Error, OSError, ValueError) as error:
+            raise StorageError(f"could not snapshot stage metrics: {error}") from error
+
+    def restore(self, run_id, attempt, rows):
+        if not rows:
+            return
+        timestamp = datetime.now(timezone.utc).isoformat()
+        self._write(
+            [
+                (run_id, stage_path, step, metric_path, value, attempt, timestamp)
+                for stage_path, step, metric_path, value in rows
+            ]
+        )

@@ -300,7 +300,7 @@ python examples/multi_gpu.py --resume runs/<batch_id>
 
 ### 随机种子与随机状态恢复
 
-Experiment 启动时自动读取根部 `seed`，默认 `0`，在构造和执行 Stage 前设置 Python `random`、环境中已安装的 NumPy 全局随机生成器，以及 PyTorch CPU/CUDA 随机种子。种子必须是 `0` 到 `2**32 - 1` 的整数，不接受布尔值。嵌套配置中的同名字段由用户代码解释。缺省值不补写原配置，业务代码需要读取默认值时可用 `ctx.cfg.get("seed", 0)`。
+Experiment 启动时自动读取根部 `seed`，默认 `0`，在构造和执行 Stage 前设置 Python `random`、环境中已安装的 NumPy 全局随机生成器，以及 PyTorch CPU/CUDA 随机种子。种子必须是 `0` 到 `2**32 - 1` 的整数，不接受布尔值。嵌套配置中的同名字段由用户代码解释。缺省值不补写原配置；业务代码若需要读取种子，应在 YAML 中显式填写根部 `seed`。
 
 ```yaml
 seed: 42
@@ -328,3 +328,15 @@ seed_everything(42)
 独立的 `random.Random`、NumPy `Generator/default_rng`、`torch.Generator`、DataLoader 工作进程及第三方库的状态由用户保存。此功能不自动开启确定性 GPU 算法、不控制 Python hash 随机化，也不保证跨库版本或硬件逐位一致；参见 [PyTorch 可复现性说明](https://docs.pytorch.org/docs/stable/notes/randomness.html)。直接使用未受 Experiment 管理的 Pipeline/Stage，不会自动设置全局种子。
 
 完整示例：`python examples/random_state.py`。
+
+## 同 Batch 连续前缀复用
+
+Batch 自动共享已完成的阶段结果。Pipeline 从 0 号阶段开始匹配读取过的配置；一旦某阶段不匹配，本次 run 后续阶段全部实际执行。根部 seed 和 Pipeline 定义参与缓存隔离。阶段无需声明依赖，读取 ctx.cfg 时自动记录。
+
+例如两个实验仅 model 不同，阶段 0 只读取 data，阶段 1 读取 model，那么第二个实验可以复用阶段 0。命中时恢复返回值、完整 state 和随机数状态，并将该阶段的数值指标写入当前 run 的 SQLite 记录。示例：`python examples/shared_prefix.py`。
+
+配置读取采用保守规则：读取 `ctx.cfg["data"]` 就记录整个 data 子树，即使后面只用其中一个字段；列表同样处理。遍历整个配置会记录整个配置。配置中的字段必须显式声明，`get()` 和 `in` 判断抛出 TypeError，索引不存在的字段抛出 KeyError。state 仍是普通字典。阶段使用 checkpoint 时，保守地将完整配置作为依赖，确保续跑不会遗漏中断前的读取。
+
+共享快照位于 Batch 的 cache 目录，各 run 的 completed.pkl 保存引用；移动实验记录时应保留完整 Batch 目录。自身已有快照和 checkpoint 优先恢复。并发进程只读取已经发布完成的共享节点，同时启动的相同工作仍可能各自计算。嵌套 Pipeline 的配置读取计入外层阶段。
+
+复用以相同上游、相关配置和随机状态产生一致结果为前提；文件内容变化等外部输入需通过配置中的版本字段表达。跳过阶段不会重新执行其中的外部副作用。独立 Experiment 保留自身恢复行为，共享范围限于同一个 Batch。

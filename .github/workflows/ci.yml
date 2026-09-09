@@ -38,6 +38,7 @@ jobs:
       - run: python examples/estimate_time.py
       - run: python examples/multi_gpu.py
       - run: python examples/random_state.py
+      - run: python examples/shared_prefix.py
 
   random-backends:
     runs-on: ubuntu-latest

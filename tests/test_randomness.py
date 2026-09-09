@@ -127,10 +127,7 @@ class RandomnessTests(unittest.TestCase):
         batch.run(progress=False)
         expected = random.Random(7)
         self.assertEqual(observed, [(expected.random(), expected.random())] * 2)
-        snapshot = read_record(
-            batch.experiments[0]._store.stage_dir((0,)) / "completed.pkl",
-            PickleSerializer(),
-        )
+        snapshot = batch.experiments[0]._store.completed((0,))
         self.assertIn("rng_state", snapshot)
         self.assertEqual(snapshot["state"], {})
 

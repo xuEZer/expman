@@ -135,6 +135,7 @@ class GpuScheduler:
                     "output_dir": experiment.output_dir,
                     "serializer": batch._serializer,
                     "metrics_path": experiment._metrics.path,
+                    "cache_root": experiment._cache_root,
                     "attempts": [
                         replace(item, output=None)
                         for item in experiment.result.attempts

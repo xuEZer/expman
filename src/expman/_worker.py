@@ -55,6 +55,7 @@ def main():
         output_dir=payload["output_dir"],
         serializer=payload["serializer"],
         _metrics_path=payload["metrics_path"],
+        _cache_root=payload["cache_root"],
         _resume=True,
     )
     experiment._attempts = payload["attempts"]

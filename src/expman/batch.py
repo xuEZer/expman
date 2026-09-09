@@ -78,6 +78,7 @@ class Batch:
                 output_dir=self.output_dir / "experiments" / run_id,
                 serializer=self._serializer,
                 _metrics_path=self.output_dir / "metrics.sqlite3",
+                _cache_root=self.output_dir / "cache",
             )
             for config in configs
         )
@@ -185,6 +186,7 @@ class Batch:
                 output_dir=root,
                 serializer=self._serializer,
                 _metrics_path=self.output_dir / "metrics.sqlite3",
+                _cache_root=self.output_dir / "cache",
                 _resume=True,
             )
             for attempt in entry["attempts"]:
