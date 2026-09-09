@@ -17,6 +17,7 @@ from .events import Status
 from .experiment import AttemptResult, Experiment, ExperimentResult
 from .pipeline import Pipeline
 from .progress import BatchProgress
+from .randomness import validate_seed
 from .recorders import InMemoryRecorder, Recorder
 from .storage import (
     PickleSerializer,
@@ -55,6 +56,8 @@ class Batch:
             )
         self.estimate_coverage = validate_coverage(estimate_coverage)
         configs = [cfg] if isinstance(cfg, dict) else load_configs(cfg)
+        for config in configs:
+            validate_seed(config.get("seed", 0))
         self.devices = configured_devices(configs)
         self._active_gpu = {}
         self._gpu_history = []

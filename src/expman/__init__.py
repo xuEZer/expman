@@ -7,6 +7,7 @@ from .estimation import TimeEstimate
 from .events import Event, ExecutionEvent, MetricEvent, ProgressEvent, Status
 from .experiment import AttemptResult, Experiment, ExperimentResult
 from .pipeline import Pipeline
+from .randomness import seed_everything
 from .recorders import InMemoryRecorder, Recorder
 from .stage import Stage
 from .storage import (
@@ -41,4 +42,5 @@ __all__ = [
     "Status",
     "TimeEstimate",
     "load_configs",
+    "seed_everything",
 ]

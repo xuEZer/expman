@@ -296,3 +296,35 @@ python examples/multi_gpu.py --resume runs/<batch_id>
 ```
 
 设备 UUID 与可见设备编号的规则参见 [NVIDIA CUDA_VISIBLE_DEVICES 文档](https://docs.nvidia.com/deploy/topics/topic_5_2_1.html)。
+
+
+### 随机种子与随机状态恢复
+
+Experiment 启动时自动读取根部 `seed`，默认 `0`，在构造和执行 Stage 前设置 Python `random`、环境中已安装的 NumPy 全局随机生成器，以及 PyTorch CPU/CUDA 随机种子。种子必须是 `0` 到 `2**32 - 1` 的整数，不接受布尔值。嵌套配置中的同名字段由用户代码解释。缺省值不补写原配置，业务代码需要读取默认值时可用 `ctx.cfg.get("seed", 0)`。
+
+```yaml
+seed: 42
+models:
+  forecasting:
+    name: patchtst
+```
+
+NumPy/PyTorch 是可选依赖，run 启动时会主动导入已安装的库，不需要用户预先 import；未安装时跳过，已安装但导入失败则正常报错。可以在库外单独调用相同的初始化函数：
+
+```python
+from expman import seed_everything
+
+seed_everything(42)
+```
+
+每个 run 将初始化后的随机状态原子写入 `experiments/<run_id>/rng_initial.pkl`。重试和恢复读取此记录，不重复设种子；随后按已有阶段快照和 checkpoint 恢复到相应位置。阶段完成快照及 checkpoint 都包含独立的 `rng_state` 字段，与业务 state 在同一文件、同一事务中保存，不占用 `ctx.state`。框架仍只保留最近两份 checkpoint。
+
+复用本 run 已完成阶段时恢复该阶段结束时的随机状态；失败阶段有 checkpoint 时恢复它，没有则从阶段入口的随机状态重跑。为避免 Stage 构造函数消耗随机数影响续跑，checkpoint 的随机状态在构造前验证恢复，并在构造后、执行阶段前再次恢复。用户在 `process()` 中重建模型、恢复数据迭代器等准备工作若消耗随机数，仍需自行管理这段恢复逻辑。
+
+随机状态记录覆盖 Python 全局生成器（含 Gaussian 缓存）、NumPy 全局 RandomState、PyTorch CPU 及全部可见 CUDA 设备的生成器。NumPy 数组转为普通列表、PyTorch ByteTensor 转为 bytes 存储，因此仅查看快照元数据不会为了随机状态反序列化 CUDA Tensor。保存可见 CUDA 状态会初始化相关生成器，需要可用的 CUDA 环境；GPU 调度器已在子进程启动前限制设备可见范围。
+
+损坏的随机 checkpoint 会 warning 并尝试上一份，损坏的初始随机状态或已完成阶段随机状态会报错。旧版快照缺少随机状态时仍可恢复业务数据，但会发出 `RecoveryWarning`，不能保证随机序列连续。恢复所需的随机库缺失、CUDA 状态数量与可见设备不一致等不兼容情况会报错。
+
+独立的 `random.Random`、NumPy `Generator/default_rng`、`torch.Generator`、DataLoader 工作进程及第三方库的状态由用户保存。此功能不自动开启确定性 GPU 算法、不控制 Python hash 随机化，也不保证跨库版本或硬件逐位一致；参见 [PyTorch 可复现性说明](https://docs.pytorch.org/docs/stable/notes/randomness.html)。直接使用未受 Experiment 管理的 Pipeline/Stage，不会自动设置全局种子。
+
+完整示例：`python examples/random_state.py`。

@@ -4,6 +4,8 @@
 
 ### Added
 
+- 根部 seed（默认 0）初始化和 seed_everything()；Python、可选 NumPy/PyTorch 的全局随机状态随阶段快照与 checkpoint 原子保存、重试及进程恢复。
+
 - YAML `device` 驱动的多卡/同卡多进程执行，显存门槛准入、退出门控补位、直接 kill 及跨进程恢复。
 - 按卡 CLI 运行数、独立尝试日志、Recorder 汇总、并发 SQLite 写入和基于当前并发规模的剩余时间区间。
 

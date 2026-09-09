@@ -13,8 +13,9 @@ from .events import Status
 from .frozen import freeze
 from .metrics import MetricStore
 from .pipeline import Pipeline
+from .randomness import RandomStateManager, validate_seed
 from .recorders import InMemoryRecorder, Recorder
-from .storage import RunStore, Serializer, write_record
+from .storage import RunStore, Serializer, read_record, write_record
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class Experiment:
             raise TypeError("cfg must be a dictionary")
         self.pipeline = pipeline
         self._cfg = deepcopy(cfg)
+        validate_seed(self._cfg.get("seed", 0))
         freeze(self._cfg)
         self._run_id = uuid4().hex if run_id is None else run_id
         _name(self._run_id, "run_id")
@@ -123,6 +125,14 @@ class Experiment:
         error_type = None
         error_message = None
         try:
+            rng = RandomStateManager(self._cfg.get("seed", 0))
+            initial = self.output_dir / "rng_initial.pkl"
+            if initial.exists():
+                rng.restore(read_record(initial, self._store.serializer))
+            else:
+                rng.seed()
+                write_record(initial, rng.capture(), self._store.serializer)
+            self._store.rng = rng
             ctx = RunContext(
                 run_id=self.run_id,
                 recorder=InMemoryRecorder() if recorder is None else recorder,

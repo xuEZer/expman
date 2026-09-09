@@ -81,6 +81,7 @@ class Pipeline:
                             scoped.state.clear()
                             scoped.state.update(completed["state"])
                             data = completed["output"]
+                            store.restore_random(completed)
                             store.status(
                                 position,
                                 Status.SUCCEEDED.value,
@@ -88,10 +89,11 @@ class Pipeline:
                                 reused=True,
                             )
                         continue
+                checkpoint = None
                 try:
                     if store is not None:
                         store.status(position, Status.RUNNING.value, context.attempt)
-                        checkpoint = store.latest(position)
+                        checkpoint = store.latest(position, restore_random=True)
                         if checkpoint is not None:
                             scoped.state.clear()
                             scoped.state.update(checkpoint["state"])
@@ -108,7 +110,12 @@ class Pipeline:
                                 scoped._pipeline_calls,
                             ),
                         )
-                    data = stage_type().run(data, scoped)
+                    stage = stage_type()
+                    if checkpoint is not None:
+                        # Reconstruction may consume randomness; process resumes at
+                        # the checkpoint's RNG position, not after reconstruction.
+                        store.restore_random(checkpoint)
+                    data = stage.run(data, scoped)
                     if store is not None:
                         store.status(position, Status.SUCCEEDED.value, context.attempt)
                 except BaseException as error:

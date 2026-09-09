@@ -9,6 +9,7 @@ from time import monotonic, sleep
 
 SCRIPT = """
 import os
+import random
 import sys
 from pathlib import Path
 from time import sleep
@@ -25,6 +26,7 @@ class Memory:
 class Work(Stage):
     def process(self, data, ctx):
         root = Path(ctx.cfg["markers"])
+        ctx.state.setdefault("draws", []).append(random.random())
         ctx.state["count"] = ctx.state.get("count", 0) + 1
         ctx.checkpoint.save()
         (root / (ctx.run_id + ".pid")).write_text(str(os.getpid()))
@@ -33,7 +35,7 @@ class Work(Stage):
                 sleep(60)
             finally:
                 (root / (ctx.run_id + ".finally")).touch()
-        return ctx.state["count"]
+        return ctx.state
 
 if __name__ == "__main__":
     root = Path(sys.argv[1])
@@ -47,7 +49,9 @@ if __name__ == "__main__":
         cfg.write_text(f"device: [0, 1]\\nmarkers: {root}\\nitem: !choice [1, 2]\\n")
         batch = Batch(Pipeline([Work]), cfg, output_dir=root / "batch")
     results = batch.run(refresh_interval=0.02)
-    assert all(result.output == 2 for result in results), results
+    expected = random.Random(0)
+    values = [expected.random(), expected.random()]
+    assert all(result.output == {"count": 2, "draws": values} for result in results), results
     assert all(len(result.attempts) == 2 for result in results), results
 """
 

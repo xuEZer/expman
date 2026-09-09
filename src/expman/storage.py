@@ -61,6 +61,22 @@ class RunStore:
     def __init__(self, root: Path, serializer: Serializer | None = None):
         self.root = root
         self.serializer = PickleSerializer() if serializer is None else serializer
+        self.rng = None
+
+    def random_snapshot(self) -> dict:
+        return {} if self.rng is None else {"rng_state": self.rng.capture()}
+
+    def restore_random(self, record: dict) -> None:
+        if self.rng is None:
+            return
+        if "rng_state" not in record:
+            warnings.warn(
+                "legacy snapshot has no random state; exact random replay is unavailable",
+                RecoveryWarning,
+                stacklevel=2,
+            )
+            return
+        self.rng.restore(record["rng_state"])
 
     def stage_dir(self, position: tuple[int, ...]) -> Path:
         return self.root.joinpath("stages", *(str(index) for index in position))
@@ -109,6 +125,7 @@ class RunStore:
                 "name": name,
                 "output": output,
                 "state": state,
+                **self.random_snapshot(),
             },
             self.serializer,
         )
@@ -117,7 +134,7 @@ class RunStore:
         directory = self.stage_dir(position) / "checkpoints"
         return sorted(directory.glob("[0-9]*.pkl"), reverse=True)
 
-    def latest(self, position) -> dict | None:
+    def latest(self, position, *, restore_random=False) -> dict | None:
         for path in self.checkpoints(position):
             try:
                 record = read_record(path, self.serializer)
@@ -132,6 +149,8 @@ class RunStore:
                     )
                 ):
                     raise StorageError(f"invalid checkpoint: {path}")
+                if restore_random:
+                    self.restore_random(record)
                 return record
             except StorageError as error:
                 warnings.warn(str(error), RecoveryWarning, stacklevel=2)
@@ -169,6 +188,7 @@ class Checkpoint:
                 "step": step,
                 "state": self._state,
                 "pipeline_calls": self._pipeline_calls,
+                **self._store.random_snapshot(),
             },
             self._store.serializer,
         )
