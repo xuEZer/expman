@@ -9,6 +9,13 @@ from .config import ConfigError
 MEMORY_MARGIN = 0.1
 LAUNCH_INTERVAL = 5.0
 POLL_INTERVAL = 0.2
+QUERY_TIMEOUT = 10.0
+QUERY_RETRY_INTERVAL = 1.0
+QUERY_FAILURE_LIMIT = 3
+
+
+class MemoryObservationError(RuntimeError):
+    """A transient query failure; the scheduler may retry without launching work."""
 
 
 def configured_devices(configs) -> tuple[int, ...]:
@@ -57,7 +64,7 @@ class NvidiaMemory:
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=QUERY_TIMEOUT,
             )
             values = {}
             for line in result.stdout.splitlines():
@@ -76,10 +83,10 @@ class NvidiaMemory:
                 raise ValueError("selected GPUs are missing from nvidia-smi")
             identities = {index: value.uuid for index, value in values.items()}
             if self.identities is not None and identities != self.identities:
-                raise ValueError("GPU identities changed while the Batch was running")
+                raise RuntimeError("GPU identities changed while the Batch was running")
             self.identities = identities
             return values
         except (OSError, subprocess.SubprocessError, ValueError) as error:
-            raise RuntimeError(
-                f"could not observe selected NVIDIA GPUs: {error}"
+            raise MemoryObservationError(
+                f"could not query selected NVIDIA GPUs: {error}"
             ) from error

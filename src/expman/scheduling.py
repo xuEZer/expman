@@ -244,6 +244,7 @@ class GpuScheduler:
             self.batch._save()
 
     def run(self):
+        observation_failures = 0
         try:
             while self.batch._queue or self.workers:
                 for run_id, worker in list(self.workers.items()):
@@ -253,7 +254,26 @@ class GpuScheduler:
                 if not self.batch._queue and not self.workers:
                     break
                 self._account()
-                memory = self.monitor.sample()
+                try:
+                    memory = self.monitor.sample()
+                except devices.MemoryObservationError as error:
+                    observation_failures += 1
+                    with self.batch._state_lock:
+                        self.batch._gpu_memory = {}
+                    if observation_failures >= devices.QUERY_FAILURE_LIMIT:
+                        raise RuntimeError(
+                            "GPU memory monitoring failed after "
+                            f"{observation_failures} consecutive queries: {error}"
+                        ) from error
+                    warnings.warn(
+                        f"GPU memory query failed ({observation_failures}/"
+                        f"{devices.QUERY_FAILURE_LIMIT}); new launches paused: {error}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    sleep(devices.QUERY_RETRY_INTERVAL)
+                    continue
+                observation_failures = 0
                 with self.batch._state_lock:
                     self.batch._gpu_memory = {
                         device: value.free_ratio for device, value in memory.items()

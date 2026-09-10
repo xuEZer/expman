@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +8,7 @@ from time import monotonic, sleep
 from unittest.mock import patch
 
 from expman import Batch, ConfigError, Pipeline, Stage, Status
-from expman.devices import DeviceMemory, NvidiaMemory
+from expman.devices import DeviceMemory, MemoryObservationError, NvidiaMemory
 from expman.scheduling import Gate
 
 IMPORT_DEVICE = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -74,6 +75,7 @@ class GpuSchedulingTests(unittest.TestCase):
             ("expman.devices.NvidiaMemory", Memory),
             ("expman.devices.LAUNCH_INTERVAL", 0.02),
             ("expman.devices.POLL_INTERVAL", 0.01),
+            ("expman.devices.QUERY_RETRY_INTERVAL", 0.01),
         ]:
             mock = patch(target, value)
             mock.start()
@@ -225,22 +227,76 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(result.status, Status.SUCCEEDED)
         self.assertEqual(result.output["saved"], 2)
 
+    def test_transient_memory_failure_keeps_worker_and_pauses_launches(self):
+        batch = self.make_batch(count=2, delay=0.2, devices=[0])
+        original = Memory.sample
+        failures = 0
+        observations_after_failure = 0
+
+        def intermittent(monitor):
+            nonlocal failures, observations_after_failure
+            if batch._active_gpu and failures < 2:
+                failures += 1
+                self.assertEqual(len(batch._active_gpu), 1)
+                raise MemoryObservationError("query timeout")
+            if failures:
+                observations_after_failure += 1
+            return original(monitor)
+
+        with (
+            patch.object(Memory, "sample", intermittent),
+            self.assertWarns(RuntimeWarning),
+        ):
+            results = batch.run(progress=False)
+        self.assertEqual(failures, 2)
+        self.assertGreater(observations_after_failure, 0)
+        self.assertTrue(all(result.status is Status.SUCCEEDED for result in results))
+        self.assertTrue(all(len(result.attempts) == 1 for result in results))
+
+    def test_query_failure_counter_resets_after_success(self):
+        batch = self.make_batch(count=1, delay=0.1)
+        original = Memory.sample
+        calls = 0
+
+        def alternating(monitor):
+            nonlocal calls
+            calls += 1
+            if calls in (1, 2, 4, 5):
+                raise MemoryObservationError("temporary query failure")
+            return original(monitor)
+
+        with (
+            patch.object(Memory, "sample", alternating),
+            self.assertWarns(RuntimeWarning),
+        ):
+            results = batch.run(progress=False)
+        self.assertEqual(results[0].status, Status.SUCCEEDED)
+        self.assertEqual(len(results[0].attempts), 1)
+
     def test_missing_memory_observation_stops_and_cleans_up(self):
         batch = self.make_batch(count=1, delay=30)
         original = Memory.sample
 
+        failures = 0
+
         def broken(monitor):
+            nonlocal failures
             if list(self.root.glob("*.checkpoint")):
-                raise RuntimeError("monitor unavailable")
+                failures += 1
+                raise MemoryObservationError("monitor unavailable")
             return original(monitor)
 
         with (
             patch.object(Memory, "sample", broken),
-            self.assertRaisesRegex(RuntimeError, "monitor unavailable"),
+            self.assertRaisesRegex(
+                RuntimeError, "3 consecutive queries: monitor unavailable"
+            ),
+            self.assertWarns(RuntimeWarning),
         ):
             batch.run(progress=False)
         self.assertEqual(batch.results[0].status, Status.CANCELLED)
         self.assertFalse(batch._active_gpu)
+        self.assertEqual(failures, 3)
 
 
 class DeviceTests(unittest.TestCase):
@@ -267,6 +323,17 @@ class DeviceTests(unittest.TestCase):
         gate.blocked = True
         self.assertFalse(gate.can_launch(0.9, 100, ["a"]))
         self.assertTrue(gate.can_launch(0.9, 100, []))
+
+    def test_query_timeout_is_retryable_and_uses_internal_timeout(self):
+        with (
+            patch(
+                "expman.devices.subprocess.run",
+                side_effect=subprocess.TimeoutExpired("nvidia-smi", 10),
+            ) as query,
+            self.assertRaises(MemoryObservationError),
+        ):
+            NvidiaMemory((0,)).sample()
+        self.assertEqual(query.call_args.kwargs["timeout"], 10.0)
 
     def test_nvidia_memory_validates_observations_and_identities(self):
         with patch("expman.devices.subprocess.run") as query:
