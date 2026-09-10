@@ -203,10 +203,10 @@ class DurationModel:
             for j, value in enumerate(self.vectors[index]):
                 gradient[j] += weight * value
         scores = {}
+        projected_gradient = _forward(self.lower, gradient)
         for index in pending:
-            x = self.vectors[index]
-            covariance_x = _solve(self.lower, x)
-            scores[index] = dot(gradient, covariance_x) ** 2 / (
-                1 + dot(x, covariance_x)
+            projected_x = _forward(self.lower, self.vectors[index])
+            scores[index] = dot(projected_gradient, projected_x) ** 2 / (
+                1 + dot(projected_x, projected_x)
             )
         return scores

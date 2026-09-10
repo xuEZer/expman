@@ -186,7 +186,9 @@ class ProgressTests(unittest.TestCase):
         stderr = Output()
         with (
             redirect_stderr(stderr),
-            patch.object(batch, "estimate", side_effect=ValueError("unavailable")),
+            patch.object(
+                batch, "_display_estimate", side_effect=ValueError("unavailable")
+            ),
             self.assertLogs("expman.progress", level="WARNING") as logs,
         ):
             result = batch.run()[0]

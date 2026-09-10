@@ -54,6 +54,10 @@ class TimeEstimator:
         self.experiments = experiments
         self.vectors = features([item.cfg for item in experiments])
         self.indices = {item.run_id: index for index, item in enumerate(experiments)}
+        self._priority_scores = {}
+        self._priority_observations = None
+        self._distance_visited = set()
+        self._distances = [math.inf] * len(experiments)
 
     def _observations(self, pending_ids):
         completed, censored, pending, visited = [], [], [], []
@@ -91,6 +95,43 @@ class TimeEstimator:
             len(completed),
             len(pending),
         )
+
+    def refresh_priorities(self, remaining_ids):
+        """Refresh information scores off the dispatch path when observations change."""
+        completed, _, _, _ = self._observations(set(remaining_ids))
+        signature = tuple(completed)
+        if signature == self._priority_observations:
+            return
+        scores = (
+            DurationModel(self.vectors, completed, []).priorities(
+                [self.indices[run_id] for run_id in remaining_ids]
+            )
+            if completed
+            else {}
+        )
+        self._priority_scores = scores
+        self._priority_observations = signature
+
+    def choose_cached(self, candidates, *, remaining_ids):
+        """Use published scores and incrementally updated diversity distances."""
+        scores = self._priority_scores
+        scale = max(scores.values(), default=1.0) or 1.0
+        index = max(
+            (self.indices[run_id] for run_id in candidates),
+            key=lambda index: (
+                round(scores.get(index, 0.0) / scale, 12),
+                self._distances[index] if self._distance_visited else 0.0,
+                -index,
+            ),
+        )
+        # Each dispatch updates diversity once; startup never scans all pairs of
+        # historical and pending runs while holding the scheduler lock.
+        vector = self.vectors[index]
+        for other, candidate in enumerate(self.vectors):
+            distance = sum((a - b) ** 2 for a, b in zip(candidate, vector, strict=True))
+            self._distances[other] = min(self._distances[other], distance)
+        self._distance_visited.add(index)
+        return self.experiments[index].run_id
 
     def choose(self, candidates, *, remaining_ids):
         """Choose information about the remaining total, with diversity tie breaks."""

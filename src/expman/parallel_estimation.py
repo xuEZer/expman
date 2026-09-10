@@ -1,5 +1,6 @@
 """Conditional makespan intervals using observed concurrent experiment durations."""
 
+from collections import defaultdict
 from time import perf_counter
 
 from ._time_model import DurationModel, features
@@ -41,8 +42,11 @@ def estimate_parallel(batch, coverage):
         assignments[run_id] = device
         loads[device] += 1
     configs = []
+    history_by_run = defaultdict(list)
+    for item in history:
+        history_by_run[item["run_id"]].append(item)
     for experiment in batch.experiments:
-        records = [item for item in history if item["run_id"] == experiment.run_id]
+        records = history_by_run[experiment.run_id]
         if experiment.run_id in running:
             records.append(running[experiment.run_id])
         duration = sum(item["duration"] for item in records)

@@ -96,7 +96,7 @@ class BatchProgress:
         try:
             total, succeeded, failed, current, cards = self._snapshot()
             try:
-                remaining = str(self.batch.estimate())
+                remaining = str(self.batch._display_estimate())
             except Exception:
                 remaining = _UNKNOWN
                 if not self.warned:

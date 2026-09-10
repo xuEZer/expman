@@ -2,6 +2,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from time import monotonic, sleep
@@ -272,6 +273,47 @@ class GpuSchedulingTests(unittest.TestCase):
             results = batch.run(progress=False)
         self.assertEqual(results[0].status, Status.SUCCEEDED)
         self.assertEqual(len(results[0].attempts), 1)
+
+    def test_slow_background_scores_do_not_block_worker_launches(self):
+        batch = self.make_batch(count=2, delay=0.1, devices=[0])
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def slow_scores(pending):
+            entered.set()
+            if not release.wait(20):
+                raise RuntimeError("test did not release background computation")
+
+        def run():
+            try:
+                batch.run(progress=False)
+            except BaseException as error:
+                errors.append(error)
+
+        with patch.object(
+            batch._time_estimator, "refresh_priorities", side_effect=slow_scores
+        ):
+            thread = threading.Thread(target=run)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                deadline = monotonic() + 10
+                while (
+                    len(list(self.root.glob("*.checkpoint"))) < 2
+                    and monotonic() < deadline
+                ):
+                    sleep(0.01)
+                self.assertEqual(len(list(self.root.glob("*.checkpoint"))), 2)
+                self.assertFalse(release.is_set())
+            finally:
+                release.set()
+                thread.join(20)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(
+            all(result.status is Status.SUCCEEDED for result in batch.results)
+        )
 
     def test_missing_memory_observation_stops_and_cleans_up(self):
         batch = self.make_batch(count=1, delay=30)

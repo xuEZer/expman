@@ -123,10 +123,14 @@ class Batch:
             )
 
     def _timing_loop(self, stopped):
-        while not stopped.wait(TIMING_SAVE_INTERVAL):
+        while not stopped.is_set():
             try:
                 try:
-                    self.estimate()
+                    if self.devices:
+                        with self._state_lock:
+                            pending = list(self._queue) + list(self._active_gpu)
+                        self._time_estimator.refresh_priorities(pending)
+                    self._refresh_estimate(self.estimate_coverage)
                 finally:
                     self._save_timing()
             except Exception as error:
@@ -135,6 +139,7 @@ class Batch:
                     RecoveryWarning,
                     stacklevel=2,
                 )
+            stopped.wait(TIMING_SAVE_INTERVAL)
 
     def _save(self) -> None:
         experiments = []
@@ -373,6 +378,24 @@ class Batch:
         level = (
             self.estimate_coverage if coverage is None else validate_coverage(coverage)
         )
+        return self._refresh_estimate(level)
+
+    def _display_estimate(self):
+        """Read the latest background estimate without fitting on the CLI thread."""
+        with self._state_lock:
+            pending = set(self._queue) | set(self._active_gpu)
+            if self._active is not None:
+                pending.add(self._active)
+            if not pending:
+                return TimeEstimate(0.0, 0.0, self.estimate_coverage, 0, 0)
+            if (
+                self._last_estimate is not None
+                and self._last_estimate.coverage == self.estimate_coverage
+            ):
+                return self._last_estimate
+            return TimeEstimate(None, None, self.estimate_coverage, 0, len(pending))
+
+    def _refresh_estimate(self, level):
         with self._state_lock:
             pending = set(self._queue)
             if self._active is not None:
@@ -408,7 +431,12 @@ class Batch:
         fresh = [run_id for run_id in self._queue if not by_id[run_id].result.attempts]
         if not fresh:
             return self._queue.popleft()
-        chosen = self._time_estimator.choose(fresh, remaining_ids=list(self._queue))
+        choose = (
+            self._time_estimator.choose_cached
+            if self.devices
+            else self._time_estimator.choose
+        )
+        chosen = choose(fresh, remaining_ids=list(self._queue))
         self._queue.remove(chosen)
         return chosen
 
