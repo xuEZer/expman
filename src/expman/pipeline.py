@@ -146,7 +146,9 @@ class Pipeline:
                         checkpoint = store.latest(position, restore_random=True)
                         if checkpoint is not None:
                             if store.reads is not None:
-                                store.reads.record(())
+                                store.reads.restore(
+                                    checkpoint.get("config_dependencies")
+                                )
                             scoped.state.clear()
                             scoped.state.update(checkpoint["state"])
                             scoped._pipeline_calls.update(

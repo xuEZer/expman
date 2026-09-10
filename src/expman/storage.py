@@ -1,13 +1,17 @@
 """Atomic trusted-object storage for stage snapshots and checkpoints."""
 
+import io
 import math
 import os
 import pickle
 import tempfile
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any, BinaryIO, Protocol
+
+from .dependencies import matches, validate
 
 
 class StorageError(RuntimeError):
@@ -51,10 +55,24 @@ def write_record(path: Path, value: Any, serializer: Serializer) -> None:
             temporary.unlink(missing_ok=True)
 
 
+@dataclass
+class _CheckpointEnvelope:
+    payload: bytes
+    dependencies: list
+
+
 def read_record(path: Path, serializer: Serializer) -> Any:
     try:
         with path.open("rb") as stream:
-            return serializer.load(stream)
+            record = serializer.load(stream)
+        if isinstance(record, _CheckpointEnvelope):
+            dependencies = record.dependencies
+            validate(dependencies)
+            record = serializer.load(io.BytesIO(record.payload))
+            if not isinstance(record, dict):
+                raise ValueError("invalid checkpoint payload")
+            record["config_dependencies"] = dependencies
+        return record
     except Exception as error:
         raise StorageError(f"cannot load {path}: {error}") from error
 
@@ -233,6 +251,17 @@ class RunStore:
                 ):
                     raise StorageError(f"invalid checkpoint: {path}")
                 stage_seconds(record)
+                if "config_dependencies" in record:
+                    try:
+                        validate(record["config_dependencies"])
+                        if self.reads is not None and not matches(
+                            record["config_dependencies"], self.reads.config
+                        ):
+                            raise ValueError(
+                                "checkpoint configuration dependencies changed"
+                            )
+                    except ValueError as error:
+                        raise StorageError(str(error)) from error
                 if restore_random:
                     self.restore_random(record)
                 return record
@@ -258,8 +287,6 @@ class Checkpoint:
             isinstance(step, bool) or not isinstance(step, int) or step < 0
         ):
             raise ValueError("step must be a nonnegative integer or None")
-        if self._store.reads is not None:
-            self._store.reads.record(())
         existing = self._store.checkpoints(self._position)
         sequence = int(existing[0].stem) + 1 if existing else 1
         path = (
@@ -267,18 +294,29 @@ class Checkpoint:
             / "checkpoints"
             / f"{sequence:020d}.pkl"
         )
-        write_record(
-            path,
-            {
-                "position": self._position,
-                "step": step,
-                "state": self._state,
-                "pipeline_calls": self._pipeline_calls,
-                **self._store.random_snapshot(),
-                "elapsed_seconds": self._store.elapsed(self._position),
-            },
-            self._store.serializer,
-        )
+        record = {
+            "position": self._position,
+            "step": step,
+            "state": self._state,
+            "pipeline_calls": self._pipeline_calls,
+            **self._store.random_snapshot(),
+            "elapsed_seconds": self._store.elapsed(self._position),
+        }
+        if self._store.reads is not None:
+            # Serialize live user objects once, before freezing the dependency set.
+            # The outer envelope contains only bytes and dependency metadata.
+            try:
+                payload = io.BytesIO()
+                self._store.serializer.dump(record, payload)
+                record = _CheckpointEnvelope(
+                    payload=payload.getvalue(),
+                    dependencies=self._store.reads.export(),
+                )
+            except Exception as error:
+                raise StorageError(
+                    f"cannot serialize checkpoint {path}: {error}"
+                ) from error
+        write_record(path, record, self._store.serializer)
         self.step = step
         for old in self._store.checkpoints(self._position)[2:]:
             old.unlink()

@@ -8,7 +8,7 @@ from unittest.mock import patch
 from expman import Batch, Pipeline, RunContext, Stage, Status
 from expman.dependencies import ConfigurationReads, matches
 from expman.frozen import FrozenDict
-from expman.storage import PickleSerializer, RecoveryWarning, read_record
+from expman.storage import PickleSerializer, RecoveryWarning, read_record, write_record
 
 
 class PrefixCacheTests(unittest.TestCase):
@@ -156,6 +156,94 @@ class PrefixCacheTests(unittest.TestCase):
         self.assertEqual([r.output for r in results], [1, 2])
         self.assertEqual(calls.count(1), 2)
         self.assertEqual(calls.count(2), 2)
+
+    def test_checkpoint_dependencies_survive_resume_without_unrelated_config(self):
+        for interrupt in (False, True):
+            with self.subTest(interrupt=interrupt):
+                calls = []
+
+                class Work(Stage):
+                    def process(self, data, ctx, calls=calls, interrupt=interrupt):
+                        calls.append(1)
+                        if ctx.checkpoint.step is None:
+                            ctx.state["before"] = ctx.cfg["before"]
+                            ctx.checkpoint.save(step=1)
+                            if interrupt:
+                                raise KeyboardInterrupt
+                        return ctx.state["before"], ctx.cfg["after"]
+
+                cfg = self.root / f"cfg-{interrupt}.yaml"
+                cfg.write_text(
+                    "before: !choice [1, 2]\nafter: !choice [3, 4]\nunused: !choice [5, 6]"
+                )
+                batch = Batch(
+                    Pipeline([Work]), cfg, output_dir=self.root / str(interrupt)
+                )
+                while True:
+                    try:
+                        results = batch.run(progress=False)
+                        break
+                    except KeyboardInterrupt:
+                        batch = Batch.resume(Pipeline([Work]), batch.output_dir)
+                self.assertTrue(all(r.status is Status.SUCCEEDED for r in results))
+                self.assertEqual(len(calls), 8 if interrupt else 4)
+                for experiment, result in zip(batch.experiments, results, strict=True):
+                    self.assertEqual(
+                        result.output,
+                        (experiment.cfg["before"], experiment.cfg["after"]),
+                    )
+                for path in (batch.output_dir / "cache").rglob("metadata.pkl"):
+                    dependencies = dict(
+                        read_record(path, PickleSerializer())["dependencies"]
+                    )
+                    self.assertEqual(set(dependencies), {("before",), ("after",)})
+
+    def test_checkpoint_serialization_reads_survive_resume(self):
+        class Work(Stage):
+            def process(self, data, ctx):
+                if ctx.checkpoint.step is None:
+                    ctx.state["cfg"] = ctx.cfg
+                    ctx.checkpoint.save(step=1)
+                    raise KeyboardInterrupt
+                ctx.state.pop("cfg")
+                return 1
+
+        batch = self.batch([Work], "unused: !choice [1, 2]")
+        for _ in range(2):
+            with self.assertRaises(KeyboardInterrupt):
+                batch.run(progress=False)
+            batch = Batch.resume(Pipeline([Work]), batch.output_dir)
+        self.assertTrue(
+            all(r.status is Status.SUCCEEDED for r in batch.run(progress=False))
+        )
+        for path in (batch.output_dir / "cache").rglob("metadata.pkl"):
+            self.assertIn(
+                (), dict(read_record(path, PickleSerializer())["dependencies"])
+            )
+
+    def test_legacy_checkpoint_retains_root_dependency_on_resume(self):
+        class Work(Stage):
+            def process(self, data, ctx):
+                if ctx.checkpoint.step is None:
+                    ctx.state["value"] = ctx.cfg["value"]
+                    ctx.checkpoint.save(step=1)
+                    raise KeyboardInterrupt
+                return ctx.state["value"]
+
+        batch = self.batch([Work], "value: 1\nunused: !choice [1, 2]")
+        with self.assertRaises(KeyboardInterrupt):
+            batch.run(progress=False)
+        store = batch.experiments[0]._store
+        path = store.checkpoints((0,))[0]
+        legacy = read_record(path, store.serializer)
+        legacy.pop("config_dependencies")
+        write_record(path, legacy, store.serializer)
+        batch = Batch.resume(Pipeline([Work]), batch.output_dir)
+        with self.assertRaises(KeyboardInterrupt):
+            batch.run(progress=False)
+        first = batch.experiments[0]._store.completed_reference((0,))
+        metadata = batch.experiments[0]._store.shared._directory(first) / "metadata.pkl"
+        self.assertIn((), dict(read_record(metadata, store.serializer)["dependencies"]))
 
     def test_corrupt_optional_cache_recomputes_and_publication_failure_fails_stage(
         self,
