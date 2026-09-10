@@ -72,7 +72,7 @@ models:
     hidden_sizes: [128, 64, 32]
 ```
 
-`name` 触发默认参数查找。例如上述节点会加载实验 YAML 所在目录下的 `configs/models/forecasting/patchtst.yaml`：
+`name` 触发项目级默认参数查找。例如上述节点会加载 `<项目根目录>/configs/models/forecasting/patchtst.yaml`：
 
 ```yaml
 patch_len: 32
@@ -350,3 +350,5 @@ Batch 自动共享已完成的阶段结果。Pipeline 从 0 号阶段开始匹�
 共享复用保留源快照的 elapsed_seconds，本 run 的 status.pkl 另存 restore_seconds，覆盖查找、加载及恢复操作（截至写入状态之前）。正常完成的 status.pkl 同步记录阶段累计耗时。旧快照缺少计时字段时视为未知，续跑后的累计值保持 None，避免把部分时长当作完整历史。损坏的 checkpoint 计时字段触发与 state 相同的回退流程。
 
 Batch 的尝试耗时与剩余时间估计保持原有规则，仍计入真实的失败、中断执行消耗。阶段计时用于实验诊断。
+
+配置根目录统一为 `<项目根目录>/configs/`，`data.name: demo` 加载其中的 `data/demo.yaml`。项目根目录通过向上查找 `pyproject.toml` 或 `.git` 定位：先从实验 YAML 所在目录查找，未找到项目标识时从当前工作目录查找。均未找到时，加载命名配置会报 ConfigError。实验 YAML 可放在项目的 `configs/`、其子目录或其他目录。示例默认参数位于项目根部的 `configs/models/`。

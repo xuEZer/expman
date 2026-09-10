@@ -11,6 +11,7 @@ class ConfigTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        (self.root / "pyproject.toml").touch()
         self.experiment = self.root / "experiment.yaml"
 
     def write(self, name, content):
@@ -173,12 +174,33 @@ model: {name: a}
             ],
         )
 
-    def test_defaults_paths_are_relative_to_experiment_and_follow_field_keys(self):
+    def test_defaults_paths_follow_project_root_and_field_keys(self):
         path = self.write("nested/experiment.yaml", "items: [{name: a}]\n")
-        self.write("nested/configs/items/a.yaml", "value: 42")
+        self.write("configs/items/a.yaml", "value: 42")
         self.assertEqual(
             load_configs(str(path)), [{"items": [{"name": "a", "value": 42}]}]
         )
+
+    def test_data_defaults_use_project_root_from_configs_and_nested_yaml(self):
+        self.write("configs/data/demo.yaml", "width: 32")
+        self.write("configs/configs/data/demo.yaml", "width: 99")
+        for location in (
+            "configs/run.yaml",
+            "configs/experiments/run.yaml",
+            "experiments/run.yaml",
+        ):
+            with self.subTest(location=location):
+                path = self.write(location, "data: {name: demo}")
+                self.assertEqual(load_configs(path)[0]["data"]["width"], 32)
+                path.write_text("data: {name: demo, width: 64}")
+                self.assertEqual(load_configs(path)[0]["data"]["width"], 64)
+
+    def test_git_file_identifies_project_root(self):
+        (self.root / "pyproject.toml").unlink()
+        self.write(".git", "gitdir: somewhere")
+        self.write("configs/data/demo.yaml", "value: 42")
+        path = self.write("experiments/run.yaml", "data: {name: demo}")
+        self.assertEqual(load_configs(path)[0]["data"]["value"], 42)
 
     def test_nested_name_from_defaults_is_resolved(self):
         self.write("configs/model/a.yaml", "optimizer: {name: adam}")

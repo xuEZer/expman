@@ -182,7 +182,7 @@ models:
 
 ```text
 models.forecasting.name: patchtst
-  → <实验文件所在目录>/configs/models/forecasting/patchtst.yaml
+  → <项目根目录>/configs/models/forecasting/patchtst.yaml
 ```
 
 模型参数直接与 `name` 并列。文件内容作为默认映射，与当前节点合并：两侧均为字典时递归合并；其余情况由实验配置的值整体替换，包括列表和显式 `null`。合并后继续处理子节点，包括默认参数引入的嵌套命名节点。
@@ -380,3 +380,5 @@ PrefixCache 使用 Pipeline 签名与根 seed 隔离树；树边包含阶段位�
 共享复用保留源快照的 elapsed_seconds，本 run 的 status.pkl 另存 restore_seconds，覆盖查找、加载及恢复操作（截至写入状态之前）。正常完成的 status.pkl 同步记录阶段累计耗时。旧快照缺少计时字段时视为未知，续跑后的累计值保持 None，避免把部分时长当作完整历史。损坏的 checkpoint 计时字段触发与 state 相同的回退流程。
 
 Batch 的尝试耗时与剩余时间估计保持原有规则，仍计入真实的失败、中断执行消耗。阶段计时用于实验诊断。
+
+命名默认配置统一位于项目根目录的 `configs/`。项目定位按实验 YAML 的祖先目录、当前工作目录的祖先目录依次查找，取首个包含 `pyproject.toml` 文件或 `.git` 标识的目录。Git worktree 的 `.git` 文件同样有效。找不到项目标识时，命名配置加载抛出 ConfigError；没有 name 的纯配置无需定位项目。

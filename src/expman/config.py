@@ -139,10 +139,22 @@ def _safe_segment(value: Any) -> bool:
     )
 
 
+def _project_root(experiment: Path) -> Path:
+    for start in (experiment.parent, Path.cwd().resolve()):
+        for candidate in (start, *start.parents):
+            if (candidate / "pyproject.toml").is_file() or (
+                candidate / ".git"
+            ).exists():
+                return candidate
+    raise ConfigError(
+        f"{experiment}: cannot locate project root (pyproject.toml or .git)"
+    )
+
+
 class _Defaults:
     def __init__(self, experiment: Path) -> None:
         self.experiment = experiment
-        self.root = (experiment.parent / "configs").resolve()
+        self.root: Path | None = None
         self.cache: dict[Path, dict[str, Any] | None] = {}
 
     def resolve(
@@ -161,6 +173,8 @@ class _Defaults:
         if not isinstance(value, dict):
             return deepcopy(value)
         if "name" in value:
+            if self.root is None:
+                self.root = (_project_root(self.experiment) / "configs").resolve()
             name = value["name"]
             if not all(_safe_segment(segment) for segment in (*keys, name)):
                 raise ConfigError(
@@ -202,7 +216,8 @@ def load_configs(path: str | Path) -> list[dict[str, Any]]:
 
     !choice marks alternatives; independent choices form a Cartesian product in
     YAML field/candidate order. Ordinary lists remain lists. Named nodes load
-    defaults from configs/<field path>/<name>.yaml beside the experiment file.
+    defaults from <project root>/configs/<field path>/<name>.yaml. Project roots
+    are located by pyproject.toml or .git above the YAML, then the working directory.
     Explicit values win, dictionaries merge recursively, and lists/null replace
     defaults. Defaults cannot contain !choice. Missing defaults warn once per
     resolved file per call. Parsing errors raise ConfigError.
