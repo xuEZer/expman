@@ -111,8 +111,7 @@ class BatchProgress:
             position = f" | 当前 {current}/{total}" if current is not None else ""
             if cards:
                 position += f" | {cards}"
-            now = self.finished_at if self.finished_at is not None else monotonic()
-            minutes = int(max(0, now - self.started_at) // 60)
+            minutes = int(max(0, self.batch.elapsed_seconds) // 60)
             days, minutes = divmod(minutes, 24 * 60)
             hours, minutes = divmod(minutes, 60)
             elapsed = f"{days:02d}:{hours:02d}:{minutes:02d}"

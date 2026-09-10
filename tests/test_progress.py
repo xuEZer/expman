@@ -71,7 +71,7 @@ class ProgressTests(unittest.TestCase):
         output = Output()
         with (
             redirect_stderr(output),
-            patch("expman.progress.monotonic", side_effect=lambda: clock[0]),
+            patch("expman.batch.monotonic", side_effect=lambda: clock[0]),
         ):
             self.batch([Work]).run()
         lines = output.getvalue().splitlines()
@@ -166,9 +166,9 @@ class ProgressTests(unittest.TestCase):
     def test_progress_can_be_disabled(self):
         batch = self.batch([])
         stderr = Output()
-        with redirect_stderr(stderr), patch.object(batch, "estimate") as estimate:
+        with redirect_stderr(stderr):
             batch.run(progress=False)
-        estimate.assert_not_called()
+        self.assertTrue((batch.output_dir / "timing.pkl").exists())
         self.assertEqual(stderr.getvalue(), "")
 
     def test_broken_output_does_not_fail_experiment(self):

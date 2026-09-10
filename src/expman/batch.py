@@ -4,8 +4,10 @@ import gc
 import math
 import warnings
 from collections import deque
+from dataclasses import asdict
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock, Thread
+from time import monotonic
 from typing import Any
 from uuid import uuid4
 
@@ -28,6 +30,8 @@ from .storage import (
     read_record,
     write_record,
 )
+
+TIMING_SAVE_INTERVAL = 5.0
 
 
 class Batch:
@@ -87,9 +91,50 @@ class Batch:
         self.recorder = InMemoryRecorder() if recorder is None else recorder
         self._state_lock = RLock()
         self._started = False
+        self._elapsed_seconds = 0.0
+        self._session_started = None
+        self._last_estimate = None
         self._queue = deque(experiment.run_id for experiment in self.experiments)
         self._active = None
         self._save()
+
+    @property
+    def elapsed_seconds(self) -> float:
+        """Accumulated Batch wall time, excluding time between run invocations."""
+        with self._state_lock:
+            return self._elapsed_seconds + (
+                0.0
+                if self._session_started is None
+                else monotonic() - self._session_started
+            )
+
+    def _save_timing(self):
+        with self._state_lock:
+            write_record(
+                self.output_dir / "timing.pkl",
+                {
+                    "version": 1,
+                    "elapsed_seconds": self.elapsed_seconds,
+                    "estimate": None
+                    if self._last_estimate is None
+                    else asdict(self._last_estimate),
+                },
+                self._serializer,
+            )
+
+    def _timing_loop(self, stopped):
+        while not stopped.wait(TIMING_SAVE_INTERVAL):
+            try:
+                try:
+                    self.estimate()
+                finally:
+                    self._save_timing()
+            except Exception as error:
+                warnings.warn(
+                    f"could not persist Batch timing: {error}",
+                    RecoveryWarning,
+                    stacklevel=2,
+                )
 
     def _save(self) -> None:
         experiments = []
@@ -279,6 +324,43 @@ class Batch:
             )
             self._queue.appendleft(active)
         self._active = None
+        self._elapsed_seconds = 0.0
+        self._session_started = None
+        self._last_estimate = None
+        timing_path = self.output_dir / "timing.pkl"
+        if timing_path.exists():
+            timing = read_record(timing_path, self._serializer)
+            elapsed = (
+                timing.get("elapsed_seconds") if isinstance(timing, dict) else None
+            )
+            if (
+                not isinstance(timing, dict)
+                or timing.get("version") != 1
+                or isinstance(elapsed, bool)
+                or not isinstance(elapsed, (int, float))
+                or not math.isfinite(elapsed)
+                or elapsed < 0
+            ):
+                raise StorageError("invalid Batch timing record")
+            self._elapsed_seconds = elapsed
+            saved = timing.get("estimate")
+            if saved is not None:
+                try:
+                    estimate = TimeEstimate(**saved)
+                    validate_coverage(estimate.coverage)
+                    if any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(value)
+                        or value < 0
+                        for value in (estimate.lower_seconds, estimate.upper_seconds)
+                    ):
+                        raise ValueError("invalid estimate bounds")
+                    if estimate.lower_seconds > estimate.upper_seconds:
+                        raise ValueError("reversed estimate bounds")
+                    self._last_estimate = estimate
+                except (TypeError, ValueError) as error:
+                    raise StorageError("invalid saved time estimate") from error
         self._expected_manifest = manifest
         return self
 
@@ -299,8 +381,23 @@ class Batch:
         if self.devices:
             from .parallel_estimation import estimate_parallel
 
-            return estimate_parallel(self, level)
-        return self._time_estimator.estimate(pending, level)
+            estimate = estimate_parallel(self, level)
+        else:
+            estimate = self._time_estimator.estimate(pending, level)
+        with self._state_lock:
+            if (
+                estimate.lower_seconds is not None
+                and estimate.upper_seconds is not None
+                and math.isfinite(estimate.lower_seconds)
+                and math.isfinite(estimate.upper_seconds)
+            ):
+                self._last_estimate = estimate
+            elif (
+                self._last_estimate is not None
+                and self._last_estimate.coverage == level
+            ):
+                return self._last_estimate
+        return estimate
 
     def _next_experiment(self) -> str:
         # Resume an interrupted member first. Failed attempts keep their tail retry
@@ -332,6 +429,15 @@ class Batch:
                 raise StorageError("batch records changed; reload with Batch.resume")
             self._started = True
             error = None
+            self._session_started = monotonic()
+            timing_stopped = Event()
+            timing_thread = Thread(
+                target=self._timing_loop,
+                args=(timing_stopped,),
+                name="expman-timing",
+                daemon=True,
+            )
+            timing_thread.start()
             try:
                 display.start()
                 if self.devices:
@@ -343,7 +449,23 @@ class Batch:
                 error = caught
                 raise
             finally:
+                timing_stopped.set()
+                timing_thread.join()
+                with self._state_lock:
+                    self._elapsed_seconds = self.elapsed_seconds
+                    self._session_started = None
                 display.stop(error)
+                try:
+                    try:
+                        self.estimate()
+                    finally:
+                        self._save_timing()
+                except Exception as timing_error:
+                    warnings.warn(
+                        f"could not persist Batch timing: {timing_error}",
+                        RecoveryWarning,
+                        stacklevel=2,
+                    )
 
     def _run_queue(self) -> tuple[ExperimentResult, ...]:
         experiments = {experiment.run_id: experiment for experiment in self.experiments}
