@@ -4,6 +4,8 @@
 
 ### Added
 
+- 阶段累计诊断耗时随 checkpoint 和完成快照原子保存、随恢复进度回退；共享复用保留源耗时并单独记录恢复用时。
+
 - 同 Batch 连续前缀自动复用，保守配置读取追踪、共享快照引用、state/RNG/数值指标恢复及 GPU worker 接入。配置 get 和成员存在性查询改为显式报错。
 
 - 根部 seed（默认 0）初始化和 seed_everything()；Python、可选 NumPy/PyTorch 的全局随机状态随阶段快照与 checkpoint 原子保存、重试及进程恢复。

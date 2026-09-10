@@ -59,3 +59,24 @@ git status --short
 - 对业务规则、故障行为和对外契约做测试，避免只测试私有实现细节。
 - 核心执行层仅依赖标准库；配置模块使用 PyYAML，存储和监控集成通过 Recorder 扩展。
 - 新增功能同步修改设计文档及 CHANGELOG，明确已实现能力与后续规划。
+
+## 完整后端验证
+
+需要验证完整功能时，使用安装了 NumPy、CUDA 版 PyTorch 且能访问实际 NVIDIA GPU 的环境运行：
+
+```bash
+python scripts/test_full.py
+```
+
+该入口执行全部测试，并将任何 skip 视为验证未完成（非零退出码）。缺少依赖、GPU 不可访问或显存不足时，修复环境后重跑；不要删除测试或取消跳过条件来获得通过。普通 unittest 命令仍可用于最小依赖环境的兼容性测试，其结果不能替代完整后端验证。
+
+当前开发机可以复用已有 CUDA 依赖，保持项目源码优先：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+CUDA_VISIBLE_DEVICES=GPU-23e616ac-ab14-91bd-71e2-ac9a8887337b \
+PYTHONPATH="$PWD/src:/home/cxz/code/SAITS/.venv/lib/python3.12/site-packages" \
+.venv/bin/python scripts/test_full.py
+```
+
+上面的依赖路径和 GPU UUID 仅适用于当前开发机；其他机器使用自己的完整测试环境。沙箱阻止 GPU 访问时，需要在获准访问 GPU 的执行环境运行。

@@ -6,7 +6,13 @@ from hashlib import sha256
 from uuid import uuid4
 
 from .dependencies import matches
-from .storage import RecoveryWarning, StorageError, read_record, write_record
+from .storage import (
+    RecoveryWarning,
+    StorageError,
+    read_record,
+    stage_seconds,
+    write_record,
+)
 
 
 def _hex(value, length):
@@ -59,6 +65,7 @@ class PrefixCache:
             or "rng_state" not in record
         ):
             raise StorageError("invalid shared-cache snapshot")
+        stage_seconds(record)
         return record
 
     def find(self, parent, position, config):

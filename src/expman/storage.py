@@ -1,10 +1,12 @@
 """Atomic trusted-object storage for stage snapshots and checkpoints."""
 
+import math
 import os
 import pickle
 import tempfile
 import warnings
 from pathlib import Path
+from time import perf_counter
 from typing import Any, BinaryIO, Protocol
 
 
@@ -57,6 +59,19 @@ def read_record(path: Path, serializer: Serializer) -> Any:
         raise StorageError(f"cannot load {path}: {error}") from error
 
 
+def stage_seconds(record):
+    """Return a validated cumulative duration; legacy progress remains unknown."""
+    value = record.get("elapsed_seconds")
+    if value is not None and (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise StorageError("invalid cumulative stage duration")
+    return value
+
+
 class RunStore:
     def __init__(self, root: Path, serializer: Serializer | None = None):
         self.root = root
@@ -68,6 +83,24 @@ class RunStore:
         self.run_id = None
         self.cache_parent = None
         self.cache_position = None
+        self._timers = {}
+        self._saved_seconds = {}
+
+    def start_timing(self, position, checkpoint=None):
+        elapsed = 0.0 if checkpoint is None else stage_seconds(checkpoint)
+        self._timers[position] = (elapsed, perf_counter())
+
+    def elapsed(self, position):
+        timer = self._timers.get(position)
+        if timer is None or timer[0] is None:
+            return None
+        return timer[0] + perf_counter() - timer[1]
+
+    def saved_seconds(self, position):
+        return self._saved_seconds.get(position)
+
+    def stop_timing(self, position):
+        self._timers.pop(position, None)
 
     def random_snapshot(self) -> dict:
         return {} if self.rng is None else {"rng_state": self.rng.capture()}
@@ -95,7 +128,16 @@ class RunStore:
         else:
             write_record(path, signature, self.serializer)
 
-    def status(self, position, status, attempt, *, reused=False) -> None:
+    def status(
+        self,
+        position,
+        status,
+        attempt,
+        *,
+        reused=False,
+        elapsed_seconds=None,
+        restore_seconds=None,
+    ) -> None:
         write_record(
             self.stage_dir(position) / "status.pkl",
             {
@@ -104,6 +146,8 @@ class RunStore:
                 "status": status,
                 "attempt": attempt,
                 "reused": reused,
+                "elapsed_seconds": elapsed_seconds,
+                "restore_seconds": restore_seconds,
             },
             self.serializer,
         )
@@ -129,6 +173,7 @@ class RunStore:
             or not isinstance(record.get("name"), str)
         ):
             raise StorageError(f"invalid stage snapshot: {path}")
+        stage_seconds(record)
         return record
 
     def completed_reference(self, position):
@@ -151,6 +196,7 @@ class RunStore:
             "output": output,
             "state": state,
             **self.random_snapshot(),
+            "elapsed_seconds": self.elapsed(position),
         }
         if (
             self.shared is not None
@@ -164,6 +210,8 @@ class RunStore:
             write_record(
                 self.stage_dir(position) / "completed.pkl", record, self.serializer
             )
+
+        self._saved_seconds[position] = record["elapsed_seconds"]
 
     def checkpoints(self, position) -> list[Path]:
         directory = self.stage_dir(position) / "checkpoints"
@@ -184,6 +232,7 @@ class RunStore:
                     )
                 ):
                     raise StorageError(f"invalid checkpoint: {path}")
+                stage_seconds(record)
                 if restore_random:
                     self.restore_random(record)
                 return record
@@ -226,6 +275,7 @@ class Checkpoint:
                 "state": self._state,
                 "pipeline_calls": self._pipeline_calls,
                 **self._store.random_snapshot(),
+                "elapsed_seconds": self._store.elapsed(self._position),
             },
             self._store.serializer,
         )

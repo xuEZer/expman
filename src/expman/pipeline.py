@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from hashlib import sha256
 from inspect import getsource
+from time import perf_counter
 from typing import Any
 
 from .context import RunContext, _name
@@ -80,6 +81,7 @@ class Pipeline:
                 if shared is not None:
                     store.cache_position = position
                     store.cache_parent = parent
+                restore_started = perf_counter()
                 if store is not None:
                     completed = store.completed(position)
                     if completed is not None:
@@ -95,6 +97,8 @@ class Pipeline:
                                 Status.SUCCEEDED.value,
                                 context.attempt,
                                 reused=True,
+                                elapsed_seconds=completed.get("elapsed_seconds"),
+                                restore_seconds=perf_counter() - restore_started,
                             )
                         if shared is not None:
                             reference = completed.get("_cache_ref")
@@ -105,6 +109,7 @@ class Pipeline:
                     # Own in-progress work has priority over another run's result.
                     started = (store.stage_dir(position) / "status.pkl").exists()
                     if not started and not store.checkpoints(position):
+                        restore_started = perf_counter()
                         candidate = shared.find(parent, position, store.reads.config)
                         if candidate is not None:
                             reference, completed = candidate
@@ -126,6 +131,8 @@ class Pipeline:
                                     Status.SUCCEEDED.value,
                                     context.attempt,
                                     reused=True,
+                                    elapsed_seconds=completed.get("elapsed_seconds"),
+                                    restore_seconds=perf_counter() - restore_started,
                                 )
                             parent = reference[2]
                             continue
@@ -155,6 +162,8 @@ class Pipeline:
                                 scoped._pipeline_calls,
                             ),
                         )
+                    if store is not None:
+                        store.start_timing(position, checkpoint)
                     stage = stage_type()
                     if checkpoint is not None:
                         # Reconstruction may consume randomness; process resumes at
@@ -162,7 +171,12 @@ class Pipeline:
                         store.restore_random(checkpoint)
                     data = stage.run(data, scoped)
                     if store is not None:
-                        store.status(position, Status.SUCCEEDED.value, context.attempt)
+                        store.status(
+                            position,
+                            Status.SUCCEEDED.value,
+                            context.attempt,
+                            elapsed_seconds=store.saved_seconds(position),
+                        )
                         if shared is not None:
                             reference = store.completed_reference(position)
                             parent = reference[2] if reference is not None else None
@@ -183,6 +197,8 @@ class Pipeline:
                             )
                     raise
                 finally:
+                    if store is not None:
+                        store.stop_timing(position)
                     if shared is not None:
                         store.reads.end()
                         store.cache_position = None
