@@ -274,7 +274,7 @@ epochs: !choice [20, 40]
 
 `device` 是整个 Batch 的设备列表，不展开为实验组合，也不允许使用 `!choice`。省略或 `[]` 使用原有 CPU 顺序执行路径；框架不改写用户的模型构建逻辑。`ctx.cfg` 保留完整的原始设备列表。每个 GPU 实验在一个独立解释器中运行，仅暴露分配到的 GPU，业务代码可统一使用 `cuda:0`。绑定通过启动环境中的 GPU UUID 设置，在导入用户 Stage 模块前生效。
 
-调度默认值在 [devices.py](src/expman/devices.py) 中：内存裕量比例 `MEMORY_MARGIN = 0.1`、显存查询超时 `QUERY_TIMEOUT = 2.0` 秒、启动间隔 `LAUNCH_INTERVAL = 5.0` 秒；它们不是 YAML 调度字段。每个调度 tick（`POLL_INTERVAL = 0.2` 秒）同时重新查询每张卡的整卡空闲显存（`nvidia-smi`，包含外部程序占用）和主机内存（`/proc/meminfo` 的 `MemAvailable`）：显存决定每张卡能跑多少，主机内存是所有实验进程共用的上限。该机制只作用于 GPU 调度，`device: []` 的顺序执行路径不受影响。
+调度默认值在 [devices.py](src/expman/devices.py) 中：内存裕量比例 `MEMORY_MARGIN = 0.1`、显存查询超时 `QUERY_TIMEOUT = 3.0` 秒、启动间隔 `LAUNCH_INTERVAL = 5.0` 秒；它们不是 YAML 调度字段。每个调度 tick（`POLL_INTERVAL = 0.2` 秒）同时重新查询每张卡的整卡空闲显存（`nvidia-smi`，包含外部程序占用）和主机内存（`/proc/meminfo` 的 `MemAvailable`）：显存决定每张卡能跑多少，主机内存是所有实验进程共用的上限。该机制只作用于 GPU 调度，`device: []` 的顺序执行路径不受影响。
 
 准入由两个阻塞标志控制，且只在实验自然退出时释放。
 
@@ -289,7 +289,7 @@ epochs: !choice [20, 40]
 
 - `MemAvailable` 比例低于 10% 时置 `mem_block`，任何卡都不再启动新实验，并 kill 全局最近启动的一个实验；读数仍不足时每个 tick 继续减载一个。
 - `mem_block` 期间不补位：只要还有实验在运行就保持停止派发，直到某个实验自然退出（成功、失败或中断）才清除（减载 kill 自身不清除）；没有运行实验时只由内存比例决定。
-- 显存或主机内存查询失败、超时（默认 2 秒）或返回无效数据都按主机内存不足处理：发出 `RuntimeWarning`、置 `mem_block` 并 kill 最近启动的一个实验，下一个 tick 重新查询。失败不会中断批次；`nvidia-smi` 或 `/proc/meminfo` 长期不可用时，批次会持续减载并等待。
+- 显存或主机内存查询失败、超时（默认 3 秒）或返回无效数据都按主机内存不足处理：发出 `RuntimeWarning`、置 `mem_block` 并 kill 最近启动的一个实验，下一个 tick 重新查询。失败不会中断批次；`nvidia-smi` 或 `/proc/meminfo` 长期不可用时，批次会持续减载并等待。
 - swap 只观测、不参与准入和减载判定；`Batch._host_memory` 同时发布 `available_ratio`、`available_kb`、`total_kb` 和 `swap_free_kb`，便于外部观察。
 - 这些门槛都不是下一个实验的需求估计。资源长期不足时，框架会反复减载并重试；单个实验本身就放不下时，该批次无法取得进展，只能看到取消与重试。
 
@@ -366,7 +366,7 @@ Batch 的尝试耗时与剩余时间估计保持原有规则，仍计入真实�
 
 配置根目录统一为 `<项目根目录>/configs/`，`data.name: demo` 加载其中的 `data/demo.yaml`。项目根目录通过向上查找 `pyproject.toml` 或 `.git` 定位：先从实验 YAML 所在目录查找，未找到项目标识时从当前工作目录查找。均未找到时，加载命名配置会报 ConfigError。实验 YAML 可放在项目的 `configs/`、其子目录或其他目录。示例默认参数位于项目根部的 `configs/models/`。
 
-GPU 显存查询使用内部默认超时 2 秒，每个调度 tick 重新查询显存与主机内存。查询失败、超时或返回无效数据时清除旧读数、发出 `RuntimeWarning`、置 `mem_block` 并减载一次，下一个 tick 重新查询，调度不因查询失败终止。GPU 身份改变属于不可恢复的设备一致性错误。上述参数由框架内部定义。
+GPU 显存查询使用内部默认超时 3 秒，每个调度 tick 重新查询显存与主机内存。该查询实测在 WSL2 单卡机器上中位约 53 毫秒、最坏约 0.9 秒（宿主机 CPU 满载时），读取 `/proc/meminfo` 不足 1 毫秒，因此单次 tick 的查询开销约为 0.2 秒轮询间隔的四分之一到七成。查询失败、超时或返回无效数据时清除旧读数、发出 `RuntimeWarning`、置 `mem_block` 并减载一次，下一个 tick 重新查询，调度不因查询失败终止。GPU 身份改变属于不可恢复的设备一致性错误。上述参数由框架内部定义。
 
 Batch 的累计墙钟时间与最近有效剩余时间区间原子保存在 `timing.pkl`。运行期间约每 5 秒更新一次，正常结束或捕获中断时再保存；关闭 CLI 仍记录。`Batch.elapsed_seconds` 返回跨 resume 累计运行时间，排除两次运行之间的停机时间，并行实验不重复累计。突然退出只能恢复最近成功保存的累计值。GPU 恢复初期尚无可用调度数据时，直接显示保存的同覆盖率预测区间，取得有效数据后更新。旧目录缺少 timing.pkl 时无法还原历史墙钟时间，从零开始累计；原有实验耗时及并发历史仍用于重新估计。
 

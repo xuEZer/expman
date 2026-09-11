@@ -502,12 +502,12 @@ class DeviceTests(unittest.TestCase):
         with (
             patch(
                 "expman.devices.subprocess.run",
-                side_effect=subprocess.TimeoutExpired("nvidia-smi", 2),
+                side_effect=subprocess.TimeoutExpired("nvidia-smi", 3),
             ) as query,
             self.assertRaises(MemoryObservationError),
         ):
             NvidiaMemory((0,)).sample()
-        self.assertEqual(query.call_args.kwargs["timeout"], 2.0)
+        self.assertEqual(query.call_args.kwargs["timeout"], 3.0)
 
     def test_nvidia_memory_validates_observations_and_identities(self):
         with patch("expman.devices.subprocess.run") as query:

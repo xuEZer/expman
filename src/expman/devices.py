@@ -10,7 +10,11 @@ from .config import ConfigError
 MEMORY_MARGIN = 0.1
 LAUNCH_INTERVAL = 5.0
 POLL_INTERVAL = 0.2
-QUERY_TIMEOUT = 2.0
+# Measured on RTX 3070 laptop / WSL2, one GPU, at the scheduler's own cadence:
+# median 53 ms, p99 300 ms, worst 620 ms with the GPU in desktop use; median
+# 143 ms, worst 915 ms with the host CPU saturated. A false timeout kills a live
+# attempt and blocks refills, so keep a few times the worst observation.
+QUERY_TIMEOUT = 3.0
 MEMINFO_PATH = Path("/proc/meminfo")
 
 
