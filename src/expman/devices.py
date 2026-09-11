@@ -27,7 +27,11 @@ HOST_RESERVE_KB = 2 * 1024 * 1024
 # unknown attempt may hold; over-estimating costs throughput, under-estimating
 # costs the host.
 HOST_PEAK_KB_DEFAULT = 1024 * 1024
-POLL_INTERVAL = 0.2
+# One scheduler tick: how often memory is re-read, finished attempts are collected,
+# blocks are released and at most one attempt per card is launched. A slower tick
+# launches more gently and spends less time inside nvidia-smi, but it also delays
+# collecting a finished attempt and shedding under pressure by up to one interval.
+POLL_INTERVAL = 1.0
 # Measured on RTX 3070 laptop / WSL2, one GPU, at the scheduler's own cadence:
 # median 53 ms, p99 300 ms, worst 620 ms with the GPU in desktop use; median
 # 143 ms, worst 915 ms with the host CPU saturated. A false timeout kills a live
