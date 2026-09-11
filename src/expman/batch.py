@@ -66,6 +66,7 @@ class Batch:
         self._active_gpu = {}
         self._gpu_history = []
         self._gpu_memory = {}
+        self._gpu_blocks = {}
         self._host_memory = {}
         self._gpu_running_info = {}
         self.output_dir = (
@@ -268,6 +269,7 @@ class Batch:
             )
         self._active_gpu = {}
         self._gpu_memory = {}
+        self._gpu_blocks = {}
         self._host_memory = {}
         self._gpu_running_info = {}
         history = manifest.get("gpu_history", [])

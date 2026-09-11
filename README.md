@@ -274,26 +274,32 @@ epochs: !choice [20, 40]
 
 `device` 是整个 Batch 的设备列表，不展开为实验组合，也不允许使用 `!choice`。省略或 `[]` 使用原有 CPU 顺序执行路径；框架不改写用户的模型构建逻辑。`ctx.cfg` 保留完整的原始设备列表。每个 GPU 实验在一个独立解释器中运行，仅暴露分配到的 GPU，业务代码可统一使用 `cuda:0`。绑定通过启动环境中的 GPU UUID 设置，在导入用户 Stage 模块前生效。
 
-调度默认值在 [devices.py](src/expman/devices.py) 中：显存裕量比例 `MEMORY_MARGIN = 0.01`（1%）、主机内存预留 `HOST_RESERVE_KB = 2097152`（2 GiB）、未知实验的峰值假设 `HOST_PEAK_KB_DEFAULT = 1048576`（1 GiB）和显存查询超时 `QUERY_TIMEOUT = 3.0` 秒；它们不是 YAML 调度字段，没有启动间隔或每卡并发上限。每个调度 tick（`POLL_INTERVAL = 1.0` 秒）同时重新查询每张卡的整卡空闲显存（`nvidia-smi`，包含外部程序占用）、主机内存（`/proc/meminfo` 的 `MemAvailable`，以及 `/proc/vmstat` 的 `pswpin`/`pswpout`）和每个 worker 的驻留内存（`/proc/<pid>/status` 的 `VmRSS`/`VmHWM`）：显存决定每张卡能跑多少，主机内存是所有实验进程共用的上限。该机制只作用于 GPU 调度，`device: []` 的顺序执行路径不受影响。
-
-准入由两个阻塞标志控制，且只在实验自然退出时释放。
+调度默认值在 [devices.py](src/expman/devices.py) 中：主机内存预留 `HOST_RESERVE_KB = 2097152`（2 GiB）、未知实验的峰值假设 `HOST_PEAK_KB_DEFAULT = 1048576`（1 GiB）、峰值回归的读取分位 `PEAK_QUANTILE = 0.9`、被限额驳回后的上调倍数 `PEAK_BUMP_MARGIN = 1.5`、cgroup 限额相对估计的余量 `CAPACITY_FACTOR = 1.25` 与下限 `CAPACITY_FLOOR_KB = 512 MiB`、以及显存查询超时 `QUERY_TIMEOUT = 3.0` 秒；它们不是 YAML 调度字段。**显存没有比例门槛**：每张卡到底能跑多少由实际分配结果决定（见下）。每个调度 tick（`POLL_INTERVAL = 1.0` 秒）同时重新查询每张卡的整卡空闲显存（`nvidia-smi`，包含外部程序占用）、主机内存（`/proc/meminfo` 的 `MemAvailable`，以及 `/proc/vmstat` 的 `pswpin`/`pswpout`）和每个 worker 的驻留内存（cgroup 的 `memory.current`/`memory.peak`，回退到 `/proc/<pid>/status` 的 `VmRSS`/`VmHWM`）。该机制只作用于 GPU 调度，`device: []` 的顺序执行路径不受影响。
 
 显存（每张卡一个 `gpu_block`）：
 
-- 空闲比例至少 1%、该卡没有 `gpu_block`（或该卡已无运行实验）时，该卡每个 tick 最多启动一个实验；没有独立于 tick 的启动间隔，也没有固定并发数量上限，因此同一张卡的实际启动速率上限是每秒一个（`POLL_INTERVAL`）。
-- 空闲比例低于 1% 时置该卡的 `gpu_block`，并 kill 这张卡上最近启动的实验；读数仍不足时每个 tick 继续减载一个。
-- 该卡有实验自然退出（成功、失败或中断）时清除 `gpu_block`；减载 kill 自身不清除，因此不会立即补位。该卡已无运行实验时，只要读数满足门槛即可再次启动。
-- 没有独立于 tick 的启动间隔，显存裕量也不是下一个实验的需求估计：只要读数还有 1% 空闲就继续启动，而模型和数据的加载延迟可能让显存在这之前不下降，所以仍可能发生 OOM，同一张卡上的实验也可能在相邻 tick 接连启动。实际失败按原规则获得一次队尾重试；调度中断不消耗失败重试次数。
+- 每个 tick 每张卡最多启动一个实验，没有独立于 tick 的启动间隔，也没有固定并发数量上限；因此单卡启动速率上限是每秒一个（`POLL_INTERVAL`）。
+- 不再按空闲比例停派发或减载：显存读数无法预测下一次分配会不会失败，所以由**实际失败**决定——某个尝试以 CUDA OOM 结束（`torch.cuda.OutOfMemoryError`，或错误信息匹配 `CUDA out of memory` / `CUDA error: out of memory` / `CUDNN_STATUS_ALLOC_FAILED`）时置该卡的 `gpu_block`。
+- `gpu_block` 期间不再往这张卡**新增**实验，但它不阻塞已经在该卡上运行的尝试；该卡上有尝试正常结束（成功，或非 OOM 的失败）时清除。该卡已无运行尝试时允许再启动一个作为试探——否则单张卡上唯一一个 OOM 尝试会让批次永远停住。
+- 试错成本由失败重试预算承担：OOM 是普通失败，按原规则获得一次队尾重试。
 
-主机内存（全局 `mem_block`，所有卡共用一个门槛）：
+主机内存（全局 `mem_block`，所有卡共用一个预算）：
 
-- **准入按预留量算，不按快照算**：每次派发前要求“`MemAvailable` − 预留 ≥ 下一个实验的预期峰值 + 每个在跑 worker 尚未长到的余量”，其中在跑 worker 的余量 = `max(已观测峰值 VmHWM, 该实验历史峰值) − 当前驻留 VmRSS`。只要预期峰值是真实峰值的上界，所有 worker 的峰值之和就永远不会超过预算：这就是限制并发的机制（旧版只看 `MemAvailable`，看不见正在长的 worker，本机曾因此在 36 秒内堆到 32 个 worker、吃掉 15.26 GiB）。预期峰值按 `run_id` 取历史最大值（记录在 `_gpu_history` 的 `peak_kb`），没跑过的实验取所有已观测峰值中的最大值，一个都没有时取 `HOST_PEAK_KB_DEFAULT`。估算高只损失吞吐，估算低则损失主机。
-- 不满足预留量时，本次派发被拒绝：已选中的实验放回队首（选择本身幂等），本 tick 不再尝试任何卡。
-- `MemAvailable` 低于 2 GiB 预留，或自上次采样以来内核发生过换页（`/proc/vmstat` 的 `pswpin`/`pswpout` 增长）时置 `mem_block`，任何卡都不再启动新实验，并 kill 全局最近启动的一个实验；读数仍不足时每个 tick 继续减载一个。
-- `mem_block` 期间不补位：只要还有实验在运行就保持停止派发，直到某个实验自然退出（成功、失败或中断）才清除（减载 kill 自身不清除）；没有运行实验时只由内存读数决定。
+- **峰值按配置特征估计**：用整份配置展开出的特征（与耗时模型同一套 `features()`：数值做带符号 log 变换并归一化、类别独热、超过 48 维做确定性散列）跑一个对数正态贝叶斯回归，取 90% 上分位作为该实验的峰值估计；被 cgroup 限额打断的尝试按**右删失**观测进入该回归（只知道"至少需要这么多"），并把它自己那条记录的估计抬高到"实测 peak × 1.5"作为地板。观测来自 `_gpu_history` 的 `peak_kb`/`capped`，随 Batch 清单一起恢复。
+- **冷启动**：一条观测都没有时（全新 Batch，或该 run 找不到配置行）直接取 `HOST_PEAK_KB_DEFAULT = 1 GiB`；有观测之后，没跑过的实验由回归给出估计，最坏情况被 `peak_ceiling`（已观测最大值）兜住。估算高只损失吞吐，估算低由 cgroup 兜住并自动上调。
+- **准入按预留量算，不按快照算**：每次派发前要求“`MemAvailable` − 2 GiB 预留 ≥ 本次估计峰值 + 每个在跑 worker 尚未长到的余量”，其中在跑 worker 的余量 = `max(worker 峰值, 该 run 的估计) − worker 当前驻留`。只要估计是真实峰值的上界，所有 worker 的峰值之和就不会超过预算：这就是限制并发的机制（旧版只看 `MemAvailable`，看不见正在长的 worker，本机曾因此在 36 秒内堆到 32 个 worker、吃掉 15.26 GiB）。
+- 不满足预留量时本次派发被拒绝：已选中的实验放回队首（选择本身幂等），本 tick 不再尝试任何卡。
+- `MemAvailable` 低于 2 GiB 预留，或自上次采样以来内核发生过换页时置 `mem_block`，任何卡都不再启动新实验，并 kill 全局最近启动的一个实验；读数仍不足时每个 tick 继续减载一个。
+- `mem_block` 期间不补位：只要还有实验在运行就保持停止派发，直到某个实验自然退出（成功、失败或中断）才清除（减载 kill 自身不清除）。
 - 显存或主机内存查询失败、超时（默认 3 秒）或返回无效数据都按主机内存不足处理：发出 `RuntimeWarning`、置 `mem_block` 并 kill 最近启动的一个实验，下一个 tick 重新查询。失败不会中断批次；`nvidia-smi` 或 `/proc/meminfo` 长期不可用时，批次会持续减载并等待。
-- swap 判定用的是“正在换页”而不是“有占用”：内核不会主动把已换出的页换回来，所以少量陈旧 swap 占用会一直留着（本机实测 2.5 MB），拿它当门槛会让调度此后再也发不出实验。计数增长不会锁存，换页停止后自动放行；`/proc/vmstat` 读不到时按未换页处理，不单独暂停派发。`Batch._host_memory` 同时发布 `available_ratio`、`available_kb`、`total_kb`、`headroom_kb`、`swap_total_kb`、`swap_free_kb`、`paging`、`tight` 和 `admits_next`（按最大已观测峰值判断此刻能否再放一个实验），便于外部观察。
-- 显存的 1% 不是下一个实验的需求估计：8 GiB 卡上约合 82 MiB，也就是接近耗尽时才开始减载，实际 OOM 余量留给用户；提高 `MEMORY_MARGIN` 可以更早停止派发。主机内存相反，预留量与预期峰值都是真实的字节预算（固定预留而不是比例：比例随机器变大而放宽，会让派发在大内存主机上比预期晚得多才收敛）。资源长期不足时，框架会反复减载并重试；单个实验本身就放不下时，该批次无法取得进展，只能看到取消与重试。
+- swap 判定用的是“正在换页”而不是“有占用”：内核不会主动把已换出的页换回来，所以少量陈旧 swap 占用会一直留着，拿它当门槛会让调度此后再也发不出实验。计数增长不会锁存，换页停止后自动放行；`/proc/vmstat` 读不到时按未换页处理。`Batch._host_memory` 同时发布 `available_ratio`、`available_kb`、`total_kb`、`headroom_kb`、`swap_total_kb`、`swap_free_kb`、`paging`、`tight` 和 `admits_next`（按最大已观测峰值判断此刻能否再放一个实验），`Batch._gpu_blocks` 发布每张卡的封禁状态，便于外部观察。
+
+cgroup 限额（每个 worker 一个）：
+
+- 每个 worker 的 `memory.max` = `max(512 MiB, 估计峰值 × 1.25)`，并同时设置 `MemorySwapMax=0`，让超限的实验在自己的限额内结束而不是拖垮主机。只用 `memory.max`：`memory.high` 对"没有可回收对象"的匿名分配只会把进程节流到停住，反而拖长失败。
+- 施加方式优先直接写 cgroupfs 并在启动后把子进程加入该 cgroup；`/sys/fs/cgroup` 对本进程只读时回退到 `systemd-run --user --scope --property=MemoryMax=... --property=MemorySwapMax=0`（systemd 能建、我们只读；`--scope` 是 exec 替换，所以 stdin EOF 检测、进程组 kill、pid 都照常）。两者都不可用时打印告警并按无限额启动。
+- **被限额驳回时上调估计再试**：worker 内的监视线程每 0.2 秒读自己的 `memory.events` 与 `memory.peak`，在限额驳回申请（`max`/`oom_kill` 计数增长）或峰值逼近限额（≥90%）时落盘一条记录（这项记录写在被杀之前，所以 cgroup OOM kill 也不会丢证据）；父进程同时每 tick 采样该 cgroup 作为兜底。判定为被限额打断的尝试记为 `cancelled` / `error_type=MemoryLimit`，**不占失败重试预算**，回到队尾按上调后的估计重试；已经跑完的尝试即使触及限额也只记录观测，不重跑。
+- 限额与估计的耦合是双向的：估计决定限额，限额被驳回又抬高估计（`peak × 1.5`），因此一个放不下的实验会逐次放大限额直到放得下，或触到主机预算而被准入拒绝。
 
 Ctrl+C 立即停止调度并 kill 所有实验进程组，不要求子进程额外保存。主进程记录已知尝试耗时和中断队列；恢复复用阶段快照及最近有效 checkpoint。主进程突然结束时，子进程通过父进程管道 EOF 清理自己的进程组；未落盘的尝试耗时继续按未知处理。用户自行脱离实验进程组的外部服务不在管理范围内。
 

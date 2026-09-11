@@ -9,7 +9,7 @@ from pathlib import Path
 from time import monotonic, sleep
 from unittest.mock import patch
 
-from expman import Batch, ConfigError, Experiment, Pipeline, Stage, Status
+from expman import Batch, ConfigError, Experiment, Pipeline, Stage, Status, devices
 from expman.devices import (
     HOST_PEAK_KB_DEFAULT,
     HOST_RESERVE_KB,
@@ -60,6 +60,18 @@ class GpuWork(Stage):
             (root / f"{ctx.run_id}.finally").touch()
 
 
+class CudaOom(Stage):
+    """Fail the first attempt of item 0 the way a PyTorch CUDA OOM does."""
+
+    def process(self, data, ctx):
+        if ctx.cfg["item"] == 0 and ctx.attempt == 1:
+            raise RuntimeError(
+                "CUDA out of memory. Tried to allocate 2.00 GiB "
+                "(GPU 0; 7.50 GiB total capacity)"
+            )
+        return ctx.cfg["item"]
+
+
 class SharedWork(Stage):
     def process(self, data, ctx):
         ctx.state["producer"] = os.getpid()
@@ -99,7 +111,7 @@ class GpuSchedulingTests(unittest.TestCase):
             mock.start()
             self.addCleanup(mock.stop)
 
-    def make_batch(self, *, count=3, devices=None, **options):
+    def make_batch(self, *, count=3, devices=None, pipeline=None, **options):
         import yaml
 
         cfg = {
@@ -113,7 +125,8 @@ class GpuSchedulingTests(unittest.TestCase):
         }
         path = self.root / "experiments.yaml"
         path.write_text(yaml.safe_dump(cfg) + f"item: !choice {list(range(count))}\n")
-        return Batch(Pipeline([GpuWork]), path, output_dir=self.root / "batch")
+        stages = Pipeline([GpuWork]) if pipeline is None else pipeline
+        return Batch(stages, path, output_dir=self.root / "batch")
 
     def test_multiple_devices_and_metrics_results_are_collected(self):
         batch = self.make_batch(count=4, delay=0.25)
@@ -226,6 +239,27 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertTrue(all(item.output["saved"] == 2 for item in results))
         self.assertTrue(all(len(item.attempts) == 2 for item in results))
 
+    def test_cuda_oom_blocks_the_card_until_an_attempt_ends_normally(self):
+        batch = self.make_batch(
+            count=1, devices=[0], delay=0, pipeline=Pipeline([CudaOom])
+        )
+        seen_blocked = []
+        original = Memory.sample
+
+        def observe(monitor):
+            seen_blocked.append(dict(batch._gpu_blocks))
+            return original(monitor)
+
+        with patch.object(Memory, "sample", observe):
+            result = batch.run(progress=False)[0]
+        self.assertEqual(result.attempts[0].status, Status.FAILED)
+        self.assertIn("CUDA out of memory", result.attempts[0].error_message)
+        # The card is blocked while the failed attempt is still the latest news on
+        # it, and the retry that ends normally releases it.
+        self.assertTrue(any(state.get(0) for state in seen_blocked))
+        self.assertEqual(result.status, Status.SUCCEEDED)
+        self.assertFalse(batch._gpu_blocks[0])
+
     def test_worker_results_are_read_back_instead_of_retained(self):
         batch = self.make_batch(count=1, devices=[0], delay=0.05)
         result = batch.run(progress=False)[0]
@@ -234,69 +268,6 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertIsNotNone(attempt.output_source)
         self.assertEqual(attempt.output["device"], "GPU-test-0")
         self.assertEqual(result.output["device"], "GPU-test-0")
-
-    def test_memory_kill_waits_for_other_exit_then_retries(self):
-        batch = self.make_batch(count=2, devices=[0], delay=0, wait_for_release=True)
-        dropped = []
-        observed_block = []
-        original = Memory.sample
-
-        def pressure(monitor):
-            active = list(batch._active_gpu)
-            if (
-                not dropped
-                and len(active) == 2
-                and all((self.root / f"{key}.checkpoint").exists() for key in active)
-            ):
-                dropped.append(active[-1])
-                return {0: DeviceMemory("GPU-test-0", 1000, 5)}
-            if dropped and not list(self.root.glob("*.finished")):
-                observed_block.append(tuple(active))
-                self.assertEqual(len(active), 1)
-                if len(observed_block) >= 5:
-                    (self.root / "release").touch()
-            return original(monitor)
-
-        with patch.object(Memory, "sample", pressure):
-            batch.run(progress=False)
-        self.assertTrue(dropped)
-        self.assertTrue(observed_block)
-        result = next(item for item in batch.results if item.run_id == dropped[0])
-        self.assertEqual(result.attempts[0].status, Status.CANCELLED)
-        self.assertEqual(result.attempts[0].error_type, "MemoryPressure")
-        self.assertEqual(result.status, Status.SUCCEEDED)
-        self.assertEqual(result.output["saved"], 2)
-
-    def test_each_tight_card_sheds_its_newest_attempt(self):
-        batch = self.make_batch(count=2, devices=[0, 1], delay=0, wait_for_release=True)
-        tight = []
-        original = Memory.sample
-
-        def pressure(monitor):
-            active = list(batch._active_gpu)
-            if tight or not active:
-                return original(monitor)
-            tight.append(1)
-            (self.root / "release").touch()
-            return {
-                device: DeviceMemory(f"GPU-test-{device}", 1000, 5) for device in (0, 1)
-            }
-
-        with patch.object(Memory, "sample", pressure):
-            results = batch.run(progress=False)
-        # One tick sees both cards tight and stops the newest attempt of each.
-        self.assertEqual(len(tight), 1)
-        shed = [
-            attempt
-            for result in results
-            for attempt in result.attempts
-            if attempt.error_type == "MemoryPressure"
-        ]
-        self.assertEqual(
-            sorted(attempt.run_id for attempt in shed),
-            sorted(result.run_id for result in results),
-        )
-        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
 
     def test_host_memory_shortage_pauses_launches_until_it_recovers(self):
         batch = self.make_batch(count=1, devices=[0], delay=0.05)
@@ -373,15 +344,20 @@ class GpuSchedulingTests(unittest.TestCase):
         # The refused dispatch went back to the queue instead of being lost.
         self.assertEqual(results[0].status, Status.SUCCEEDED)
 
-    def test_observed_peak_is_recorded_and_changes_later_admission(self):
+    def test_observed_peak_feeds_the_estimate_and_the_ceiling(self):
         batch = self.make_batch(count=1, devices=[0], delay=0.05)
         batch.run(progress=False)
         peaks = [item["peak_kb"] for item in batch._gpu_history]
         self.assertEqual(len(peaks), 1)
         self.assertGreater(peaks[0], 0)
         scheduler = GpuScheduler(batch)
-        self.assertEqual(scheduler.peak_ceiling, peaks[0])
-        self.assertEqual(scheduler._expected_peak("never-ran"), peaks[0])
+        self.assertEqual(scheduler.peaks.ceiling_kb, peaks[0])
+        # The observed attempt is the only sample, so the configuration estimate
+        # sits above it (upper quantile of the regression) and never below it.
+        self.assertGreaterEqual(
+            scheduler.peaks.estimate_kb(batch.experiments[0].run_id), peaks[0]
+        )
+        self.assertEqual(scheduler.peaks.estimate_kb("never-ran"), HOST_PEAK_KB_DEFAULT)
 
     def test_failed_host_query_sheds_newest_attempt_and_pauses_launches(self):
         batch = self.make_batch(count=2, devices=[0], delay=0.05)
@@ -528,13 +504,34 @@ class DeviceTests(unittest.TestCase):
             self.assertEqual(len(batch.experiments), 2)
             self.assertEqual(batch.devices, (0, 1))
 
-    def test_gate_threshold_and_empty_card_fallback(self):
+    def test_gate_blocks_a_card_that_still_has_attempts(self):
         gate = Gate()
-        self.assertTrue(gate.can_launch(0.01, ["a"]))
-        self.assertFalse(gate.can_launch(0.009, ["a"]))
+        self.assertTrue(gate.can_launch(["a"]))
         gate.gpu_block = True
-        self.assertFalse(gate.can_launch(0.9, ["a"]))
-        self.assertTrue(gate.can_launch(0.9, []))
+        self.assertFalse(gate.can_launch(["a"]))
+        # An empty card may try again: otherwise one out-of-memory failure with
+        # nothing else running would stall the Batch forever.
+        self.assertTrue(gate.can_launch([]))
+
+    def test_cuda_out_of_memory_signatures(self):
+        self.assertTrue(
+            devices.cuda_out_of_memory(
+                "OutOfMemoryError", "CUDA out of memory. Tried to allocate 2.00 GiB"
+            )
+        )
+        self.assertTrue(
+            devices.cuda_out_of_memory("RuntimeError", "CUDA error: out of memory")
+        )
+        self.assertTrue(
+            devices.cuda_out_of_memory(
+                "RuntimeError", "cuDNN error: CUDNN_STATUS_ALLOC_FAILED"
+            )
+        )
+        self.assertFalse(devices.cuda_out_of_memory("ValueError", "bad shape"))
+        self.assertFalse(devices.cuda_out_of_memory(None, None))
+        self.assertFalse(
+            devices.cuda_out_of_memory("OutOfMemoryError", "host allocation failed")
+        )
 
     def test_host_gate_holds_refills_until_a_card_is_free(self):
         gate = HostGate()

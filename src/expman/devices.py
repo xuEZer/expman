@@ -8,10 +8,16 @@ from pathlib import Path
 
 from .config import ConfigError
 
-# Free-ratio floor for device memory. At 1% a launch only stops and shedding only
-# starts once a card is nearly exhausted: about 82 MiB of an 8 GiB card, so the OOM
-# margin is left to the user.
-MEMORY_MARGIN = 0.01
+# Device memory carries no ratio threshold: a card admits work until a kernel run
+# actually fails with CUDA out of memory, which then blocks further launches on
+# that card while it still has attempts running (see Gate). Signatures come from
+# PyTorch's own error type and message.
+CUDA_OOM_TYPE = "OutOfMemoryError"
+CUDA_OOM_MARKERS = (
+    "CUDA out of memory",
+    "CUDA error: out of memory",
+    "cuDNN error: CUDNN_STATUS_ALLOC_FAILED",
+)
 # Host RAM kept free of experiment allocations, in kilobytes. Host memory is shared
 # by every worker process, and an exhausted host does not fail the allocating
 # process the way a full card fails a kernel launch: the kernel reclaims, swaps, or
@@ -25,8 +31,23 @@ HOST_RESERVE_KB = 2 * 1024 * 1024
 # Assumed peak resident memory of an attempt that has never been observed, in
 # kilobytes. Admission reserves the sum of expected peaks, so this bounds what one
 # unknown attempt may hold; over-estimating costs throughput, under-estimating
-# costs the host.
+# costs the host. It is also the cold start of the feature regression.
 HOST_PEAK_KB_DEFAULT = 1024 * 1024
+# Level of the log-normal peak regression used for admission. A high quantile
+# because the reserve has to bound the next attempt, not describe the average one.
+PEAK_QUANTILE = 0.9
+# A run stopped by its own cgroup cap comes back with this much more than the peak
+# it was seen to reach; the cap is recomputed from the raised estimate.
+PEAK_BUMP_MARGIN = 1.5
+# Cgroup memory limit written for one worker: the estimate plus room to grow, and
+# never below a floor that a Python interpreter with CUDA can start inside. Only
+# memory.max is set: memory.high would throttle an allocator that has nothing
+# reclaimable to give back (anonymous memory, swap disabled) and stall it instead
+# of ending the attempt.
+CAPACITY_FACTOR = 1.25
+CAPACITY_FLOOR_KB = 512 * 1024
+# A worker whose peak came this close to its own limit was stopped by it.
+CAPACITY_NEAR = 0.9
 # One scheduler tick: how often memory is re-read, finished attempts are collected,
 # blocks are released and at most one attempt per card is launched. A slower tick
 # launches more gently and spends less time inside nvidia-smi, but it also delays
@@ -46,6 +67,19 @@ NVIDIA_SMI_FALLBACKS = (Path("/usr/lib/wsl/lib/nvidia-smi"),)
 
 class MemoryObservationError(RuntimeError):
     """A failed or timed-out memory query; the scheduler treats host RAM as tight."""
+
+
+def cuda_out_of_memory(error_type, error_message) -> bool:
+    """Whether a failed attempt ran out of device memory.
+
+    Device memory is only observed after the fact: the reading cannot predict what
+    the next kernel will ask for, so the first real allocation failure is what tells
+    the scheduler a card has no room left.
+    """
+    if error_type == CUDA_OOM_TYPE and "out of memory" in (error_message or "").lower():
+        return True
+    message = error_message or ""
+    return any(marker in message for marker in CUDA_OOM_MARKERS)
 
 
 def configured_devices(configs) -> tuple[int, ...]:
