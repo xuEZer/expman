@@ -118,6 +118,20 @@ class MemoryLimitTests(unittest.TestCase):
         self.assertFalse(limits.near_cap(1000.0, 2000.0))
         self.assertTrue(limits.near_cap(1900.0, 2000.0))
 
+    def test_direct_limit_adopts_an_empty_leftover_and_skips_a_busy_one(self):
+        parent = tempfile.TemporaryDirectory()
+        self.addCleanup(parent.cleanup)
+        own = Path(parent.name) / "my.scope"
+        own.mkdir()
+        with patch("expman.limits.own_cgroup", return_value=own):
+            adopted = limits._direct("expman-left-1", 1024 * 1024)
+            self.assertEqual(adopted, own.parent / "expman-left-1")
+            self.assertEqual(
+                (adopted / "memory.max").read_text(), str(1024 * 1024 * 1024)
+            )
+            (adopted / "cgroup.procs").write_text("4242\n")
+            self.assertIsNone(limits._direct("expman-left-1", 1024 * 1024))
+
     def test_release_removes_a_directly_created_cgroup(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

@@ -62,8 +62,16 @@ def _direct(unit: str, limit_kb: float) -> Path | None:
     if parent is None or not parent.is_dir():
         return None
     directory = parent.parent / unit
+    if directory.exists():
+        # A hard-killed scheduler cannot remove what it created. An empty
+        # directory is safe to adopt; one that still has processes is not ours.
+        try:
+            if (directory / "cgroup.procs").read_text().strip():
+                return None
+        except OSError:
+            return None
     try:
-        directory.mkdir()
+        directory.mkdir(exist_ok=True)
         (directory / "memory.max").write_text(str(int(limit_kb * 1024)))
         (directory / "memory.swap.max").write_text("0")
     except OSError:
