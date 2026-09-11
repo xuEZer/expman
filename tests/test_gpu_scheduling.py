@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from itertools import pairwise
 from pathlib import Path
 from time import monotonic, sleep
 from unittest.mock import patch
@@ -16,7 +17,7 @@ from expman.devices import (
     MemoryObservationError,
     NvidiaMemory,
 )
-from expman.scheduling import Gate
+from expman.scheduling import Gate, GpuScheduler
 
 IMPORT_DEVICE = os.environ.get("CUDA_VISIBLE_DEVICES")
 
@@ -88,7 +89,7 @@ class GpuSchedulingTests(unittest.TestCase):
             ("expman.devices.MeminfoMonitor", Host),
             ("expman.devices.LAUNCH_INTERVAL", 0.02),
             ("expman.devices.POLL_INTERVAL", 0.01),
-            ("expman.devices.QUERY_RETRY_INTERVAL", 0.01),
+            ("expman.devices.MEMORY_QUERY_INTERVAL", 0.02),
         ]:
             mock = patch(target, value)
             mock.start()
@@ -242,6 +243,27 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(result.status, Status.SUCCEEDED)
         self.assertEqual(result.output["saved"], 2)
 
+    def test_one_attempt_is_shed_per_observation_round(self):
+        batch = self.make_batch(count=2, devices=[0, 1], delay=0, wait_for_release=True)
+        rounds = []
+        original = Memory.sample
+
+        def pressure(monitor):
+            active = list(batch._active_gpu)
+            if len(rounds) >= 2 or not active:
+                return original(monitor)
+            rounds.append(len(active))
+            return {
+                device: DeviceMemory(f"GPU-test-{device}", 100, 5) for device in (0, 1)
+            }
+
+        with patch.object(Memory, "sample", pressure):
+            results = batch.run(progress=False)
+        # Both cards report pressure, but each round drops only the newest attempt.
+        self.assertEqual(rounds, [2, 1])
+        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
+        self.assertTrue(all(len(item.attempts) == 2 for item in results))
+
     def test_host_memory_shortage_pauses_launches_until_it_recovers(self):
         batch = self.make_batch(count=1, devices=[0], delay=0.05)
         original = Host.sample
@@ -296,51 +318,95 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(len(result.attempts), 2)
         self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
 
-    def test_transient_memory_failure_keeps_worker_and_pauses_launches(self):
-        batch = self.make_batch(count=2, delay=0.2, devices=[0])
-        original = Memory.sample
+    def test_failed_host_query_sheds_newest_attempt_and_pauses_launches(self):
+        batch = self.make_batch(count=2, devices=[0], delay=0.05)
+        original = Host.sample
+        original_launch = GpuScheduler._launch
+        launches = []
         failures = 0
-        observations_after_failure = 0
+        launches_at_failure = []
 
-        def intermittent(monitor):
-            nonlocal failures, observations_after_failure
-            if batch._active_gpu and failures < 2:
+        def counted(self, device, memory):
+            launches.append(device)
+            return original_launch(self, device, memory)
+
+        def failing(monitor):
+            nonlocal failures
+            if failures < 2 and batch._active_gpu:
                 failures += 1
-                self.assertEqual(len(batch._active_gpu), 1)
-                raise MemoryObservationError("query timeout")
-            if failures:
-                observations_after_failure += 1
+                launches_at_failure.append(len(launches))
+                raise MemoryObservationError("meminfo unavailable")
+            if launches_at_failure and len(launches) != launches_at_failure[-1]:
+                self.fail("a failed query launched work before the next reading")
+            if launches_at_failure:
+                launches_at_failure.pop()
             return original(monitor)
 
         with (
-            patch.object(Memory, "sample", intermittent),
+            patch.object(Host, "sample", failing),
+            patch.object(GpuScheduler, "_launch", counted),
             self.assertWarns(RuntimeWarning),
         ):
             results = batch.run(progress=False)
         self.assertEqual(failures, 2)
-        self.assertGreater(observations_after_failure, 0)
-        self.assertTrue(all(result.status is Status.SUCCEEDED for result in results))
-        self.assertTrue(all(len(result.attempts) == 1 for result in results))
+        self.assertEqual(launches_at_failure, [])
+        shed = [
+            attempt
+            for result in results
+            for attempt in result.attempts
+            if attempt.error_type == "MemoryPressure"
+        ]
+        self.assertEqual(len(shed), 2)
+        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
 
-    def test_query_failure_counter_resets_after_success(self):
-        batch = self.make_batch(count=1, delay=0.1)
+    def test_failed_memory_query_pauses_launches_without_stopping_the_batch(self):
+        batch = self.make_batch(count=2, devices=[0, 1], delay=0.05)
         original = Memory.sample
-        calls = 0
+        original_launch = GpuScheduler._launch
+        launches = []
+        failures = 0
 
-        def alternating(monitor):
-            nonlocal calls
-            calls += 1
-            if calls in (1, 2, 4, 5):
-                raise MemoryObservationError("temporary query failure")
+        def counted(self, device, memory):
+            launches.append(device)
+            return original_launch(self, device, memory)
+
+        def failing(monitor):
+            nonlocal failures
+            if failures < 3:
+                failures += 1
+                self.assertEqual(launches, [])
+                raise MemoryObservationError("nvidia-smi unavailable")
             return original(monitor)
 
         with (
-            patch.object(Memory, "sample", alternating),
+            patch.object(Memory, "sample", failing),
+            patch.object(GpuScheduler, "_launch", counted),
             self.assertWarns(RuntimeWarning),
         ):
             results = batch.run(progress=False)
-        self.assertEqual(results[0].status, Status.SUCCEEDED)
-        self.assertEqual(len(results[0].attempts), 1)
+        self.assertEqual(failures, 3)
+        self.assertEqual(sorted(launches), [0, 1])
+        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
+        self.assertTrue(all(len(item.attempts) == 1 for item in results))
+        self.assertFalse(batch._active_gpu)
+
+    def test_memory_is_observed_on_the_configured_interval(self):
+        batch = self.make_batch(count=1, devices=[0], delay=0.3)
+        original = Memory.sample
+        stamps = []
+
+        def recorded(monitor):
+            stamps.append(monotonic())
+            return original(monitor)
+
+        with (
+            patch("expman.devices.MEMORY_QUERY_INTERVAL", 0.1),
+            patch.object(Memory, "sample", recorded),
+        ):
+            batch.run(progress=False)
+        gaps = [later - earlier for earlier, later in pairwise(stamps)]
+        self.assertGreaterEqual(len(gaps), 2)
+        self.assertGreaterEqual(min(gaps), 0.05)
 
     def test_slow_background_scores_do_not_block_worker_launches(self):
         batch = self.make_batch(count=2, delay=0.1, devices=[0])
@@ -382,31 +448,6 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertTrue(
             all(result.status is Status.SUCCEEDED for result in batch.results)
         )
-
-    def test_missing_memory_observation_stops_and_cleans_up(self):
-        batch = self.make_batch(count=1, delay=30)
-        original = Memory.sample
-
-        failures = 0
-
-        def broken(monitor):
-            nonlocal failures
-            if list(self.root.glob("*.checkpoint")):
-                failures += 1
-                raise MemoryObservationError("monitor unavailable")
-            return original(monitor)
-
-        with (
-            patch.object(Memory, "sample", broken),
-            self.assertRaisesRegex(
-                RuntimeError, "3 consecutive queries: monitor unavailable"
-            ),
-            self.assertWarns(RuntimeWarning),
-        ):
-            batch.run(progress=False)
-        self.assertEqual(batch.results[0].status, Status.CANCELLED)
-        self.assertFalse(batch._active_gpu)
-        self.assertEqual(failures, 3)
 
 
 class DeviceTests(unittest.TestCase):
