@@ -8,15 +8,14 @@ from pathlib import Path
 from .config import ConfigError
 
 MEMORY_MARGIN = 0.1
-MEMORY_QUERY_INTERVAL = 5.0
 LAUNCH_INTERVAL = 5.0
 POLL_INTERVAL = 0.2
-QUERY_TIMEOUT = 10.0
+QUERY_TIMEOUT = 2.0
 MEMINFO_PATH = Path("/proc/meminfo")
 
 
 class MemoryObservationError(RuntimeError):
-    """A failed memory query; the scheduler treats resources as tight."""
+    """A failed or timed-out memory query; the scheduler treats host RAM as tight."""
 
 
 def configured_devices(configs) -> tuple[int, ...]:

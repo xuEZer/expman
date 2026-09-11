@@ -19,13 +19,15 @@ from .storage import PickleSerializer, RecoveryWarning, read_record, write_recor
 
 @dataclass
 class Gate:
+    """One card's launch spacing, held while its VRAM reading stays tight."""
+
     last_launch: float = float("-inf")
-    blocked: bool = False
+    gpu_block: bool = False
 
     def can_launch(self, ratio, now, running):
         return (
             ratio >= devices.MEMORY_MARGIN
-            and (not self.blocked or not running)
+            and (not self.gpu_block or not running)
             and now - self.last_launch >= devices.LAUNCH_INTERVAL
         )
 
@@ -34,10 +36,10 @@ class Gate:
 class HostGate:
     """Admission for host RAM, which every worker process shares."""
 
-    blocked: bool = False
+    mem_block: bool = False
 
     def can_launch(self, ratio, running):
-        return ratio >= devices.MEMORY_MARGIN and (not self.blocked or not running)
+        return ratio >= devices.MEMORY_MARGIN and (not self.mem_block or not running)
 
 
 @dataclass
@@ -68,8 +70,6 @@ class GpuScheduler:
         self.gates = {device: Gate() for device in batch.devices}
         self.host_gate = HostGate()
         self.workers = {}
-        self.observation = None
-        self.next_observation = perf_counter()
         self.last_tick = perf_counter()
 
     def _account(self):
@@ -112,20 +112,20 @@ class GpuScheduler:
                 warnings.warn(f"recorder failed: {error}", RuntimeWarning, stacklevel=2)
 
     def _observe(self):
-        """Sample device and host memory; a failed query counts as tight resources."""
+        """Read device and host memory; a failed or timed-out query is not a reading."""
         try:
             memory = self.monitor.sample()
             host = self.host.sample()
         except devices.MemoryObservationError as error:
             warnings.warn(
-                f"memory query failed; treating resources as tight: {error}",
+                f"memory query failed; treating host memory as tight: {error}",
                 RuntimeWarning,
                 stacklevel=2,
             )
             with self.batch._state_lock:
                 self.batch._gpu_memory = {}
                 self.batch._host_memory = {}
-            return None
+            return None, None
         with self.batch._state_lock:
             self.batch._gpu_memory = {
                 device: value.free_ratio for device, value in memory.items()
@@ -138,39 +138,40 @@ class GpuScheduler:
             }
         return memory, host
 
-    def _relieve(self):
-        """Stop at most one attempt per observation round to relieve pressure."""
-        if self.observation is None:
-            # A failed query is treated as tight resources: hold every card.
-            self.host_gate.blocked = True
+    def _relieve(self, memory, host):
+        """Hold blocked cards and shed the newest attempt of each tight resource."""
+        if host is None:
+            # Without a reading the host cannot be assumed to have room, so this
+            # checks as host memory shortage: block launches and drop one attempt.
+            self.host_gate.mem_block = True
             if self.workers:
                 self._shed(self._newest())
             return
-        memory, host = self.observation
         if host.available_ratio < devices.MEMORY_MARGIN:
             # Host RAM is shared by every worker process: drop the newest attempt
             # globally and stop refilling any card until one of the survivors
             # exits on its own.
-            self.host_gate.blocked = True
+            self.host_gate.mem_block = True
             if self.workers:
                 self._shed(self._newest())
-            return
-        for device in self.gates:
-            running = [
-                key for key, worker in self.workers.items() if worker.device == device
-            ]
-            if memory[device].free_ratio < devices.MEMORY_MARGIN and running:
-                self._shed(running[-1])
-                return
+        for device, gate in self.gates.items():
+            if memory[device].free_ratio < devices.MEMORY_MARGIN:
+                gate.gpu_block = True
+                running = [
+                    key
+                    for key, worker in self.workers.items()
+                    if worker.device == device
+                ]
+                if running:
+                    self._shed(running[-1])
 
     def _newest(self):
         return max(self.workers, key=lambda run_id: self.workers[run_id].started)
 
     def _shed(self, run_id):
-        """Cancel one running attempt for memory pressure and hold its card."""
+        """Cancel one running attempt for memory pressure and space its card."""
         worker = self.workers[run_id]
         gate = self.gates[worker.device]
-        gate.blocked = True
         gate.last_launch = perf_counter()
         with self.batch._state_lock:
             self.batch._gpu_launch_times[worker.device] = gate.last_launch
@@ -326,8 +327,10 @@ class GpuScheduler:
             ):
                 self.batch._queue.append(run_id)
             if cancelled != "MemoryPressure":
-                self.gates[worker.device].blocked = False
-                self.host_gate.blocked = False
+                # A natural exit frees memory: release the host block and the block
+                # of the card the attempt ran on.
+                self.gates[worker.device].gpu_block = False
+                self.host_gate.mem_block = False
             self.batch._save()
 
     def run(self):
@@ -340,16 +343,10 @@ class GpuScheduler:
                 if not self.batch._queue and not self.workers:
                     break
                 self._account()
-                now = perf_counter()
-                if now >= self.next_observation:
-                    self.observation = self._observe()
-                    self.next_observation = now + devices.MEMORY_QUERY_INTERVAL
-                    self._relieve()
-                memory, host = (
-                    (None, None) if self.observation is None else self.observation
-                )
-                # Between observations the last reading still gates launches: a
-                # missing reading from a failed query keeps every card closed.
+                # Both readings are rechecked every tick: a stale ratio never
+                # admits work, and an unreadable one keeps every card closed.
+                memory, host = self._observe()
+                self._relieve(memory, host)
                 launching = host is not None and self.host_gate.can_launch(
                     host.available_ratio, list(self.workers)
                 )

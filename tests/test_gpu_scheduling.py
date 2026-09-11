@@ -17,7 +17,7 @@ from expman.devices import (
     MemoryObservationError,
     NvidiaMemory,
 )
-from expman.scheduling import Gate, GpuScheduler
+from expman.scheduling import Gate, GpuScheduler, HostGate
 
 IMPORT_DEVICE = os.environ.get("CUDA_VISIBLE_DEVICES")
 
@@ -89,7 +89,6 @@ class GpuSchedulingTests(unittest.TestCase):
             ("expman.devices.MeminfoMonitor", Host),
             ("expman.devices.LAUNCH_INTERVAL", 0.02),
             ("expman.devices.POLL_INTERVAL", 0.01),
-            ("expman.devices.MEMORY_QUERY_INTERVAL", 0.02),
         ]:
             mock = patch(target, value)
             mock.start()
@@ -252,26 +251,36 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(result.status, Status.SUCCEEDED)
         self.assertEqual(result.output["saved"], 2)
 
-    def test_one_attempt_is_shed_per_observation_round(self):
+    def test_each_tight_card_sheds_its_newest_attempt(self):
         batch = self.make_batch(count=2, devices=[0, 1], delay=0, wait_for_release=True)
-        rounds = []
+        tight = []
         original = Memory.sample
 
         def pressure(monitor):
             active = list(batch._active_gpu)
-            if len(rounds) >= 2 or not active:
+            if tight or not active:
                 return original(monitor)
-            rounds.append(len(active))
+            tight.append(1)
+            (self.root / "release").touch()
             return {
                 device: DeviceMemory(f"GPU-test-{device}", 100, 5) for device in (0, 1)
             }
 
         with patch.object(Memory, "sample", pressure):
             results = batch.run(progress=False)
-        # Both cards report pressure, but each round drops only the newest attempt.
-        self.assertEqual(rounds, [2, 1])
+        # One tick sees both cards tight and stops the newest attempt of each.
+        self.assertEqual(len(tight), 1)
+        shed = [
+            attempt
+            for result in results
+            for attempt in result.attempts
+            if attempt.error_type == "MemoryPressure"
+        ]
+        self.assertEqual(
+            sorted(attempt.run_id for attempt in shed),
+            sorted(result.run_id for result in results),
+        )
         self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
-        self.assertTrue(all(len(item.attempts) == 2 for item in results))
 
     def test_host_memory_shortage_pauses_launches_until_it_recovers(self):
         batch = self.make_batch(count=1, devices=[0], delay=0.05)
@@ -399,7 +408,7 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertTrue(all(len(item.attempts) == 1 for item in results))
         self.assertFalse(batch._active_gpu)
 
-    def test_memory_is_observed_on_the_configured_interval(self):
+    def test_memory_is_rechecked_on_every_tick(self):
         batch = self.make_batch(count=1, devices=[0], delay=0.3)
         original = Memory.sample
         stamps = []
@@ -408,14 +417,11 @@ class GpuSchedulingTests(unittest.TestCase):
             stamps.append(monotonic())
             return original(monitor)
 
-        with (
-            patch("expman.devices.MEMORY_QUERY_INTERVAL", 0.1),
-            patch.object(Memory, "sample", recorded),
-        ):
+        with patch.object(Memory, "sample", recorded):
             batch.run(progress=False)
         gaps = [later - earlier for earlier, later in pairwise(stamps)]
-        self.assertGreaterEqual(len(gaps), 2)
-        self.assertGreaterEqual(min(gaps), 0.05)
+        self.assertGreaterEqual(len(stamps), 10)
+        self.assertLess(max(gaps), 0.1)
 
     def test_slow_background_scores_do_not_block_worker_launches(self):
         batch = self.make_batch(count=2, delay=0.1, devices=[0])
@@ -480,20 +486,28 @@ class DeviceTests(unittest.TestCase):
         self.assertTrue(gate.can_launch(0.1, 15, ["a"]))
         self.assertFalse(gate.can_launch(0.099, 15, ["a"]))
         self.assertFalse(gate.can_launch(0.5, 14.99, ["a"]))
-        gate.blocked = True
+        gate.gpu_block = True
         self.assertFalse(gate.can_launch(0.9, 100, ["a"]))
         self.assertTrue(gate.can_launch(0.9, 100, []))
 
-    def test_query_timeout_is_retryable_and_uses_internal_timeout(self):
+    def test_host_gate_holds_refills_until_a_card_is_free(self):
+        gate = HostGate()
+        self.assertTrue(gate.can_launch(0.9, ["a"]))
+        gate.mem_block = True
+        self.assertFalse(gate.can_launch(0.9, ["a"]))
+        self.assertTrue(gate.can_launch(0.9, []))
+        self.assertFalse(gate.can_launch(0.099, []))
+
+    def test_query_timeout_is_an_observation_error_with_the_default_timeout(self):
         with (
             patch(
                 "expman.devices.subprocess.run",
-                side_effect=subprocess.TimeoutExpired("nvidia-smi", 10),
+                side_effect=subprocess.TimeoutExpired("nvidia-smi", 2),
             ) as query,
             self.assertRaises(MemoryObservationError),
         ):
             NvidiaMemory((0,)).sample()
-        self.assertEqual(query.call_args.kwargs["timeout"], 10.0)
+        self.assertEqual(query.call_args.kwargs["timeout"], 2.0)
 
     def test_nvidia_memory_validates_observations_and_identities(self):
         with patch("expman.devices.subprocess.run") as query:
