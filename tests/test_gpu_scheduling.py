@@ -9,7 +9,13 @@ from time import monotonic, sleep
 from unittest.mock import patch
 
 from expman import Batch, ConfigError, Pipeline, Stage, Status
-from expman.devices import DeviceMemory, MemoryObservationError, NvidiaMemory
+from expman.devices import (
+    DeviceMemory,
+    HostMemory,
+    MeminfoMonitor,
+    MemoryObservationError,
+    NvidiaMemory,
+)
 from expman.scheduling import Gate
 
 IMPORT_DEVICE = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -66,6 +72,11 @@ class Memory:
         }
 
 
+class Host:
+    def sample(self):
+        return HostMemory(1000, 900, 800, 400)
+
+
 @unittest.skipUnless(os.name == "posix", "POSIX worker process groups")
 class GpuSchedulingTests(unittest.TestCase):
     def setUp(self):
@@ -74,6 +85,7 @@ class GpuSchedulingTests(unittest.TestCase):
         self.root = Path(temporary.name)
         for target, value in [
             ("expman.devices.NvidiaMemory", Memory),
+            ("expman.devices.MeminfoMonitor", Host),
             ("expman.devices.LAUNCH_INTERVAL", 0.02),
             ("expman.devices.POLL_INTERVAL", 0.01),
             ("expman.devices.QUERY_RETRY_INTERVAL", 0.01),
@@ -114,6 +126,8 @@ class GpuSchedulingTests(unittest.TestCase):
         )
         self.assertTrue(all(item.output["cfg_devices"] == [0, 1] for item in results))
         self.assertTrue(any(item["concurrency"] > 1 for item in batch._gpu_history))
+        self.assertEqual(batch._host_memory["available_ratio"], 0.9)
+        self.assertEqual(batch._host_memory["swap_free_kb"], 400.0)
         with sqlite3.connect(batch.output_dir / "metrics.sqlite3") as db:
             self.assertEqual(
                 db.execute("SELECT count(*) FROM metrics").fetchone()[0], 40
@@ -227,6 +241,60 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(result.attempts[0].error_type, "MemoryPressure")
         self.assertEqual(result.status, Status.SUCCEEDED)
         self.assertEqual(result.output["saved"], 2)
+
+    def test_host_memory_shortage_pauses_launches_until_it_recovers(self):
+        batch = self.make_batch(count=1, devices=[0], delay=0.05)
+        original = Host.sample
+        pressured = []
+
+        def shortage(monitor):
+            if len(pressured) < 5:
+                pressured.append(len(batch._active_gpu))
+                return HostMemory(1000, 99, 0, 0)
+            return original(monitor)
+
+        with patch.object(Host, "sample", shortage):
+            results = batch.run(progress=False)
+        self.assertEqual(pressured, [0] * 5)
+        self.assertEqual(results[0].status, Status.SUCCEEDED)
+
+    def test_host_memory_pressure_sheds_newest_attempt_and_holds_other_cards(self):
+        batch = self.make_batch(count=2, devices=[0, 1], delay=0, wait_for_release=True)
+        dropped = []
+        held = []
+        cards = []
+        original = Host.sample
+
+        def pressure(monitor):
+            active = list(batch._active_gpu)
+            if (
+                not dropped
+                and len(active) == 2
+                and all((self.root / f"{key}.checkpoint").exists() for key in active)
+            ):
+                dropped.append(active[-1])
+                cards.extend(batch._active_gpu.values())
+                return HostMemory(1000, 50, 0, 0)
+            if dropped and not (self.root / "release").exists():
+                held.append(len(batch._active_gpu))
+                if len(held) >= 5:
+                    (self.root / "release").touch()
+            return original(monitor)
+
+        with patch.object(Host, "sample", pressure):
+            results = batch.run(progress=False)
+        self.assertTrue(dropped)
+        # The attempts ran on separate cards, so the shed run could have been
+        # replaced straight away on the freed card if host RAM had not held it.
+        self.assertEqual(sorted(cards), [0, 1])
+        # While the surviving attempt runs, no replacement starts on any card.
+        self.assertEqual(set(held), {1})
+        result = next(item for item in results if item.run_id == dropped[0])
+        self.assertEqual(result.attempts[0].status, Status.CANCELLED)
+        self.assertEqual(result.attempts[0].error_type, "MemoryPressure")
+        self.assertEqual(result.status, Status.SUCCEEDED)
+        self.assertEqual(len(result.attempts), 2)
+        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
 
     def test_transient_memory_failure_keeps_worker_and_pauses_launches(self):
         batch = self.make_batch(count=2, delay=0.2, devices=[0])
@@ -393,6 +461,40 @@ class DeviceTests(unittest.TestCase):
             query.return_value.stdout = "0, GPU-first, N/A, N/A\n"
             with self.assertRaises(RuntimeError):
                 NvidiaMemory((0,)).sample()
+
+    def test_host_memory_reads_meminfo_and_rejects_invalid_values(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "meminfo"
+            path.write_text(
+                "MemTotal:       1000 kB\n"
+                "MemFree:         100 kB\n"
+                "MemAvailable:    250 kB\n"
+                "SwapTotal:       400 kB\n"
+                "SwapFree:        300 kB\n"
+            )
+            observation = MeminfoMonitor(path).sample()
+            self.assertEqual(observation.available_ratio, 0.25)
+            self.assertEqual(observation.swap_total_kb, 400.0)
+            self.assertEqual(observation.swap_free_kb, 300.0)
+            path.write_text("MemTotal: 1000 kB\nMemAvailable: 2000 kB\n")
+            with self.assertRaisesRegex(MemoryObservationError, "invalid host memory"):
+                MeminfoMonitor(path).sample()
+            path.write_text("MemTotal: 1000 kB\nMemAvailable: N/A\n")
+            with self.assertRaisesRegex(
+                MemoryObservationError, "could not observe host memory"
+            ):
+                MeminfoMonitor(path).sample()
+            path.write_text("MemFree: 100 kB\n")
+            with self.assertRaisesRegex(
+                MemoryObservationError, "could not observe host memory"
+            ):
+                MeminfoMonitor(path).sample()
+
+    @unittest.skipUnless(Path("/proc/meminfo").exists(), "host meminfo is unavailable")
+    def test_default_host_monitor_reads_the_running_host(self):
+        observation = MeminfoMonitor().sample()
+        self.assertGreater(observation.total_kb, 0)
+        self.assertTrue(0 <= observation.available_ratio <= 1)
 
 
 if __name__ == "__main__":

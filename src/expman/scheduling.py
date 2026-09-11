@@ -31,6 +31,16 @@ class Gate:
 
 
 @dataclass
+class HostGate:
+    """Admission for host RAM, which every worker process shares."""
+
+    blocked: bool = False
+
+    def can_launch(self, ratio, running):
+        return ratio >= devices.MEMORY_MARGIN and (not self.blocked or not running)
+
+
+@dataclass
 class Worker:
     process: subprocess.Popen
     experiment: object
@@ -54,7 +64,9 @@ class GpuScheduler:
             raise RuntimeError("GPU process scheduling currently requires Linux or WSL")
         self.batch = batch
         self.monitor = devices.NvidiaMemory(batch.devices)
+        self.host = devices.MeminfoMonitor()
         self.gates = {device: Gate() for device in batch.devices}
+        self.host_gate = HostGate()
         self.workers = {}
         self.last_tick = perf_counter()
 
@@ -96,6 +108,16 @@ class GpuScheduler:
                 self.batch.recorder.record(pickle.loads(payload))
             except Exception as error:
                 warnings.warn(f"recorder failed: {error}", RuntimeWarning, stacklevel=2)
+
+    def _shed(self, run_id):
+        """Cancel one running attempt for memory pressure and hold its card."""
+        worker = self.workers[run_id]
+        gate = self.gates[worker.device]
+        gate.blocked = True
+        gate.last_launch = perf_counter()
+        with self.batch._state_lock:
+            self.batch._gpu_launch_times[worker.device] = gate.last_launch
+        self._finish(run_id, cancelled="MemoryPressure")
 
     def _launch(self, device, memory):
         batch = self.batch
@@ -241,6 +263,7 @@ class GpuScheduler:
                 self.batch._queue.append(run_id)
             if cancelled != "MemoryPressure":
                 self.gates[worker.device].blocked = False
+                self.host_gate.blocked = False
             self.batch._save()
 
     def run(self):
@@ -256,17 +279,19 @@ class GpuScheduler:
                 self._account()
                 try:
                     memory = self.monitor.sample()
+                    host = self.host.sample()
                 except devices.MemoryObservationError as error:
                     observation_failures += 1
                     with self.batch._state_lock:
                         self.batch._gpu_memory = {}
+                        self.batch._host_memory = {}
                     if observation_failures >= devices.QUERY_FAILURE_LIMIT:
                         raise RuntimeError(
-                            "GPU memory monitoring failed after "
+                            "memory monitoring failed after "
                             f"{observation_failures} consecutive queries: {error}"
                         ) from error
                     warnings.warn(
-                        f"GPU memory query failed ({observation_failures}/"
+                        f"memory query failed ({observation_failures}/"
                         f"{devices.QUERY_FAILURE_LIMIT}); new launches paused: {error}",
                         RuntimeWarning,
                         stacklevel=2,
@@ -278,6 +303,23 @@ class GpuScheduler:
                     self.batch._gpu_memory = {
                         device: value.free_ratio for device, value in memory.items()
                     }
+                    self.batch._host_memory = {
+                        "available_ratio": host.available_ratio,
+                        "available_kb": host.available_kb,
+                        "total_kb": host.total_kb,
+                        "swap_free_kb": host.swap_free_kb,
+                    }
+                if host.available_ratio < devices.MEMORY_MARGIN and self.workers:
+                    # Host RAM is shared by every worker process: drop the newest
+                    # attempt globally and stop refilling any card until one of the
+                    # survivors exits on its own.
+                    self.host_gate.blocked = True
+                    self._shed(
+                        max(self.workers, key=lambda item: self.workers[item].started)
+                    )
+                launching = self.host_gate.can_launch(
+                    host.available_ratio, list(self.workers)
+                )
                 for device, gate in self.gates.items():
                     running = [
                         key
@@ -286,14 +328,14 @@ class GpuScheduler:
                     ]
                     if memory[device].free_ratio < devices.MEMORY_MARGIN:
                         if running:
-                            gate.blocked = True
-                            gate.last_launch = perf_counter()
-                            with self.batch._state_lock:
-                                self.batch._gpu_launch_times[device] = gate.last_launch
-                            self._finish(running[-1], cancelled="MemoryPressure")
+                            self._shed(running[-1])
                         continue
-                    if self.batch._queue and gate.can_launch(
-                        memory[device].free_ratio, perf_counter(), running
+                    if (
+                        self.batch._queue
+                        and launching
+                        and gate.can_launch(
+                            memory[device].free_ratio, perf_counter(), running
+                        )
                     ):
                         self._launch(device, memory[device])
                 sleep(devices.POLL_INTERVAL)

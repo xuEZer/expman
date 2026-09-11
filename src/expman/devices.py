@@ -1,8 +1,9 @@
-"""Device selection and whole-device NVIDIA memory observations."""
+"""Device selection plus whole-device and host memory observations."""
 
 import math
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 from .config import ConfigError
 
@@ -12,6 +13,7 @@ POLL_INTERVAL = 0.2
 QUERY_TIMEOUT = 10.0
 QUERY_RETRY_INTERVAL = 1.0
 QUERY_FAILURE_LIMIT = 3
+MEMINFO_PATH = Path("/proc/meminfo")
 
 
 class MemoryObservationError(RuntimeError):
@@ -90,3 +92,52 @@ class NvidiaMemory:
             raise MemoryObservationError(
                 f"could not query selected NVIDIA GPUs: {error}"
             ) from error
+
+
+@dataclass(frozen=True)
+class HostMemory:
+    """Host RAM reported by /proc/meminfo; swap is observed but never gates."""
+
+    total_kb: float
+    available_kb: float
+    swap_total_kb: float
+    swap_free_kb: float
+
+    @property
+    def available_ratio(self) -> float:
+        return self.available_kb / self.total_kb
+
+
+class MeminfoMonitor:
+    """Read host RAM availability for scheduling; a failed read pauses launches."""
+
+    def __init__(self, path: Path | None = None):
+        self.path = MEMINFO_PATH if path is None else Path(path)
+
+    def sample(self) -> HostMemory:
+        try:
+            fields = {}
+            for line in self.path.read_text().splitlines():
+                key, _, value = line.partition(":")
+                if key in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"):
+                    fields[key] = float(value.split()[0])
+            total = fields["MemTotal"]
+            available = fields["MemAvailable"]
+            swap_total = fields.get("SwapTotal", 0.0)
+            swap_free = fields.get("SwapFree", 0.0)
+        except (OSError, ValueError, IndexError, KeyError) as error:
+            raise MemoryObservationError(
+                f"could not observe host memory: {error}"
+            ) from error
+        if (
+            not math.isfinite(total)
+            or total <= 0
+            or not math.isfinite(available)
+            or not 0 <= available <= total
+            or not math.isfinite(swap_total)
+            or swap_total < 0
+            or not math.isfinite(swap_free)
+            or not 0 <= swap_free <= swap_total
+        ):
+            raise MemoryObservationError("invalid host memory observation")
+        return HostMemory(total, available, swap_total, swap_free)

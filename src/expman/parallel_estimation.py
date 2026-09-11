@@ -15,6 +15,7 @@ def estimate_parallel(batch, coverage):
         history = list(batch._gpu_history)
         running = dict(batch._gpu_running_info)
         memory = dict(batch._gpu_memory)
+        host = dict(batch._host_memory)
         launch_times = dict(batch._gpu_launch_times)
     pending_ids = set(queue) | set(active)
     completed, censored, pending, _ = batch._time_estimator._observations(pending_ids)
@@ -31,6 +32,10 @@ def estimate_parallel(batch, coverage):
         for device, count in counts.items()
         if count or memory.get(device, 0) >= MEMORY_MARGIN
     }
+    if host.get("available_ratio", 1.0) < MEMORY_MARGIN:
+        # Host RAM shortage pauses every launch and sheds running attempts, so the
+        # forecast keeps only the slots that are already occupied.
+        capacity = {device: count for device, count in counts.items() if count}
     if not capacity:
         return TimeEstimate(None, None, coverage, len(completed), len(pending))
     # This forecast conditions on the present slot counts. It does not assume

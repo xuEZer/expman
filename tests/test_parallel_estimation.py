@@ -57,6 +57,34 @@ class ParallelEstimationTests(unittest.TestCase):
             batch._gpu_memory = {0: 0.05}
             self.assertIsNone(batch.estimate().upper_seconds)
 
+    def test_host_memory_pressure_keeps_only_the_occupied_slots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            batch = self.make_batch(Path(temporary), [0, 1])
+            second = batch.experiments[1]
+            batch._active_gpu[second.run_id] = 0
+            batch._queue.remove(second.run_id)
+            with patch(
+                "expman.parallel_estimation.DurationModel.draws",
+                return_value=iter([[100, 100]]),
+            ):
+                estimate = estimate_parallel(batch, 0.8)
+            self.assertEqual(estimate.upper_seconds, 100)
+            batch._host_memory = {"available_ratio": 0.05}
+            with patch(
+                "expman.parallel_estimation.DurationModel.draws",
+                return_value=iter([[100, 100]]),
+            ):
+                pressured = estimate_parallel(batch, 0.8)
+            # The free card gets no slot, so the queued experiment waits for the
+            # running one instead of starting beside it.
+            self.assertEqual(pressured.upper_seconds, 200)
+
+    def test_host_memory_pressure_without_running_work_is_unknown(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            batch = self.make_batch(Path(temporary), [0])
+            batch._host_memory = {"available_ratio": 0.05}
+            self.assertIsNone(batch.estimate().upper_seconds)
+
     def test_observed_contention_is_used_as_a_model_feature(self):
         with tempfile.TemporaryDirectory() as temporary:
             batch = self.make_batch(Path(temporary), [0, 1])
