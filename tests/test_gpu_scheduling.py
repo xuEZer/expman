@@ -1,6 +1,8 @@
+import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -9,7 +11,7 @@ from pathlib import Path
 from time import monotonic, sleep
 from unittest.mock import patch
 
-from expman import Batch, ConfigError, Experiment, Pipeline, Stage, Status, devices
+from expman import Batch, ConfigError, Pipeline, Stage, Status, devices
 from expman.devices import (
     HOST_PEAK_KB_DEFAULT,
     HOST_RESERVE_KB,
@@ -159,6 +161,48 @@ class GpuSchedulingTests(unittest.TestCase):
         )
         self.assertEqual(resumed.devices, (0, 1))
 
+    def seed_shared_cache(self, output_dir):
+        """Run one Experiment in a fresh process and return its output.
+
+        The seeding process hides CUDA, because the faked GPU reading hands the
+        workers a device token CUDA cannot resolve: the snapshot has to be captured
+        under the same visibility, or it records RNG states no worker can match.
+        """
+        script = (
+            "import importlib, json, sys\n"
+            "sys.path[:] = json.loads(sys.argv[1])\n"
+            "from pathlib import Path\n"
+            "from expman import Experiment, Pipeline\n"
+            "stage = getattr(importlib.import_module(sys.argv[2]), 'SharedWork')\n"
+            "result = Experiment(Pipeline([stage]), {'unused': 0},\n"
+            "                    output_dir=Path(sys.argv[3]),\n"
+            "                    _cache_root=Path(sys.argv[4])).run()\n"
+            "print(json.dumps({'status': result.status.value, 'output': result.output, 'error': result.error_message}))\n"
+        )
+        environment = dict(os.environ)
+        environment["CUDA_VISIBLE_DEVICES"] = ""
+        environment["PYTHONPATH"] = os.pathsep.join(
+            str(Path(item)) for item in sys.path
+        )
+        done = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                json.dumps([str(Path(item)) for item in sys.path]),
+                type(self).__module__,
+                str(self.root / "seed"),
+                str(output_dir / "cache"),
+            ],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        seeded = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(seeded["status"], "succeeded", seeded["error"])
+        return seeded["output"]
+
     def test_shared_prefix_is_loaded_by_a_new_worker(self):
         # Seed the shared cache, then let the worker processes start from it instead
         # of running the stage: both results are the seeding process, and both
@@ -167,17 +211,10 @@ class GpuSchedulingTests(unittest.TestCase):
         path = self.root / "shared.yaml"
         path.write_text("device: [0]\nunused: !choice [1, 2]\n")
         batch = Batch(Pipeline([SharedWork]), path, output_dir=output_dir)
-        seeded = Experiment(
-            Pipeline([SharedWork]),
-            {"unused": 0},
-            output_dir=self.root / "seed",
-            _cache_root=output_dir / "cache",
-        ).run()
+        seeded = self.seed_shared_cache(output_dir)
         results = batch.run(progress=False)
         self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
-        self.assertEqual(
-            [item.output for item in results], [seeded.output, seeded.output]
-        )
+        self.assertEqual([item.output for item in results], [seeded, seeded])
         references = [
             experiment._store.completed_reference((0,))
             for experiment in batch.experiments
@@ -185,7 +222,7 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(references[0], references[1])
         self.assertEqual(
             batch.experiments[1]._store.completed((0,))["state"]["producer"],
-            seeded.output,
+            seeded,
         )
 
     def test_failure_and_unexpected_process_exit_get_one_retry(self):

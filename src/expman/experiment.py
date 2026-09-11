@@ -138,11 +138,11 @@ class Experiment:
             else _metrics_path
         )
         self._store = RunStore(self.output_dir, serializer)
-        self._cache_root = _cache_root
+        self._cache_root = None if _cache_root is None else Path(_cache_root)
         self._reads = ConfigurationReads(self._cfg)
         if _cache_root is not None:
             self._store.shared = PrefixCache(
-                _cache_root,
+                self._cache_root,
                 pipeline.signature(),
                 self._cfg.get("seed", 0),
                 self._store.serializer,
