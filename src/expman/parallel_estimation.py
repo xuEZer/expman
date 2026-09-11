@@ -1,10 +1,9 @@
 """Conditional makespan intervals using observed concurrent experiment durations."""
 
 from collections import defaultdict
-from time import perf_counter
 
 from ._time_model import DurationModel, features
-from .devices import LAUNCH_INTERVAL, MEMORY_MARGIN
+from .devices import MEMORY_MARGIN
 from .estimation import TimeEstimate, _quantile
 
 
@@ -16,7 +15,6 @@ def estimate_parallel(batch, coverage):
         running = dict(batch._gpu_running_info)
         memory = dict(batch._gpu_memory)
         host = dict(batch._host_memory)
-        launch_times = dict(batch._gpu_launch_times)
     pending_ids = set(queue) | set(active)
     completed, censored, pending, _ = batch._time_estimator._observations(pending_ids)
     if not pending:
@@ -77,7 +75,6 @@ def estimate_parallel(batch, coverage):
     model = DurationModel(features(configs), completed, censored)
     ids = [batch.experiments[index].run_id for index, _ in pending]
     totals = []
-    now = perf_counter()
     for durations in model.draws(pending, components=True):
         predictions = dict(zip(ids, durations, strict=True))
         slots = {device: [0.0] * count for device, count in capacity.items()}
@@ -86,20 +83,12 @@ def estimate_parallel(batch, coverage):
             if run_id in predictions:
                 slots[device][occupied[device]] = predictions[run_id]
                 occupied[device] += 1
-        launched = {
-            device: max(
-                0.0, launch_times.get(device, float("-inf")) + LAUNCH_INTERVAL - now
-            )
-            for device in capacity
-        }
         for run_id in queue:
             if run_id not in predictions:
                 continue
             device = assignments[run_id]
             slot = min(range(len(slots[device])), key=slots[device].__getitem__)
-            start = max(slots[device][slot], launched[device])
-            slots[device][slot] = start + predictions[run_id]
-            launched[device] = start + LAUNCH_INTERVAL
+            slots[device][slot] += predictions[run_id]
         totals.append(max(max(value) for value in slots.values()))
     totals.sort()
     tail = (1 - coverage) / 2

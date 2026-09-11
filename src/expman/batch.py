@@ -68,7 +68,6 @@ class Batch:
         self._gpu_memory = {}
         self._host_memory = {}
         self._gpu_running_info = {}
-        self._gpu_launch_times = {}
         self.output_dir = (
             Path("runs") / uuid4().hex if output_dir is None else Path(output_dir)
         ).resolve()
@@ -271,7 +270,6 @@ class Batch:
         self._gpu_memory = {}
         self._host_memory = {}
         self._gpu_running_info = {}
-        self._gpu_launch_times = {}
         history = manifest.get("gpu_history", [])
         attempts_by_id = {
             item.run_id: len(item.result.attempts) for item in experiments

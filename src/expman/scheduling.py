@@ -19,17 +19,12 @@ from .storage import PickleSerializer, RecoveryWarning, read_record, write_recor
 
 @dataclass
 class Gate:
-    """One card's launch spacing, held while its VRAM reading stays tight."""
+    """One card's admission, held while its VRAM reading stays tight."""
 
-    last_launch: float = float("-inf")
     gpu_block: bool = False
 
-    def can_launch(self, ratio, now, running):
-        return (
-            ratio >= devices.MEMORY_MARGIN
-            and (not self.gpu_block or not running)
-            and now - self.last_launch >= devices.LAUNCH_INTERVAL
-        )
+    def can_launch(self, ratio, running):
+        return ratio >= devices.MEMORY_MARGIN and (not self.gpu_block or not running)
 
 
 @dataclass
@@ -169,12 +164,7 @@ class GpuScheduler:
         return max(self.workers, key=lambda run_id: self.workers[run_id].started)
 
     def _shed(self, run_id):
-        """Cancel one running attempt for memory pressure and space its card."""
-        worker = self.workers[run_id]
-        gate = self.gates[worker.device]
-        gate.last_launch = perf_counter()
-        with self.batch._state_lock:
-            self.batch._gpu_launch_times[worker.device] = gate.last_launch
+        """Cancel one running attempt for memory pressure on its card."""
         self._finish(run_id, cancelled="MemoryPressure")
 
     def _launch(self, device, memory):
@@ -245,9 +235,6 @@ class GpuScheduler:
             self.workers[run_id] = Worker(
                 process, experiment, device, memory.uuid, root, now
             )
-            self.gates[device].last_launch = now
-            with batch._state_lock:
-                batch._gpu_launch_times[device] = now
         except BaseException:
             if process is not None:
                 _kill_group(process)
@@ -363,9 +350,7 @@ class GpuScheduler:
                     if (
                         self.batch._queue
                         and launching
-                        and gate.can_launch(
-                            memory[device].free_ratio, perf_counter(), running
-                        )
+                        and gate.can_launch(memory[device].free_ratio, running)
                     ):
                         self._launch(device, memory[device])
                 sleep(devices.POLL_INTERVAL)

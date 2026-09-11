@@ -12,7 +12,6 @@ from .config import ConfigError
 # shedding only starts once a resource is nearly exhausted: about 82 MiB of an
 # 8 GiB card, or 320 MB of a 32 GiB host, so the OOM margin is left to the user.
 MEMORY_MARGIN = 0.01
-LAUNCH_INTERVAL = 5.0
 POLL_INTERVAL = 0.2
 # Measured on RTX 3070 laptop / WSL2, one GPU, at the scheduler's own cadence:
 # median 53 ms, p99 300 ms, worst 620 ms with the GPU in desktop use; median

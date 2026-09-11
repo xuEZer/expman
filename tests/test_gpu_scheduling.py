@@ -9,7 +9,7 @@ from pathlib import Path
 from time import monotonic, sleep
 from unittest.mock import patch
 
-from expman import Batch, ConfigError, Pipeline, Stage, Status
+from expman import Batch, ConfigError, Experiment, Pipeline, Stage, Status
 from expman.devices import (
     DeviceMemory,
     HostMemory,
@@ -88,7 +88,6 @@ class GpuSchedulingTests(unittest.TestCase):
         for target, value in [
             ("expman.devices.NvidiaMemory", Memory),
             ("expman.devices.MeminfoMonitor", Host),
-            ("expman.devices.LAUNCH_INTERVAL", 0.02),
             ("expman.devices.POLL_INTERVAL", 0.01),
         ]:
             mock = patch(target, value)
@@ -142,14 +141,24 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(resumed.devices, (0, 1))
 
     def test_shared_prefix_is_loaded_by_a_new_worker(self):
-        # Use two distinct configs whose difference is irrelevant to SharedWork.
+        # Seed the shared cache, then let the worker processes start from it instead
+        # of running the stage: both results are the seeding process, and both
+        # experiments point at the same cache entry.
+        output_dir = self.root / "shared-two"
         path = self.root / "shared.yaml"
         path.write_text("device: [0]\nunused: !choice [1, 2]\n")
-        batch = Batch(Pipeline([SharedWork]), path, output_dir=self.root / "shared-two")
-        with patch("expman.devices.LAUNCH_INTERVAL", 1.0):
-            results = batch.run(progress=False)
+        batch = Batch(Pipeline([SharedWork]), path, output_dir=output_dir)
+        seeded = Experiment(
+            Pipeline([SharedWork]),
+            {"unused": 0},
+            output_dir=self.root / "seed",
+            _cache_root=output_dir / "cache",
+        ).run()
+        results = batch.run(progress=False)
         self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
-        self.assertEqual(results[0].output, results[1].output)
+        self.assertEqual(
+            [item.output for item in results], [seeded.output, seeded.output]
+        )
         references = [
             experiment._store.completed_reference((0,))
             for experiment in batch.experiments
@@ -157,7 +166,7 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(references[0], references[1])
         self.assertEqual(
             batch.experiments[1]._store.completed((0,))["state"]["producer"],
-            results[0].output,
+            seeded.output,
         )
 
     def test_failure_and_unexpected_process_exit_get_one_retry(self):
@@ -482,14 +491,13 @@ class DeviceTests(unittest.TestCase):
             self.assertEqual(len(batch.experiments), 2)
             self.assertEqual(batch.devices, (0, 1))
 
-    def test_gate_boundary_spacing_and_empty_card_fallback(self):
-        gate = Gate(last_launch=10)
-        self.assertTrue(gate.can_launch(0.01, 15, ["a"]))
-        self.assertFalse(gate.can_launch(0.009, 15, ["a"]))
-        self.assertFalse(gate.can_launch(0.5, 14.99, ["a"]))
+    def test_gate_threshold_and_empty_card_fallback(self):
+        gate = Gate()
+        self.assertTrue(gate.can_launch(0.01, ["a"]))
+        self.assertFalse(gate.can_launch(0.009, ["a"]))
         gate.gpu_block = True
-        self.assertFalse(gate.can_launch(0.9, 100, ["a"]))
-        self.assertTrue(gate.can_launch(0.9, 100, []))
+        self.assertFalse(gate.can_launch(0.9, ["a"]))
+        self.assertTrue(gate.can_launch(0.9, []))
 
     def test_host_gate_holds_refills_until_a_card_is_free(self):
         gate = HostGate()

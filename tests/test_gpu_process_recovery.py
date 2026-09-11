@@ -40,7 +40,6 @@ class Work(Stage):
 if __name__ == "__main__":
     root = Path(sys.argv[1])
     devices.NvidiaMemory = Memory
-    devices.LAUNCH_INTERVAL = 0.02
     devices.POLL_INTERVAL = 0.01
     if len(sys.argv) > 2:
         batch = Batch.resume(Pipeline([Work]), root / "batch")
