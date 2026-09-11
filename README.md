@@ -330,7 +330,7 @@ models:
     name: patchtst
 ```
 
-NumPy/PyTorch 是可选依赖，run 启动时会主动导入已安装的库，不需要用户预先 import；未安装时跳过，已安装但导入失败则正常报错。可以在库外单独调用相同的初始化函数：
+NumPy/PyTorch 是可选依赖（只装基础包不会拉取它们；`pip install 'expman[numpy]'` 或 `'expman[torch]'` 可显式安装），run 启动时会主动导入已安装的库，不需要用户预先 import；未安装时跳过，已安装但导入失败则正常报错。可以在库外单独调用相同的初始化函数：
 
 ```python
 from expman import seed_everything
