@@ -241,21 +241,21 @@ class Batch:
                 _resume=True,
             )
             for attempt in entry["attempts"]:
-                output = None
+                output_source = None
                 if attempt["status"] == Status.SUCCEEDED.value and pipeline.stages:
-                    completed = experiment._store.completed((len(pipeline.stages) - 1,))
-                    if completed is None:
+                    position = (len(pipeline.stages) - 1,)
+                    if experiment._store.completed(position) is None:
                         raise StorageError(
                             f"successful experiment has no final snapshot: {root}"
                         )
-                    output = completed["output"]
+                    output_source = experiment._output_source()
                 experiment._attempts.append(
                     AttemptResult(
                         run_id=run_id,
                         attempt=attempt["attempt"],
                         status=Status(attempt["status"]),
                         duration_seconds=attempt["duration_seconds"],
-                        output=output,
+                        output_source=output_source,
                         error_type=attempt["error_type"],
                         error_message=attempt["error_message"],
                     )
@@ -506,6 +506,7 @@ class Batch:
             self._save()
             try:
                 result = experiment.run(recorder=self.recorder)
+                experiment._release_output()
             except BaseException:
                 with self._state_lock:
                     self._queue.appendleft(self._active)

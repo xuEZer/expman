@@ -211,6 +211,15 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertTrue(all(item.output["saved"] == 2 for item in results))
         self.assertTrue(all(len(item.attempts) == 2 for item in results))
 
+    def test_worker_results_are_read_back_instead_of_retained(self):
+        batch = self.make_batch(count=1, devices=[0], delay=0.05)
+        result = batch.run(progress=False)[0]
+        attempt = result.attempts[-1]
+        self.assertIsNone(attempt._output)
+        self.assertIsNotNone(attempt.output_source)
+        self.assertEqual(attempt.output["device"], "GPU-test-0")
+        self.assertEqual(result.output["device"], "GPU-test-0")
+
     def test_memory_kill_waits_for_other_exit_then_retries(self):
         batch = self.make_batch(count=2, devices=[0], delay=0, wait_for_release=True)
         dropped = []

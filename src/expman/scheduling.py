@@ -13,7 +13,7 @@ from time import perf_counter, sleep
 
 from . import devices
 from .events import Status
-from .experiment import AttemptResult
+from .experiment import AttemptResult, ResultOutput
 from .storage import PickleSerializer, RecoveryWarning, read_record, write_record
 
 
@@ -216,7 +216,7 @@ class GpuScheduler:
                     "metrics_path": experiment._metrics.path,
                     "cache_root": experiment._cache_root,
                     "attempts": [
-                        replace(item, output=None)
+                        replace(item, _output=None, output_source=None)
                         for item in experiment.result.attempts
                     ],
                 },
@@ -285,6 +285,13 @@ class GpuScheduler:
             ):
                 raise RuntimeError("invalid worker attempt result")
             result = replace(result, duration_seconds=duration)
+            # The record stays authoritative for the output: keep only the summary
+            # so the parent does not hold one result object per completed attempt.
+            result = replace(
+                result,
+                _output=None,
+                output_source=ResultOutput(result_path, self.batch._serializer),
+            )
         else:
             result = AttemptResult(
                 run_id,

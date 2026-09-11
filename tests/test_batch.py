@@ -22,6 +22,14 @@ class Echo(Stage):
         return ctx.cfg
 
 
+class Payload:
+    """Weakref-able stage output used to check what the Batch keeps alive."""
+
+    def __init__(self, item):
+        self.item = item
+        self.data = bytearray(1024)
+
+
 class BatchTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -252,6 +260,39 @@ class BatchTests(unittest.TestCase):
         result = self.make_batch(Pipeline([Fail]), {}).run()[0]
         self.assertTrue(all(reference() is None for reference in refs))
         self.assertEqual(result.attempts[0].error_message, "failure")
+
+    def test_completed_attempt_does_not_retain_its_output(self):
+        references = []
+
+        class Produce(Stage):
+            def process(self, data, ctx):
+                output = Payload(ctx.cfg["item"])
+                references.append(weakref.ref(output))
+                return output
+
+        batch = self.make_batch(
+            Pipeline([Produce]), self.config("item: !choice [A, B]")
+        )
+        results = batch.run()
+        self.assertEqual([result.output.item for result in results], ["A", "B"])
+        self.assertTrue(all(reference() is None for reference in references))
+        self.assertEqual(
+            [attempt._output for result in results for attempt in result.attempts],
+            [None, None],
+        )
+        self.assertEqual(
+            [attempt.output.item for result in results for attempt in result.attempts],
+            ["A", "B"],
+        )
+
+    def test_resumed_batch_reads_outputs_instead_of_retaining_them(self):
+        batch = self.make_batch(Pipeline([Echo]), self.config("item: !choice [A, B]"))
+        batch.run()
+        resumed = Batch.resume(Pipeline([Echo]), batch.output_dir)
+        attempts = [result.attempts[-1] for result in resumed.results]
+        self.assertEqual([attempt._output for attempt in attempts], [None, None])
+        self.assertTrue(all(attempt.output_source is not None for attempt in attempts))
+        self.assertEqual([attempt.output["item"] for attempt in attempts], ["A", "B"])
 
     def test_error_message_failure_does_not_break_queue(self):
         class UnprintableError(Exception):

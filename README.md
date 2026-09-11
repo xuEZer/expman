@@ -131,6 +131,7 @@ for result in results:
 - 重试保留 `run_id`，`ctx.attempt` 从 1 递增。`ctx.cfg` 深层只读，运行过程中变化的数据放在可变字典 `ctx.state`。
 - `KeyboardInterrupt`、`SystemExit` 等中断会停止 Batch 并继续抛出。调用方捕获后可读取 `batch.results`：已执行实验保留结果，未执行实验状态为 `pending`。
 - 新实验按估时信息价值选择启动顺序；返回结果按配置顺序排列，每个结果保留全部尝试的状态、耗时和错误摘要；`output` 是最终成功尝试的返回值。事件可通过 `batch.recorder` 获取，支持传入自定义 Recorder。
+- 尝试输出不常驻内存：Batch 只保留状态、耗时、错误摘要和输出的存放位置，`result.output` 每次访问都从权威记录（GPU 为 `attempts/<n>/result.pkl`，顺序执行为该 run 的最终阶段快照）重新读取，因此内存占用不随已完成实验数增长，中断后 `batch.results` 仍可读取全部输出。每次访问返回的是重新读到的副本，修改它不会写回记录；需要反复使用同一份数据时请自行保存引用。
 - Batch 对象执行一次；继续已有实验使用 `Batch.resume()`，重新开始使用新的 Batch。也可以传入一份具体配置字典，创建只有一个 Experiment 的集合。
 
 隔离覆盖框架持有的实例和配置；用户的类变量、全局变量及文件等外部副作用仍需自行管理。失败后不保存异常对象或 traceback，并触发垃圾回收。恢复不会回滚外部写入，用户代码需要合理处理重复执行。

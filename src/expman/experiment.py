@@ -1,11 +1,11 @@
 """One concrete configuration and the history of its isolated attempts."""
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
 from time import perf_counter
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 from .context import RunContext, _error_message, _name
@@ -17,18 +17,66 @@ from .pipeline import Pipeline
 from .prefix_cache import PrefixCache
 from .randomness import RandomStateManager, validate_seed
 from .recorders import InMemoryRecorder, Recorder
-from .storage import RunStore, Serializer, read_record, write_record
+from .storage import RunStore, Serializer, StorageError, read_record, write_record
+
+
+class OutputSource(Protocol):
+    """Reads an attempt output that the parent process does not keep in memory."""
+
+    def load(self) -> Any: ...
+
+
+@dataclass(frozen=True, eq=False)
+class ResultOutput:
+    """Attempt output kept in the result record written by a worker process."""
+
+    path: Path
+    serializer: Serializer
+
+    def load(self) -> Any:
+        record = read_record(self.path, self.serializer)
+        if not isinstance(record, AttemptResult):
+            raise StorageError(f"invalid attempt record: {self.path}")
+        return record.output
+
+
+@dataclass(frozen=True, eq=False)
+class SnapshotOutput:
+    """Attempt output kept in the final stage snapshot of its run."""
+
+    store: RunStore
+    position: tuple[int, ...]
+
+    def load(self) -> Any:
+        record = self.store.completed(self.position)
+        if record is None:
+            raise StorageError(f"missing stage snapshot: {self.position}")
+        return record["output"]
 
 
 @dataclass(frozen=True)
 class AttemptResult:
+    """Attempt summary; the output is read from its record on demand.
+
+    A batch keeps one of these per attempt for its whole lifetime, so the output
+    object is not retained: output_source rereads the authoritative record, and
+    every access returns a fresh object.
+    """
+
     run_id: str
     attempt: int
     status: Status
     duration_seconds: float
-    output: Any = None
+    _output: Any = None
     error_type: str | None = None
     error_message: str | None = None
+    output_source: OutputSource | None = None
+
+    @property
+    def output(self) -> Any:
+        if self._output is not None or self.output_source is None:
+            return self._output
+        return self.output_source.load()
 
 
 @dataclass(frozen=True)
@@ -120,6 +168,27 @@ class Experiment:
     def result(self) -> ExperimentResult:
         return ExperimentResult(self.run_id, tuple(self._attempts))
 
+    def _output_source(self) -> OutputSource | None:
+        """Snapshot source for this run's output when it is re-readable."""
+        if not self.pipeline.stages:
+            return None
+        position = (len(self.pipeline.stages) - 1,)
+        if not (self._store.stage_dir(position) / "completed.pkl").exists():
+            return None
+        return SnapshotOutput(self._store, position)
+
+    def _release_output(self) -> None:
+        """Keep the newest attempt summary once its output can be read back."""
+        with self._timing_lock:
+            if not self._attempts:
+                return
+            result = self._attempts[-1]
+            if result.status is not Status.SUCCEEDED or result._output is None:
+                return
+            source = self._output_source()
+            if source is not None:
+                self._attempts[-1] = replace(result, _output=None, output_source=source)
+
     def _timing_snapshot(self) -> tuple[tuple[AttemptResult, ...], float]:
         with self._timing_lock:
             elapsed = (
@@ -170,7 +239,7 @@ class Experiment:
                 attempt=attempt,
                 status=status,
                 duration_seconds=perf_counter() - started,
-                output=output,
+                _output=output,
                 error_type=error_type,
                 error_message=error_message,
             )
