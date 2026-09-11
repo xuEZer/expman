@@ -234,7 +234,7 @@ class GpuSchedulingTests(unittest.TestCase):
                 and all((self.root / f"{key}.checkpoint").exists() for key in active)
             ):
                 dropped.append(active[-1])
-                return {0: DeviceMemory("GPU-test-0", 100, 9)}
+                return {0: DeviceMemory("GPU-test-0", 1000, 5)}
             if dropped and not list(self.root.glob("*.finished")):
                 observed_block.append(tuple(active))
                 self.assertEqual(len(active), 1)
@@ -264,7 +264,7 @@ class GpuSchedulingTests(unittest.TestCase):
             tight.append(1)
             (self.root / "release").touch()
             return {
-                device: DeviceMemory(f"GPU-test-{device}", 100, 5) for device in (0, 1)
+                device: DeviceMemory(f"GPU-test-{device}", 1000, 5) for device in (0, 1)
             }
 
         with patch.object(Memory, "sample", pressure):
@@ -291,7 +291,7 @@ class GpuSchedulingTests(unittest.TestCase):
         def shortage(monitor):
             if len(pressured) < 5:
                 pressured.append(len(batch._active_gpu))
-                return HostMemory(1000, 99, 0, 0)
+                return HostMemory(1000, 5, 0, 0)
             return original(monitor)
 
         with patch.object(Host, "sample", shortage):
@@ -315,7 +315,7 @@ class GpuSchedulingTests(unittest.TestCase):
             ):
                 dropped.append(active[-1])
                 cards.extend(batch._active_gpu.values())
-                return HostMemory(1000, 50, 0, 0)
+                return HostMemory(1000, 5, 0, 0)
             if dropped and not (self.root / "release").exists():
                 held.append(len(batch._active_gpu))
                 if len(held) >= 5:
@@ -484,8 +484,8 @@ class DeviceTests(unittest.TestCase):
 
     def test_gate_boundary_spacing_and_empty_card_fallback(self):
         gate = Gate(last_launch=10)
-        self.assertTrue(gate.can_launch(0.1, 15, ["a"]))
-        self.assertFalse(gate.can_launch(0.099, 15, ["a"]))
+        self.assertTrue(gate.can_launch(0.01, 15, ["a"]))
+        self.assertFalse(gate.can_launch(0.009, 15, ["a"]))
         self.assertFalse(gate.can_launch(0.5, 14.99, ["a"]))
         gate.gpu_block = True
         self.assertFalse(gate.can_launch(0.9, 100, ["a"]))
@@ -497,7 +497,7 @@ class DeviceTests(unittest.TestCase):
         gate.mem_block = True
         self.assertFalse(gate.can_launch(0.9, ["a"]))
         self.assertTrue(gate.can_launch(0.9, []))
-        self.assertFalse(gate.can_launch(0.099, []))
+        self.assertFalse(gate.can_launch(0.009, []))
 
     def test_query_timeout_is_an_observation_error_with_the_default_timeout(self):
         with (

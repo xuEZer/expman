@@ -54,7 +54,7 @@ class ParallelEstimationTests(unittest.TestCase):
     def test_no_available_card_leaves_wait_time_unknown(self):
         with tempfile.TemporaryDirectory() as temporary:
             batch = self.make_batch(Path(temporary), [0])
-            batch._gpu_memory = {0: 0.05}
+            batch._gpu_memory = {0: 0.005}
             self.assertIsNone(batch.estimate().upper_seconds)
 
     def test_host_memory_pressure_keeps_only_the_occupied_slots(self):
@@ -69,7 +69,7 @@ class ParallelEstimationTests(unittest.TestCase):
             ):
                 estimate = estimate_parallel(batch, 0.8)
             self.assertEqual(estimate.upper_seconds, 100)
-            batch._host_memory = {"available_ratio": 0.05}
+            batch._host_memory = {"available_ratio": 0.005}
             with patch(
                 "expman.parallel_estimation.DurationModel.draws",
                 return_value=iter([[100, 100]]),
@@ -82,7 +82,7 @@ class ParallelEstimationTests(unittest.TestCase):
     def test_host_memory_pressure_without_running_work_is_unknown(self):
         with tempfile.TemporaryDirectory() as temporary:
             batch = self.make_batch(Path(temporary), [0])
-            batch._host_memory = {"available_ratio": 0.05}
+            batch._host_memory = {"available_ratio": 0.005}
             self.assertIsNone(batch.estimate().upper_seconds)
 
     def test_observed_contention_is_used_as_a_model_feature(self):
