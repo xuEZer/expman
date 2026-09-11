@@ -106,6 +106,22 @@ def memory_limit(unit: str, estimate_kb: float) -> MemoryLimit:
     return MemoryLimit((), None, 0.0, "none")
 
 
+def release(limit: MemoryLimit | None) -> bool:
+    """Remove a directly created cgroup once its worker has exited.
+
+    A systemd scope is unloaded by systemd itself; a cgroup this process created
+    stays behind forever, so a long Batch would leave one empty directory per
+    attempt.
+    """
+    if limit is None or limit.mechanism != "cgroup" or limit.cgroup is None:
+        return False
+    try:
+        limit.cgroup.rmdir()
+    except OSError:
+        return False
+    return True
+
+
 def join(directory: Path, pid: int) -> bool:
     """Move a started child into a directly created cgroup."""
     try:

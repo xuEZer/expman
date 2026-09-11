@@ -327,6 +327,7 @@ class GpuScheduler:
                 self.workers.pop(run_id, None)
                 with experiment._timing_lock:
                     experiment._active_started = None
+            limits.release(limit)
             with batch._state_lock:
                 batch._active_gpu.pop(run_id, None)
                 batch._queue.appendleft(run_id)
@@ -349,6 +350,7 @@ class GpuScheduler:
         experiment = worker.experiment
         duration = max(0.0, finished - worker.started)
         capped, peak_kb = self._cap_report(worker)
+        limits.release(worker.limit)
         result_path = worker.root / "result.pkl"
         if result_path.exists():
             result = read_record(result_path, self.batch._serializer)

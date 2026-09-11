@@ -118,6 +118,19 @@ class MemoryLimitTests(unittest.TestCase):
         self.assertFalse(limits.near_cap(1000.0, 2000.0))
         self.assertTrue(limits.near_cap(1900.0, 2000.0))
 
+    def test_release_removes_a_directly_created_cgroup(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        created = Path(directory.name) / "expman-unit-1"
+        created.mkdir()
+        limit = limits.MemoryLimit((), created, 1024.0, "cgroup")
+        self.assertTrue(limits.release(limit))
+        self.assertFalse(created.exists())
+        self.assertFalse(limits.release(limit))
+        scope = limits.MemoryLimit((), created, 1024.0, "systemd")
+        self.assertFalse(limits.release(scope))
+        self.assertFalse(limits.release(None))
+
     def test_unreadable_cgroup_state_is_not_pressure(self):
         missing = Path(tempfile.gettempdir()) / "expman-missing-cgroup"
         self.assertIsNone(limits.usage(missing))
@@ -171,7 +184,18 @@ class CappedWorkerTests(unittest.TestCase):
             started.start()
             self.addCleanup(started.stop)
 
+    @staticmethod
+    def cgroup_root():
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+        from expman import limits as limits_module
+
+        own = limits_module.own_cgroup()
+        return own.parent
+
     def test_capped_attempt_is_retried_with_a_raised_estimate(self):
+        before = set(self.cgroup_root().glob("expman-*"))
         path = self.root / "experiments.yaml"
         path.write_text(
             yaml.safe_dump({"device": [0], "markers": str(self.root), "delay": 0})
@@ -188,6 +212,12 @@ class CappedWorkerTests(unittest.TestCase):
         # The raised floor covers more than the peak that tripped the cap.
         estimate = GpuScheduler(batch).peaks.estimate_kb(result.run_id)
         self.assertGreater(estimate, capped[0]["peak_kb"])
+        if ORIGINAL_MEMORY_LIMIT("probe", 1.0).mechanism == "cgroup":
+            # Each attempt's cgroup is removed again, so a large Batch does not
+            # leave one directory per attempt behind.
+            self.assertEqual(
+                sorted(self.cgroup_root().glob("expman-*"))[len(before) :], []
+            )
 
 
 if __name__ == "__main__":
