@@ -11,12 +11,16 @@ from unittest.mock import patch
 
 from expman import Batch, ConfigError, Experiment, Pipeline, Stage, Status
 from expman.devices import (
+    HOST_PEAK_KB_DEFAULT,
+    HOST_RESERVE_KB,
     DeviceMemory,
     HostMemory,
     MeminfoMonitor,
     MemoryObservationError,
     NvidiaMemory,
+    fits_reserve,
     nvidia_smi,
+    residency_kb,
 )
 from expman.scheduling import Gate, GpuScheduler, HostGate
 
@@ -76,7 +80,8 @@ class Memory:
 
 class Host:
     def sample(self):
-        return HostMemory(1000, 900, 800, 400)
+        # Roomy in bytes, with no swap in use: the reading admits launches.
+        return HostMemory(64 * 1024**2, 48 * 1024**2, 0, 0)
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX worker process groups")
@@ -126,8 +131,9 @@ class GpuSchedulingTests(unittest.TestCase):
         )
         self.assertTrue(all(item.output["cfg_devices"] == [0, 1] for item in results))
         self.assertTrue(any(item["concurrency"] > 1 for item in batch._gpu_history))
-        self.assertEqual(batch._host_memory["available_ratio"], 0.9)
-        self.assertEqual(batch._host_memory["swap_free_kb"], 400.0)
+        self.assertEqual(batch._host_memory["available_ratio"], 0.75)
+        self.assertEqual(batch._host_memory["swap_free_kb"], 0.0)
+        self.assertFalse(batch._host_memory["tight"])
         with sqlite3.connect(batch.output_dir / "metrics.sqlite3") as db:
             self.assertEqual(
                 db.execute("SELECT count(*) FROM metrics").fetchone()[0], 40
@@ -346,6 +352,37 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(len(result.attempts), 2)
         self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
 
+    def test_host_reserve_pauses_launches_until_the_next_attempt_fits(self):
+        batch = self.make_batch(count=1, devices=[0], delay=0.05)
+        original = Host.sample
+        pressured = []
+
+        def scarce(monitor):
+            if len(pressured) < 5:
+                pressured.append(len(batch._active_gpu))
+                # Room above the reserve, and not tight, but nothing like enough
+                # for the peak one unknown attempt is charged.
+                return HostMemory(
+                    64 * 1024**2, HOST_RESERVE_KB + HOST_PEAK_KB_DEFAULT // 2, 0, 0
+                )
+            return original(monitor)
+
+        with patch.object(Host, "sample", scarce):
+            results = batch.run(progress=False)
+        self.assertEqual(pressured, [0] * 5)
+        # The refused dispatch went back to the queue instead of being lost.
+        self.assertEqual(results[0].status, Status.SUCCEEDED)
+
+    def test_observed_peak_is_recorded_and_changes_later_admission(self):
+        batch = self.make_batch(count=1, devices=[0], delay=0.05)
+        batch.run(progress=False)
+        peaks = [item["peak_kb"] for item in batch._gpu_history]
+        self.assertEqual(len(peaks), 1)
+        self.assertGreater(peaks[0], 0)
+        scheduler = GpuScheduler(batch)
+        self.assertEqual(scheduler.peak_ceiling, peaks[0])
+        self.assertEqual(scheduler._expected_peak("never-ran"), peaks[0])
+
     def test_failed_host_query_sheds_newest_attempt_and_pauses_launches(self):
         batch = self.make_batch(count=2, devices=[0], delay=0.05)
         original = Host.sample
@@ -354,9 +391,9 @@ class GpuSchedulingTests(unittest.TestCase):
         failures = 0
         launches_at_failure = []
 
-        def counted(self, device, memory):
+        def counted(self, device, memory, host):
             launches.append(device)
-            return original_launch(self, device, memory)
+            return original_launch(self, device, memory, host)
 
         def failing(monitor):
             nonlocal failures
@@ -394,9 +431,9 @@ class GpuSchedulingTests(unittest.TestCase):
         launches = []
         failures = 0
 
-        def counted(self, device, memory):
+        def counted(self, device, memory, host):
             launches.append(device)
-            return original_launch(self, device, memory)
+            return original_launch(self, device, memory, host)
 
         def failing(monitor):
             nonlocal failures
@@ -501,11 +538,49 @@ class DeviceTests(unittest.TestCase):
 
     def test_host_gate_holds_refills_until_a_card_is_free(self):
         gate = HostGate()
-        self.assertTrue(gate.can_launch(0.9, ["a"]))
+        roomy = HostMemory(64 * 1024**2, 48 * 1024**2, 0, 0)
+        self.assertTrue(gate.can_launch(roomy, ["a"]))
         gate.mem_block = True
-        self.assertFalse(gate.can_launch(0.9, ["a"]))
-        self.assertTrue(gate.can_launch(0.9, []))
-        self.assertFalse(gate.can_launch(0.009, []))
+        self.assertFalse(gate.can_launch(roomy, ["a"]))
+        self.assertTrue(gate.can_launch(roomy, []))
+        self.assertFalse(gate.can_launch(None, []))
+
+    def test_host_gate_refuses_room_below_the_byte_reserve(self):
+        # A free-ratio floor admits these readings: most of the host still counts
+        # as free while the absolute room one allocation needs is already gone.
+        gate = HostGate()
+        nearly_full = HostMemory(HOST_RESERVE_KB, HOST_RESERVE_KB * 95 // 100, 0, 0)
+        self.assertGreater(nearly_full.available_ratio, 0.9)
+        self.assertFalse(gate.can_launch(nearly_full, []))
+        roomy = HostMemory(64 * 1024**2, HOST_RESERVE_KB + 1, 0, 0)
+        self.assertTrue(gate.can_launch(roomy, []))
+
+    def test_host_gate_refuses_while_the_kernel_is_paging(self):
+        # Paging means the kernel is short of RAM, whatever MemAvailable reports.
+        gate = HostGate()
+        large = 64 * 1024**2
+        paging = HostMemory(large, large // 2, 4096, 2048, True)
+        self.assertFalse(gate.can_launch(paging, []))
+        # Occupancy that nothing is paging on any more admits launches again:
+        # swapped pages stay out, so occupancy is a latch rather than a reading.
+        settled = HostMemory(large, large // 2, 4096, 2048, False)
+        self.assertTrue(gate.can_launch(settled, []))
+
+    def test_fits_reserve_needs_both_headroom_and_no_paging(self):
+        roomy = HostMemory(HOST_RESERVE_KB * 4, HOST_RESERVE_KB * 2, 0, 0)
+        paging = HostMemory(HOST_RESERVE_KB * 4, HOST_RESERVE_KB * 2, 0, 0, True)
+        self.assertTrue(fits_reserve(roomy, HOST_RESERVE_KB))
+        self.assertFalse(fits_reserve(roomy, HOST_RESERVE_KB + 1))
+        self.assertFalse(fits_reserve(paging, 1))
+        self.assertFalse(fits_reserve(None, 1))
+
+    def test_residency_reports_current_and_peak_for_a_live_process(self):
+        residency = residency_kb(os.getpid())
+        self.assertIsNotNone(residency)
+        current, peak = residency
+        self.assertGreater(current, 0)
+        self.assertGreaterEqual(peak, current)
+        self.assertIsNone(residency_kb(2**30))
 
     def test_query_timeout_is_an_observation_error_with_the_default_timeout(self):
         with (
@@ -577,6 +652,45 @@ class DeviceTests(unittest.TestCase):
                 MemoryObservationError, "could not observe host memory"
             ):
                 MeminfoMonitor(path).sample()
+
+    def test_host_memory_reports_paging_rather_than_swap_occupancy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            meminfo = Path(temporary) / "meminfo"
+            vmstat = Path(temporary) / "vmstat"
+            meminfo.write_text(
+                "MemTotal:       16777216 kB\n"
+                "MemAvailable:    8388608 kB\n"
+                "SwapTotal:       4194304 kB\n"
+                "SwapFree:        2097152 kB\n"
+            )
+            vmstat.write_text("pswpin 4\npswpout 443\n")
+            monitor = MeminfoMonitor(meminfo, vmstat)
+            self.assertFalse(monitor.sample().paging)
+            occupied = monitor.sample()
+            # Half of swap is occupied while nothing is paging on it any more.
+            self.assertEqual(occupied.swap_free_kb, 2097152.0)
+            self.assertFalse(occupied.paging)
+            self.assertFalse(occupied.tight)
+            vmstat.write_text("pswpin 4\npswpout 448\n")
+            paging = monitor.sample()
+            self.assertTrue(paging.paging)
+            self.assertTrue(paging.tight)
+            vmstat.write_text("pswpin 4\npswpout 448\n")
+            self.assertFalse(monitor.sample().paging)
+
+    def test_missing_vmstat_is_not_paging_pressure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            meminfo = Path(temporary) / "meminfo"
+            meminfo.write_text(
+                "MemTotal:       16777216 kB\n"
+                "MemAvailable:    8388608 kB\n"
+                "SwapTotal:       4194304 kB\n"
+                "SwapFree:        2097152 kB\n"
+            )
+            absent = Path(temporary) / "absent"
+            observation = MeminfoMonitor(meminfo, absent).sample()
+            self.assertFalse(observation.paging)
+            self.assertFalse(observation.tight)
 
     @unittest.skipUnless(Path("/proc/meminfo").exists(), "host meminfo is unavailable")
     def test_default_host_monitor_reads_the_running_host(self):

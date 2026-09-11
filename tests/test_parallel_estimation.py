@@ -69,7 +69,7 @@ class ParallelEstimationTests(unittest.TestCase):
             ):
                 estimate = estimate_parallel(batch, 0.8)
             self.assertEqual(estimate.upper_seconds, 100)
-            batch._host_memory = {"available_ratio": 0.005}
+            batch._host_memory = {"tight": True}
             with patch(
                 "expman.parallel_estimation.DurationModel.draws",
                 return_value=iter([[100, 100]]),
@@ -82,7 +82,7 @@ class ParallelEstimationTests(unittest.TestCase):
     def test_host_memory_pressure_without_running_work_is_unknown(self):
         with tempfile.TemporaryDirectory() as temporary:
             batch = self.make_batch(Path(temporary), [0])
-            batch._host_memory = {"available_ratio": 0.005}
+            batch._host_memory = {"tight": True}
             self.assertIsNone(batch.estimate().upper_seconds)
 
     def test_observed_contention_is_used_as_a_model_feature(self):

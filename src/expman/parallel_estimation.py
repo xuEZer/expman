@@ -30,9 +30,10 @@ def estimate_parallel(batch, coverage):
         for device, count in counts.items()
         if count or memory.get(device, 0) >= MEMORY_MARGIN
     }
-    if host.get("available_ratio", 1.0) < MEMORY_MARGIN:
-        # Host RAM shortage pauses every launch and sheds running attempts, so the
-        # forecast keeps only the slots that are already occupied.
+    if host.get("tight", False) or not host.get("admits_next", True):
+        # Host RAM shortage, or a reserve that cannot cover one more attempt of
+        # the largest peak on record, pauses every launch and sheds running
+        # attempts, so the forecast keeps only the slots already occupied.
         capacity = {device: count for device, count in counts.items() if count}
     if not capacity:
         return TimeEstimate(None, None, coverage, len(completed), len(pending))

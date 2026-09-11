@@ -33,8 +33,10 @@ class HostGate:
 
     mem_block: bool = False
 
-    def can_launch(self, ratio, running):
-        return ratio >= devices.MEMORY_MARGIN and (not self.mem_block or not running)
+    def can_launch(self, host, running):
+        if host is None or host.tight:
+            return False
+        return not self.mem_block or not running
 
 
 @dataclass
@@ -47,6 +49,10 @@ class Worker:
     started: float
     area: float = 0.0
     offset: int = 0
+    # Sampled every tick: resident is what the worker holds now, peak is the most
+    # it has ever held (VmHWM). Admission reserves the gap between the two.
+    resident_kb: float = 0.0
+    peak_kb: float = 0.0
     buffer: bytes = field(default=b"", repr=False)
 
 
@@ -66,12 +72,26 @@ class GpuScheduler:
         self.host_gate = HostGate()
         self.workers = {}
         self.last_tick = perf_counter()
+        # Peak resident memory per run, from attempts that already ran. Admission
+        # reserves the sum of these, so an unobserved run is charged the largest
+        # peak any run has reported.
+        self.peaks = {}
+        for item in batch._gpu_history:
+            peak = item.get("peak_kb")
+            if peak:
+                self.peaks[item["run_id"]] = max(
+                    self.peaks.get(item["run_id"], 0.0), peak
+                )
+        self.peak_ceiling = max(self.peaks.values(), default=0.0)
 
     def _account(self):
         now = perf_counter()
         for worker in self.workers.values():
             count = sum(item.device == worker.device for item in self.workers.values())
             worker.area += (now - max(self.last_tick, worker.started)) * count
+            residency = devices.residency_kb(worker.process.pid)
+            if residency is not None:
+                worker.resident_kb, worker.peak_kb = residency
         self.last_tick = now
         with self.batch._state_lock:
             self.batch._gpu_running_info = {
@@ -80,6 +100,8 @@ class GpuScheduler:
                     "uuid": worker.uuid,
                     "concurrency": worker.area / max(now - worker.started, 1e-9),
                     "duration": max(0.0, now - worker.started),
+                    "resident_kb": worker.resident_kb,
+                    "peak_kb": worker.peak_kb,
                 }
                 for run_id, worker in self.workers.items()
             }
@@ -121,6 +143,9 @@ class GpuScheduler:
                 self.batch._gpu_memory = {}
                 self.batch._host_memory = {}
             return None, None
+        admits_next = self._admits(
+            host, self.peak_ceiling or devices.HOST_PEAK_KB_DEFAULT
+        )
         with self.batch._state_lock:
             self.batch._gpu_memory = {
                 device: value.free_ratio for device, value in memory.items()
@@ -129,7 +154,12 @@ class GpuScheduler:
                 "available_ratio": host.available_ratio,
                 "available_kb": host.available_kb,
                 "total_kb": host.total_kb,
+                "headroom_kb": host.headroom_kb,
+                "swap_total_kb": host.swap_total_kb,
                 "swap_free_kb": host.swap_free_kb,
+                "paging": host.paging,
+                "tight": host.tight,
+                "admits_next": admits_next,
             }
         return memory, host
 
@@ -142,10 +172,12 @@ class GpuScheduler:
             if self.workers:
                 self._shed(self._newest())
             return
-        if host.available_ratio < devices.MEMORY_MARGIN:
+        if host.tight:
             # Host RAM is shared by every worker process: drop the newest attempt
             # globally and stop refilling any card until one of the survivors
-            # exits on its own.
+            # exits on its own. One attempt per tick, not one decisive sweep: the
+            # shed frees its memory by the next tick, so pressure that survives
+            # the reserve keeps shedding until the reading recovers.
             self.host_gate.mem_block = True
             if self.workers:
                 self._shed(self._newest())
@@ -167,10 +199,42 @@ class GpuScheduler:
         """Cancel one running attempt for memory pressure on its card."""
         self._finish(run_id, cancelled="MemoryPressure")
 
-    def _launch(self, device, memory):
+    def _expected_peak(self, run_id):
+        """The largest resident set this run has been seen to need, in kilobytes.
+
+        An unobserved run is charged the largest peak any run has reported: the
+        reserve has to upper-bound the next attempt, and only throughput suffers
+        when the bound is too generous.
+        """
+        return (
+            self.peaks.get(run_id) or self.peak_ceiling or devices.HOST_PEAK_KB_DEFAULT
+        )
+
+    def _admits(self, host, expected_kb):
+        """Whether one more attempt of expected_kb fits above the host reserve.
+
+        Every running worker is charged for the gap between what it holds now and
+        the most it has been seen to need, so a launch cannot spend memory that
+        attempts already in flight are still going to ask for.
+        """
+        needed = expected_kb
+        for run_id, worker in self.workers.items():
+            reach = max(worker.peak_kb, self._expected_peak(run_id))
+            needed += max(0.0, reach - worker.resident_kb)
+        return devices.fits_reserve(host, needed)
+
+    def _launch(self, device, memory, host):
         batch = self.batch
         with batch._state_lock:
             run_id = batch._next_experiment()
+        if not self._admits(host, self._expected_peak(run_id)):
+            # Put the selection back at the front. Dispatching updated the
+            # estimator's own state, and re-selecting the same run is idempotent,
+            # so the queue keeps its remaining order while the host is short.
+            with batch._state_lock:
+                batch._queue.appendleft(run_id)
+            return False
+        with batch._state_lock:
             batch._active_gpu[run_id] = device
         experiment = next(item for item in batch.experiments if item.run_id == run_id)
         attempt = len(experiment.result.attempts) + 1
@@ -248,6 +312,7 @@ class GpuScheduler:
                 batch._queue.appendleft(run_id)
             batch._save()
             raise
+        return True
 
     def _finish(self, run_id, *, cancelled=None):
         worker = self.workers[run_id]
@@ -301,8 +366,12 @@ class GpuScheduler:
                     "uuid": worker.uuid,
                     "concurrency": worker.area / max(duration, 1e-9),
                     "duration": duration,
+                    "peak_kb": worker.peak_kb,
                 }
             )
+            if worker.peak_kb:
+                self.peaks[run_id] = max(self.peaks.get(run_id, 0.0), worker.peak_kb)
+                self.peak_ceiling = max(self.peak_ceiling, worker.peak_kb)
             self.batch._active_gpu.pop(run_id)
             self.batch._gpu_running_info.pop(run_id, None)
             del self.workers[run_id]
@@ -334,9 +403,7 @@ class GpuScheduler:
                 # admits work, and an unreadable one keeps every card closed.
                 memory, host = self._observe()
                 self._relieve(memory, host)
-                launching = host is not None and self.host_gate.can_launch(
-                    host.available_ratio, list(self.workers)
-                )
+                launching = self.host_gate.can_launch(host, list(self.workers))
                 for device, gate in self.gates.items():
                     if memory is None or (
                         memory[device].free_ratio < devices.MEMORY_MARGIN
@@ -351,8 +418,11 @@ class GpuScheduler:
                         self.batch._queue
                         and launching
                         and gate.can_launch(memory[device].free_ratio, running)
+                        and not self._launch(device, memory[device], host)
                     ):
-                        self._launch(device, memory[device])
+                        # Host RAM is shared, so one refused launch closes every
+                        # card for this tick.
+                        break
                 sleep(devices.POLL_INTERVAL)
             return self.batch.results
         except BaseException:
