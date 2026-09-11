@@ -4,12 +4,6 @@
 
 ### Fixed
 
-- 可选后端声明为 extras：`numpy`、`torch` 与合并的 `optional`，基础依赖仍只有 PyYAML；对应的 4 个随机状态测试在缺少后端时自动跳过，完整矩阵在独立环境（`.venv-optional`）中运行。
-
-- 内存调度改为按配置特征估计峰值并落到 cgroup 限额：`_gpu_model` 用配置特征回归取 0.9 上分位作为每个实验的主机峰值估计（被限额打断的尝试作为右删失观测，冷启动用 1 GiB 默认值），每个 worker 的 `memory.max` 取估计×1.25（下限 512 MiB），被限额驳回的尝试记为 `MemoryLimit` 并在估计上调（实测 peak×1.5）后重试、不占失败重试预算。
-
-- 显存不再使用比例门槛：某个尝试以 CUDA OOM 结束时封禁该卡，停止在其上新增实验，直到该卡有尝试正常结束；空卡保留一次试探以避免单个 OOM 让批次停住。
-
 - `nvidia-smi` 在 PATH 中找不到时回退到 WSL2 的 `/usr/lib/wsl/lib/nvidia-smi`，避免 WSL2 下按未配置 PATH 启动批次时显存查询全部失败。
 
 - 尝试输出不再常驻父进程：AttemptResult 只保留状态、耗时、错误摘要和读取来源，`result.output` 按需从 worker 结果记录或最终阶段快照读取，内存占用不随已完成实验数增长，中断后 `batch.results` 仍可读取全部输出。读取契约不变，但直接构造 AttemptResult 时输出字段名由 `output` 改为 `_output`。

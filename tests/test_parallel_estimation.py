@@ -26,6 +26,7 @@ class ParallelEstimationTests(unittest.TestCase):
             }
         )
         batch._queue.remove(first.run_id)
+        batch._gpu_memory = dict.fromkeys(devices, 0.9)
         return batch
 
     def test_makespan_uses_individual_active_predictions(self):
@@ -50,12 +51,10 @@ class ParallelEstimationTests(unittest.TestCase):
                 self.assertEqual(estimate.upper_seconds, expected)
                 self.assertFalse(estimate.calibrated)
 
-    def test_blocked_card_leaves_wait_time_unknown(self):
+    def test_no_available_card_leaves_wait_time_unknown(self):
         with tempfile.TemporaryDirectory() as temporary:
             batch = self.make_batch(Path(temporary), [0])
-            # No reading is needed to forecast: a card out of device memory is out
-            # of the forecast until an attempt on it ends normally.
-            batch._gpu_blocks = {0: True}
+            batch._gpu_memory = {0: 0.005}
             self.assertIsNone(batch.estimate().upper_seconds)
 
     def test_host_memory_pressure_keeps_only_the_occupied_slots(self):

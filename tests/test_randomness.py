@@ -278,7 +278,7 @@ class RandomnessTests(unittest.TestCase):
 
         if os.name != "posix" or not torch.cuda.is_available():
             self.skipTest("POSIX CUDA worker unavailable")
-        from expman.devices import NvidiaMemory, nvidia_smi
+        from expman.devices import NvidiaMemory
 
         # Match the physical index to the currently visible logical GPU.
         uuid = torch.cuda.get_device_properties(0).uuid
@@ -288,7 +288,7 @@ class RandomnessTests(unittest.TestCase):
             else str(uuid)
         )
         query = subprocess.run(
-            [nvidia_smi(), "--query-gpu=index,uuid", "--format=csv,noheader"],
+            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
             check=True,
             capture_output=True,
             text=True,

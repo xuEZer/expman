@@ -12,13 +12,6 @@ dependencies = ["PyYAML>=6.0,<7"]
 
 [project.optional-dependencies]
 dev = ["pre-commit==4.6.2", "ruff==0.16.6"]
-# Optional execution backends. The framework imports either one only if it is
-# already installed, so a plain install never pulls them; the matching tests skip
-# themselves when the backend is absent.
-numpy = ["numpy>=1.26"]
-torch = ["torch>=2.0"]
-# Both backends, for running the full matrix in a separate environment.
-optional = ["numpy>=1.26", "torch>=2.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

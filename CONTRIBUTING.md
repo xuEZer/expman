@@ -29,16 +29,6 @@ git diff --check
 git status --short
 ```
 
-NumPy 和 PyTorch 是可选后端：基础依赖只有 PyYAML，框架在两库缺失时跳过相关状态，测试也会自动跳过对应的 4 个用例。要在**独立环境**里跑完整矩阵（不要把这些后端装进日常开发环境）：
-
-```bash
-python -m virtualenv .venv-optional          # 或 uv venv .venv-optional
-.venv-optional/bin/python -m pip install -e '.[optional]'
-.venv-optional/bin/python -m unittest discover -s tests
-```
-
-`optional` extra 同时装两个后端；也可以只装 `.[numpy]` 或 `.[torch]`。`.venv-optional/` 已在 `.gitignore` 中。装了 CUDA 版 torch 后，单个 GPU worker 的常驻内存会从约 24 MiB 升到约 530 MiB，套件耗时约从 14 秒升到 82 秒。
-
 需要自动修复时，执行 `ruff check --fix .` 和 `ruff format .`，然后检查差异并重新运行上述检查。
 
 `.pre-commit-config.yaml` 为每次提交运行全项目 Ruff lint 和格式检查，任一失败都会阻止提交。hook 只检查，不自动修改或暂存文件；pre-commit 会临时隐藏已跟踪文件的未暂存改动，以检查本次提交对应的内容。不要使用 `--no-verify` 或 `SKIP` 绕过检查。

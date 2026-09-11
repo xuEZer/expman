@@ -11,8 +11,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import perf_counter, sleep
 
-from . import devices, limits
-from ._memory_model import PeakEstimator
+from . import devices
 from .events import Status
 from .experiment import AttemptResult, ResultOutput
 from .storage import PickleSerializer, RecoveryWarning, read_record, write_record
@@ -20,17 +19,12 @@ from .storage import PickleSerializer, RecoveryWarning, read_record, write_recor
 
 @dataclass
 class Gate:
-    """One card's admission, held after a CUDA out-of-memory failure.
-
-    The block stops *adding* attempts to a card that already ran out of device
-    memory while it still has attempts running; an empty card may try again, which
-    is also what keeps a single failed attempt from stalling the Batch forever.
-    """
+    """One card's admission, held while its VRAM reading stays tight."""
 
     gpu_block: bool = False
 
-    def can_launch(self, running):
-        return not self.gpu_block or not running
+    def can_launch(self, ratio, running):
+        return ratio >= devices.MEMORY_MARGIN and (not self.gpu_block or not running)
 
 
 @dataclass
@@ -55,12 +49,10 @@ class Worker:
     started: float
     area: float = 0.0
     offset: int = 0
-    limit: object = None
     # Sampled every tick: resident is what the worker holds now, peak is the most
-    # it has ever held. Admission reserves the gap between the two.
+    # it has ever held (VmHWM). Admission reserves the gap between the two.
     resident_kb: float = 0.0
     peak_kb: float = 0.0
-    cap_hit: bool = False
     buffer: bytes = field(default=b"", repr=False)
 
 
@@ -80,25 +72,26 @@ class GpuScheduler:
         self.host_gate = HostGate()
         self.workers = {}
         self.last_tick = perf_counter()
-        # Peak host memory per attempt: admission charges the configuration-based
-        # estimate and the cgroup cap enforces it, so the scheduler keeps no
-        # per-run table of its own here.
-        self.peaks = PeakEstimator.from_batch(batch)
+        # Peak resident memory per run, from attempts that already ran. Admission
+        # reserves the sum of these, so an unobserved run is charged the largest
+        # peak any run has reported.
+        self.peaks = {}
+        for item in batch._gpu_history:
+            peak = item.get("peak_kb")
+            if peak:
+                self.peaks[item["run_id"]] = max(
+                    self.peaks.get(item["run_id"], 0.0), peak
+                )
+        self.peak_ceiling = max(self.peaks.values(), default=0.0)
 
     def _account(self):
         now = perf_counter()
         for worker in self.workers.values():
             count = sum(item.device == worker.device for item in self.workers.values())
             worker.area += (now - max(self.last_tick, worker.started)) * count
-            residency = limits.usage(worker.limit.cgroup if worker.limit else None)
-            if residency is None:
-                residency = devices.residency_kb(worker.process.pid)
+            residency = devices.residency_kb(worker.process.pid)
             if residency is not None:
                 worker.resident_kb, worker.peak_kb = residency
-            if worker.limit is not None and limits.refused(
-                limits.events(worker.limit.cgroup)
-            ):
-                worker.cap_hit = True
         self.last_tick = now
         with self.batch._state_lock:
             self.batch._gpu_running_info = {
@@ -150,9 +143,8 @@ class GpuScheduler:
                 self.batch._gpu_memory = {}
                 self.batch._host_memory = {}
             return None, None
-        # One more attempt is charged at least the largest peak seen so far.
         admits_next = self._admits(
-            host, max(self.peaks.ceiling_kb, devices.HOST_PEAK_KB_DEFAULT)
+            host, self.peak_ceiling or devices.HOST_PEAK_KB_DEFAULT
         )
         with self.batch._state_lock:
             self.batch._gpu_memory = {
@@ -189,39 +181,34 @@ class GpuScheduler:
             self.host_gate.mem_block = True
             if self.workers:
                 self._shed(self._newest())
+        for device, gate in self.gates.items():
+            if memory[device].free_ratio < devices.MEMORY_MARGIN:
+                gate.gpu_block = True
+                running = [
+                    key
+                    for key, worker in self.workers.items()
+                    if worker.device == device
+                ]
+                if running:
+                    self._shed(running[-1])
 
     def _newest(self):
         return max(self.workers, key=lambda run_id: self.workers[run_id].started)
 
-    def _cap_report(self, worker):
-        """(limit refused a charge, peak kilobytes) for one finished worker.
-
-        The worker writes the record from inside its own cgroup, because a cgroup
-        OOM kill leaves the parent with nothing but an unexplained signal; the
-        parent's own sampling covers a record that never got written.
-        """
-        capped = worker.cap_hit
-        peak = worker.peak_kb
-        path = worker.root / "memory_cap.pkl"
-        if path.exists():
-            report = read_record(path, PickleSerializer())
-            if isinstance(report, dict):
-                capped = capped or limits.refused(report.get("events") or {})
-                recorded = report.get("usage")
-                if isinstance(recorded, (list, tuple)) and len(recorded) == 2:
-                    peak = max(peak, float(recorded[1]))
-        if not capped and worker.limit is not None:
-            # A peak that reached the limit, or a SIGKILL with no recorded cause,
-            # is this attempt's cap rather than an unrelated crash: the counters on
-            # the kill path can miss the window, and the remedy is the same.
-            capped = limits.near_cap(peak, worker.limit.cap_kb) or (
-                worker.process.returncode == -signal.SIGKILL
-            )
-        return capped, peak
-
     def _shed(self, run_id):
         """Cancel one running attempt for memory pressure on its card."""
         self._finish(run_id, cancelled="MemoryPressure")
+
+    def _expected_peak(self, run_id):
+        """The largest resident set this run has been seen to need, in kilobytes.
+
+        An unobserved run is charged the largest peak any run has reported: the
+        reserve has to upper-bound the next attempt, and only throughput suffers
+        when the bound is too generous.
+        """
+        return (
+            self.peaks.get(run_id) or self.peak_ceiling or devices.HOST_PEAK_KB_DEFAULT
+        )
 
     def _admits(self, host, expected_kb):
         """Whether one more attempt of expected_kb fits above the host reserve.
@@ -232,7 +219,7 @@ class GpuScheduler:
         """
         needed = expected_kb
         for run_id, worker in self.workers.items():
-            reach = max(worker.peak_kb, self.peaks.estimate_kb(run_id))
+            reach = max(worker.peak_kb, self._expected_peak(run_id))
             needed += max(0.0, reach - worker.resident_kb)
         return devices.fits_reserve(host, needed)
 
@@ -240,7 +227,7 @@ class GpuScheduler:
         batch = self.batch
         with batch._state_lock:
             run_id = batch._next_experiment()
-        if not self._admits(host, self.peaks.estimate_kb(run_id)):
+        if not self._admits(host, self._expected_peak(run_id)):
             # Put the selection back at the front. Dispatching updated the
             # estimator's own state, and re-selecting the same run is idempotent,
             # so the queue keeps its remaining order while the host is short.
@@ -296,28 +283,21 @@ class GpuScheduler:
             env["PYTHONPATH"] = os.pathsep.join(
                 str(Path(path).resolve()) for path in sys.path
             )
-            # The unit is unique per attempt: systemd unloads a finished scope
-            # asynchronously, and a retry must not collide with the previous one.
-            limit = limits.memory_limit(
-                f"expman-{run_id[:12]}-{attempt}", self.peaks.estimate_kb(run_id)
-            )
             self._account()
             with (root / "output.log").open("ab", buffering=0) as log:
                 process = subprocess.Popen(
-                    [*limit.command, sys.executable, "-m", "expman._worker", str(root)],
+                    [sys.executable, "-m", "expman._worker", str(root)],
                     env=env,
                     stdin=subprocess.PIPE,
                     stdout=log,
                     stderr=log,
                     start_new_session=True,
                 )
-            if limit.mechanism == "cgroup" and limit.cgroup is not None:
-                limits.join(limit.cgroup, process.pid)
             now = perf_counter()
             with experiment._timing_lock:
                 experiment._active_started = now
             self.workers[run_id] = Worker(
-                process, experiment, device, memory.uuid, root, now, limit=limit
+                process, experiment, device, memory.uuid, root, now
             )
         except BaseException:
             if process is not None:
@@ -327,7 +307,6 @@ class GpuScheduler:
                 self.workers.pop(run_id, None)
                 with experiment._timing_lock:
                     experiment._active_started = None
-            limits.release(limit)
             with batch._state_lock:
                 batch._active_gpu.pop(run_id, None)
                 batch._queue.appendleft(run_id)
@@ -349,8 +328,6 @@ class GpuScheduler:
                 break
         experiment = worker.experiment
         duration = max(0.0, finished - worker.started)
-        capped, peak_kb = self._cap_report(worker)
-        limits.release(worker.limit)
         result_path = worker.root / "result.pkl"
         if result_path.exists():
             result = read_record(result_path, self.batch._serializer)
@@ -377,39 +354,24 @@ class GpuScheduler:
                 error_type=cancelled or "WorkerExit",
                 error_message=f"worker exited with code {worker.process.returncode}",
             )
-        if capped and cancelled is None and result.status is not Status.SUCCEEDED:
-            # The limit, not the experiment, ended this attempt: it is retried with
-            # a raised peak estimate instead of spending the failure budget, and it
-            # carries the peak it reached as a lower bound for that estimate. An
-            # attempt that finished its work inside a throttled limit still counts
-            # as done; the raised estimate only affects the attempts after it.
-            result = replace(
-                result,
-                status=Status.CANCELLED,
-                error_type="MemoryLimit",
-                error_message=(
-                    "attempt stopped by its memory limit of "
-                    f"{worker.limit.cap_kb / 1024:.0f} MiB"
-                    if worker.limit is not None
-                    else "attempt stopped by its memory limit"
-                ),
-            )
         with self.batch._state_lock:
             with experiment._timing_lock:
                 experiment._attempts.append(result)
                 experiment._active_started = None
-            observation = {
-                "run_id": run_id,
-                "attempt": result.attempt,
-                "device": worker.device,
-                "uuid": worker.uuid,
-                "concurrency": worker.area / max(duration, 1e-9),
-                "duration": duration,
-                "peak_kb": peak_kb,
-                "capped": capped,
-            }
-            self.batch._gpu_history.append(observation)
-            self.peaks.record(observation)
+            self.batch._gpu_history.append(
+                {
+                    "run_id": run_id,
+                    "attempt": result.attempt,
+                    "device": worker.device,
+                    "uuid": worker.uuid,
+                    "concurrency": worker.area / max(duration, 1e-9),
+                    "duration": duration,
+                    "peak_kb": worker.peak_kb,
+                }
+            )
+            if worker.peak_kb:
+                self.peaks[run_id] = max(self.peaks.get(run_id, 0.0), worker.peak_kb)
+                self.peak_ceiling = max(self.peak_ceiling, worker.peak_kb)
             self.batch._active_gpu.pop(run_id)
             self.batch._gpu_running_info.pop(run_id, None)
             del self.workers[run_id]
@@ -420,24 +382,11 @@ class GpuScheduler:
                 result.status is Status.FAILED and failures <= self.batch.max_retries
             ):
                 self.batch._queue.append(run_id)
-            out_of_memory = devices.cuda_out_of_memory(
-                result.error_type, result.error_message
-            )
-            if out_of_memory:
-                # Device memory is only known to be short once a kernel failed.
-                self.gates[worker.device].gpu_block = True
-            if cancelled != "MemoryPressure" and not capped:
-                # A natural exit frees memory: release the host block, and release
-                # the card's block unless the attempt itself ran out of device
-                # memory (that block is lifted by an attempt that ends normally).
+            if cancelled != "MemoryPressure":
+                # A natural exit frees memory: release the host block and the block
+                # of the card the attempt ran on.
+                self.gates[worker.device].gpu_block = False
                 self.host_gate.mem_block = False
-                if not out_of_memory and (
-                    result.status is Status.SUCCEEDED or result.status is Status.FAILED
-                ):
-                    self.gates[worker.device].gpu_block = False
-            self.batch._gpu_blocks = {
-                device: gate.gpu_block for device, gate in self.gates.items()
-            }
             self.batch._save()
 
     def run(self):
@@ -456,7 +405,9 @@ class GpuScheduler:
                 self._relieve(memory, host)
                 launching = self.host_gate.can_launch(host, list(self.workers))
                 for device, gate in self.gates.items():
-                    if memory is None:
+                    if memory is None or (
+                        memory[device].free_ratio < devices.MEMORY_MARGIN
+                    ):
                         continue
                     running = [
                         key
@@ -466,7 +417,7 @@ class GpuScheduler:
                     if (
                         self.batch._queue
                         and launching
-                        and gate.can_launch(running)
+                        and gate.can_launch(memory[device].free_ratio, running)
                         and not self._launch(device, memory[device], host)
                     ):
                         # Host RAM is shared, so one refused launch closes every
