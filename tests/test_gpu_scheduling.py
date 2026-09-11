@@ -9,7 +9,7 @@ from pathlib import Path
 from time import monotonic, sleep
 from unittest.mock import patch
 
-from expman import Batch, ConfigError, Experiment, Pipeline, Stage, Status
+from expman import Batch, ConfigError, Experiment, Pipeline, Stage, Status, devices
 from expman.devices import (
     HOST_PEAK_KB_DEFAULT,
     HOST_RESERVE_KB,
@@ -290,7 +290,10 @@ class GpuSchedulingTests(unittest.TestCase):
                     (self.root / "release").touch()
             return original(monitor)
 
-        with patch.object(Host, "sample", pressure):
+        with (
+            patch.object(devices, "HOST_RESERVE_KB", 2 * 1024**2),
+            patch.object(Host, "sample", pressure),
+        ):
             results = batch.run(progress=False)
         self.assertTrue(dropped)
         # The attempts ran on separate cards, so the shed run could have been
@@ -499,10 +502,10 @@ class DeviceTests(unittest.TestCase):
         self.assertFalse(gate.can_launch(None, []))
 
     def test_host_gate_refuses_room_below_the_byte_reserve(self):
-        # A free-ratio floor admits these readings: most of the host still counts
-        # as free while the absolute room one allocation needs is already gone.
+        # The default reserve is 1 GiB, so the host gate refuses a reading below
+        # it and admits a positive amount above it.
         gate = HostGate()
-        nearly_full = HostMemory(HOST_RESERVE_KB, HOST_RESERVE_KB * 95 // 100, 0, 0)
+        nearly_full = HostMemory(HOST_RESERVE_KB, HOST_RESERVE_KB - 1, 0, 0)
         self.assertGreater(nearly_full.available_ratio, 0.9)
         self.assertFalse(gate.can_launch(nearly_full, []))
         roomy = HostMemory(64 * 1024**2, HOST_RESERVE_KB + 1, 0, 0)
@@ -520,10 +523,11 @@ class DeviceTests(unittest.TestCase):
         self.assertTrue(gate.can_launch(settled, []))
 
     def test_fits_reserve_needs_both_headroom_and_no_paging(self):
-        roomy = HostMemory(HOST_RESERVE_KB * 4, HOST_RESERVE_KB * 2, 0, 0)
-        paging = HostMemory(HOST_RESERVE_KB * 4, HOST_RESERVE_KB * 2, 0, 0, True)
-        self.assertTrue(fits_reserve(roomy, HOST_RESERVE_KB))
-        self.assertFalse(fits_reserve(roomy, HOST_RESERVE_KB + 1))
+        available = HOST_RESERVE_KB + 2 * 1024**2
+        roomy = HostMemory(64 * 1024**2, available, 0, 0)
+        paging = HostMemory(64 * 1024**2, available, 0, 0, True)
+        self.assertTrue(fits_reserve(roomy, 2 * 1024**2))
+        self.assertFalse(fits_reserve(roomy, 2 * 1024**2 + 1))
         self.assertFalse(fits_reserve(paging, 1))
         self.assertFalse(fits_reserve(None, 1))
 

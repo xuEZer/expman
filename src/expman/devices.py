@@ -18,16 +18,11 @@ CUDA_OOM_MARKERS = (
     "CUDA error: out of memory",
     "cuDNN error: CUDNN_STATUS_ALLOC_FAILED",
 )
-# Host RAM kept free of experiment allocations, in kilobytes. Host memory is shared
-# by every worker process, and an exhausted host does not fail the allocating
-# process the way a full card fails a kernel launch: the kernel reclaims, swaps, or
-# kills instead. A bursty allocator needs an absolute reserve, so this is fixed
-# rather than a fraction of total RAM: a fraction grows with the machine and keeps
-# admitting launches on a large host well past the point where one more multi-GB
-# allocation, or a few simultaneous ones, stalls every process in the VM. The
-# reserve also keeps a working set of page cache alive: once every page of a data
-# set has been evicted, each read goes back to the disk and the host looks loaded.
-HOST_RESERVE_KB = 2 * 1024 * 1024
+# Host RAM kept free of experiment allocations, in kilobytes. Keep the parameter
+# available for callers that need a safety margin, while defaulting to a 1 GiB
+# scheduler-only reservation; admission still charges each worker's estimated
+# peak and cgroup limits continue to protect the host from one runaway worker.
+HOST_RESERVE_KB = 1024 * 1024
 # Assumed peak resident memory of an attempt that has never been observed, in
 # kilobytes. Admission reserves the sum of expected peaks, so this bounds what one
 # unknown attempt may hold; over-estimating costs throughput, under-estimating
@@ -44,7 +39,7 @@ PEAK_BUMP_MARGIN = 1.5
 # memory.max is set: memory.high would throttle an allocator that has nothing
 # reclaimable to give back (anonymous memory, swap disabled) and stall it instead
 # of ending the attempt.
-CAPACITY_FACTOR = 1.25
+CAPACITY_FACTOR = 1.10
 CAPACITY_FLOOR_KB = 512 * 1024
 # A worker whose peak came this close to its own limit was stopped by it.
 CAPACITY_NEAR = 0.9
@@ -183,6 +178,8 @@ class HostMemory:
 
     @property
     def available_ratio(self) -> float:
+        if self.total_kb <= 0:
+            return 0.0
         return self.available_kb / self.total_kb
 
     @property
