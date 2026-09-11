@@ -16,6 +16,7 @@ from expman.devices import (
     MeminfoMonitor,
     MemoryObservationError,
     NvidiaMemory,
+    nvidia_smi,
 )
 from expman.scheduling import Gate, GpuScheduler, HostGate
 
@@ -508,6 +509,21 @@ class DeviceTests(unittest.TestCase):
         ):
             NvidiaMemory((0,)).sample()
         self.assertEqual(query.call_args.kwargs["timeout"], 3.0)
+
+    def test_nvidia_smi_is_found_outside_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fallback = Path(temporary) / "nvidia-smi"
+            fallback.write_text("#!/bin/sh\n")
+            with (
+                patch("expman.devices.shutil.which", return_value=None),
+                patch("expman.devices.NVIDIA_SMI_FALLBACKS", (fallback,)),
+                patch("expman.devices.subprocess.run") as query,
+            ):
+                query.return_value.stdout = "0, GPU-first, 100, 10\n"
+                NvidiaMemory((0,)).sample()
+            self.assertEqual(query.call_args.args[0][0], str(fallback))
+        with patch("expman.devices.shutil.which", return_value="/usr/bin/nvidia-smi"):
+            self.assertEqual(nvidia_smi(), "/usr/bin/nvidia-smi")
 
     def test_nvidia_memory_validates_observations_and_identities(self):
         with patch("expman.devices.subprocess.run") as query:

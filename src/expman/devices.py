@@ -1,6 +1,7 @@
 """Device selection plus whole-device and host memory observations."""
 
 import math
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,8 @@ POLL_INTERVAL = 0.2
 # attempt and blocks refills, so keep a few times the worst observation.
 QUERY_TIMEOUT = 3.0
 MEMINFO_PATH = Path("/proc/meminfo")
+# WSL2 installs the Linux nvidia-smi here without adding it to PATH.
+NVIDIA_SMI_FALLBACKS = (Path("/usr/lib/wsl/lib/nvidia-smi"),)
 
 
 class MemoryObservationError(RuntimeError):
@@ -51,6 +54,17 @@ class DeviceMemory:
         return self.free / self.total
 
 
+def nvidia_smi() -> str:
+    """Resolve nvidia-smi from PATH, then from the known WSL2 driver directory."""
+    found = shutil.which("nvidia-smi")
+    if found is not None:
+        return found
+    for candidate in NVIDIA_SMI_FALLBACKS:
+        if candidate.is_file():
+            return str(candidate)
+    return "nvidia-smi"
+
+
 class NvidiaMemory:
     def __init__(self, devices):
         self.devices = devices
@@ -60,7 +74,7 @@ class NvidiaMemory:
         try:
             result = subprocess.run(
                 [
-                    "nvidia-smi",
+                    nvidia_smi(),
                     "--query-gpu=index,uuid,memory.total,memory.free",
                     "--format=csv,noheader,nounits",
                     "--id=" + ",".join(map(str, self.devices)),
