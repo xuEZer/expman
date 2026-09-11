@@ -86,17 +86,14 @@ class RandomStateManager:
                 if not isinstance(cpu, bytes) or not isinstance(cuda, list):
                     raise ValueError("invalid PyTorch random state")
                 self.torch.Generator(device="cpu").set_state(self._tensor(cpu))
-                count = (
-                    self.torch.cuda.device_count()
-                    if self.torch.cuda.is_available()
-                    else 0
-                )
-                if len(cuda) != count or any(
-                    not isinstance(item, bytes) or not item for item in cuda
-                ):
-                    raise ValueError(
-                        "saved CUDA random states do not match visible devices"
-                    )
+                if self.torch.cuda.is_available():
+                    count = self.torch.cuda.device_count()
+                    if len(cuda) != count or any(
+                        not isinstance(item, bytes) or not item for item in cuda
+                    ):
+                        raise ValueError(
+                            "saved CUDA random states do not match visible devices"
+                        )
         except Exception as error:
             raise StorageError(f"could not validate random state: {error}") from error
 
@@ -109,7 +106,11 @@ class RandomStateManager:
             self.numpy.random.set_state(state["numpy"])
         if state["torch"] is not None:
             self.torch.set_rng_state(self._tensor(state["torch"]["cpu"]))
-            if state["torch"]["cuda"]:
+            if (
+                self.torch.cuda.is_available()
+                and state["torch"]["cuda"]
+                and len(state["torch"]["cuda"]) == self.torch.cuda.device_count()
+            ):
                 self.torch.cuda.set_rng_state_all(
                     [self._tensor(item) for item in state["torch"]["cuda"]]
                 )

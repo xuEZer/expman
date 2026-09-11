@@ -8,6 +8,7 @@ import hashlib
 import math
 import random
 from collections.abc import Mapping
+from statistics import NormalDist
 
 
 def _flatten(value, path=()):
@@ -194,6 +195,22 @@ class DurationModel:
                 )
                 durations.append(max(0.0, seconds(log_time) - elapsed))
             yield durations if components else sum(durations)
+
+    def upper_quantile(self, index, probability):
+        """Upper quantile of one prediction without sampling.
+
+        Same posterior mean and covariance as draws(), with the normal
+        approximation to the Student-t predictive marginal: callers that need one
+        cheap conservative bound (a memory peak) instead of joint samples use this.
+        """
+        vector = self.vectors[index]
+        projected = _forward(self.lower, vector)
+        mean = dot(vector, self.mean)
+        variance = max(self.scale / self.shape, 1e-12) * (
+            1.0 + dot(projected, projected)
+        )
+        z = NormalDist().inv_cdf(probability)
+        return seconds(mean + z * math.sqrt(variance))
 
     def priorities(self, pending):
         """Approximate reduction in uncertainty of the sum of pending durations."""

@@ -235,68 +235,21 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(attempt.output["device"], "GPU-test-0")
         self.assertEqual(result.output["device"], "GPU-test-0")
 
-    def test_memory_kill_waits_for_other_exit_then_retries(self):
-        batch = self.make_batch(count=2, devices=[0], delay=0, wait_for_release=True)
-        dropped = []
-        observed_block = []
-        original = Memory.sample
+    def test_cuda_oom_block_allows_only_existing_work_until_normal_exit(self):
+        gate = Gate()
+        self.assertTrue(gate.can_launch(0.005, ["running"]))
+        gate.gpu_block = True
+        self.assertFalse(gate.can_launch(0.99, ["running"]))
+        self.assertTrue(gate.can_launch(0.99, []))
 
-        def pressure(monitor):
-            active = list(batch._active_gpu)
-            if (
-                not dropped
-                and len(active) == 2
-                and all((self.root / f"{key}.checkpoint").exists() for key in active)
-            ):
-                dropped.append(active[-1])
-                return {0: DeviceMemory("GPU-test-0", 1000, 5)}
-            if dropped and not list(self.root.glob("*.finished")):
-                observed_block.append(tuple(active))
-                self.assertEqual(len(active), 1)
-                if len(observed_block) >= 5:
-                    (self.root / "release").touch()
-            return original(monitor)
-
-        with patch.object(Memory, "sample", pressure):
-            batch.run(progress=False)
-        self.assertTrue(dropped)
-        self.assertTrue(observed_block)
-        result = next(item for item in batch.results if item.run_id == dropped[0])
-        self.assertEqual(result.attempts[0].status, Status.CANCELLED)
-        self.assertEqual(result.attempts[0].error_type, "MemoryPressure")
-        self.assertEqual(result.status, Status.SUCCEEDED)
-        self.assertEqual(result.output["saved"], 2)
-
-    def test_each_tight_card_sheds_its_newest_attempt(self):
-        batch = self.make_batch(count=2, devices=[0, 1], delay=0, wait_for_release=True)
-        tight = []
-        original = Memory.sample
-
-        def pressure(monitor):
-            active = list(batch._active_gpu)
-            if tight or not active:
-                return original(monitor)
-            tight.append(1)
-            (self.root / "release").touch()
-            return {
-                device: DeviceMemory(f"GPU-test-{device}", 1000, 5) for device in (0, 1)
-            }
-
-        with patch.object(Memory, "sample", pressure):
-            results = batch.run(progress=False)
-        # One tick sees both cards tight and stops the newest attempt of each.
-        self.assertEqual(len(tight), 1)
-        shed = [
-            attempt
-            for result in results
-            for attempt in result.attempts
-            if attempt.error_type == "MemoryPressure"
-        ]
-        self.assertEqual(
-            sorted(attempt.run_id for attempt in shed),
-            sorted(result.run_id for result in results),
-        )
-        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
+    def test_low_vram_ratio_alone_does_not_shed_attempts(self):
+        batch = self.make_batch(count=1, devices=[0], delay=0)
+        scheduler = GpuScheduler(batch)
+        scheduler.gates[0].gpu_block = False
+        memory = {0: DeviceMemory("GPU-test-0", 1000, 5)}
+        host = HostMemory(64 * 1024**2, 48 * 1024**2, 0, 0)
+        scheduler._relieve(memory, host)
+        self.assertFalse(scheduler.gates[0].gpu_block)
 
     def test_host_memory_shortage_pauses_launches_until_it_recovers(self):
         batch = self.make_batch(count=1, devices=[0], delay=0.05)
@@ -381,7 +334,7 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertGreater(peaks[0], 0)
         scheduler = GpuScheduler(batch)
         self.assertEqual(scheduler.peak_ceiling, peaks[0])
-        self.assertEqual(scheduler._expected_peak("never-ran"), peaks[0])
+        self.assertEqual(scheduler._expected_peak("never-ran"), HOST_PEAK_KB_DEFAULT)
 
     def test_failed_host_query_sheds_newest_attempt_and_pauses_launches(self):
         batch = self.make_batch(count=2, devices=[0], delay=0.05)
@@ -528,10 +481,10 @@ class DeviceTests(unittest.TestCase):
             self.assertEqual(len(batch.experiments), 2)
             self.assertEqual(batch.devices, (0, 1))
 
-    def test_gate_threshold_and_empty_card_fallback(self):
+    def test_gate_ignores_ratio_and_empty_card_fallback(self):
         gate = Gate()
         self.assertTrue(gate.can_launch(0.01, ["a"]))
-        self.assertFalse(gate.can_launch(0.009, ["a"]))
+        self.assertTrue(gate.can_launch(0.009, ["a"]))
         gate.gpu_block = True
         self.assertFalse(gate.can_launch(0.9, ["a"]))
         self.assertTrue(gate.can_launch(0.9, []))

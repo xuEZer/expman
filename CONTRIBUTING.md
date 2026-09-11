@@ -16,6 +16,12 @@ python -m pip install -e '.[dev]'
 pre-commit install --install-hooks
 ```
 
+运行完整测试时安装可选后端：
+
+```bash
+python -m pip install -e '.[dev,optional]'
+```
+
 使用 uv 时，安装命令可替换为 `uv pip install -e '.[dev]'`。每次新克隆仓库或重建虚拟环境后，都需要重新安装 hook。
 
 提交前检查：

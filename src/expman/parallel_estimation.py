@@ -3,7 +3,6 @@
 from collections import defaultdict
 
 from ._time_model import DurationModel, features
-from .devices import MEMORY_MARGIN
 from .estimation import TimeEstimate, _quantile
 
 
@@ -13,8 +12,8 @@ def estimate_parallel(batch, coverage):
         queue = list(batch._queue)
         history = list(batch._gpu_history)
         running = dict(batch._gpu_running_info)
-        memory = dict(batch._gpu_memory)
         host = dict(batch._host_memory)
+        blocks = dict(batch._gpu_blocks)
     pending_ids = set(queue) | set(active)
     completed, censored, pending, _ = batch._time_estimator._observations(pending_ids)
     if not pending:
@@ -25,10 +24,12 @@ def estimate_parallel(batch, coverage):
         device: sum(value == device for value in active.values())
         for device in batch.devices
     }
+    # An empty card with a block is one that ran out of device memory; it stays out
+    # of the forecast until an attempt on it ends normally.
     capacity = {
         device: max(1, count)
         for device, count in counts.items()
-        if count or memory.get(device, 0) >= MEMORY_MARGIN
+        if count or not blocks.get(device, False)
     }
     if host.get("tight", False) or not host.get("admits_next", True):
         # Host RAM shortage, or a reserve that cannot cover one more attempt of

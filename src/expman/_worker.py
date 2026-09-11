@@ -11,6 +11,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from .experiment import Experiment
+from .limits import watch
 from .storage import PickleSerializer, RunLock, read_record, write_record
 
 
@@ -34,6 +35,18 @@ def main():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     threading.Thread(target=_watch_parent, daemon=True).start()
     root = Path(sys.argv[1])
+    # Report a memory limit that refuses a charge before it can kill this process.
+    cap_stopped = threading.Event()
+    threading.Thread(
+        target=watch,
+        args=(
+            root / "memory_cap.pkl",
+            0.2,
+            cap_stopped,
+            os.environ.get("EXPMAN_CGROUP"),
+        ),
+        daemon=True,
+    ).start()
     metadata = read_record(root / "bootstrap.pkl", PickleSerializer())
     sys.path[:] = metadata["sys_path"]
     script = metadata["main_script"]
@@ -68,6 +81,7 @@ def main():
                 result = experiment.result.attempts[-1]
             write_record(root / "result.pkl", result, experiment._store.serializer)
     finally:
+        cap_stopped.set()
         recorder.stream.close()
 
 

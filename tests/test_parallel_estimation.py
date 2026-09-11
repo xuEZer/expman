@@ -55,7 +55,7 @@ class ParallelEstimationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             batch = self.make_batch(Path(temporary), [0])
             batch._gpu_memory = {0: 0.005}
-            self.assertIsNone(batch.estimate().upper_seconds)
+            self.assertIsNotNone(batch.estimate().upper_seconds)
 
     def test_host_memory_pressure_keeps_only_the_occupied_slots(self):
         with tempfile.TemporaryDirectory() as temporary:
