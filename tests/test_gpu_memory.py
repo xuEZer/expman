@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from expman.gpu_memory import sample
+from expman.gpu_memory import limit, sample
 
 
 class GpuMemoryTests(unittest.TestCase):
@@ -30,6 +30,19 @@ class GpuMemoryTests(unittest.TestCase):
     def test_missing_pytorch_leaves_gpu_telemetry_unavailable(self):
         with patch("expman.gpu_memory.import_module", side_effect=ModuleNotFoundError):
             self.assertIsNone(sample())
+
+    def test_pytorch_allocator_limit_uses_the_visible_device_capacity(self):
+        fractions = []
+        cuda = SimpleNamespace(
+            is_available=lambda: True,
+            get_device_properties=lambda index: SimpleNamespace(total_memory=8 * 1024),
+            set_per_process_memory_fraction=fractions.append,
+        )
+        with patch(
+            "expman.gpu_memory.import_module", return_value=SimpleNamespace(cuda=cuda)
+        ):
+            limit(4)
+        self.assertEqual(fractions, [0.5])
 
 
 if __name__ == "__main__":

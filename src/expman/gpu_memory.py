@@ -2,9 +2,6 @@
 
 from importlib import import_module
 from numbers import Integral
-from pathlib import Path
-
-from .storage import PickleSerializer, write_record
 
 
 def sample() -> dict[str, float] | None:
@@ -33,12 +30,13 @@ def sample() -> dict[str, float] | None:
     return {key: value / 1024 for key, value in values.items()}
 
 
-def watch(record: Path, interval: float, stop) -> None:
-    """Publish allocator telemetry until the experiment worker exits."""
-    while not stop.wait(interval):
-        value = sample()
-        if value is not None:
-            write_record(record, value, PickleSerializer())
-    value = sample()
-    if value is not None:
-        write_record(record, value, PickleSerializer())
+def limit(kilobytes: float) -> None:
+    """Apply a per-process PyTorch allocator ceiling when CUDA is available."""
+    try:
+        torch = import_module("torch")
+        if not torch.cuda.is_available():
+            return
+        total = torch.cuda.get_device_properties(0).total_memory
+        torch.cuda.set_per_process_memory_fraction(kilobytes * 1024 / total)
+    except (ModuleNotFoundError, RuntimeError, AttributeError, ZeroDivisionError):
+        return

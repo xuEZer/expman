@@ -80,6 +80,19 @@ class AttemptResult:
 
 
 @dataclass(frozen=True)
+class StageResult:
+    """One top-level Stage execution, used by the Stage scheduler."""
+
+    run_id: str
+    stage_index: int
+    attempt: int
+    status: Status
+    duration_seconds: float
+    error_type: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True)
 class ExperimentResult:
     run_id: str
     attempts: tuple[AttemptResult, ...]
@@ -247,3 +260,52 @@ class Experiment:
                 self._attempts.append(result)
                 self._active_started = None
         return result
+
+    def run_stage(
+        self, stage_index: int, *, attempt: int, recorder: Recorder | None = None
+    ) -> StageResult:
+        """Run exactly one top-level stage, restoring the completed prefix."""
+        if not 0 <= stage_index < len(self.pipeline.stages):
+            raise ValueError("stage_index must identify a top-level Pipeline stage")
+        for index in range(stage_index):
+            if self._store.completed((index,)) is None:
+                raise StorageError(
+                    "a Stage worker may only execute its scheduled top-level Stage"
+                )
+        started = perf_counter()
+        status = Status.SUCCEEDED
+        error_type = error_message = None
+        try:
+            rng = RandomStateManager(self._cfg.get("seed", 0))
+            initial = self.output_dir / "rng_initial.pkl"
+            if initial.exists():
+                rng.restore(read_record(initial, self._store.serializer))
+            else:
+                rng.seed()
+                write_record(initial, rng.capture(), self._store.serializer)
+            self._store.rng = rng
+            ctx = RunContext(
+                run_id=self.run_id,
+                recorder=InMemoryRecorder() if recorder is None else recorder,
+                cfg=FrozenDict(self._cfg, tracker=self._reads),
+                attempt=attempt,
+                _store=self._store,
+                _metrics=self._metrics,
+            )
+            with ctx.observe(self.pipeline.name, kind="experiment") as context:
+                self.pipeline.run(ctx=context, stop_after=stage_index)
+        except BaseException as error:
+            status = Status.FAILED if isinstance(error, Exception) else Status.CANCELLED
+            error_type = type(error).__qualname__
+            error_message = _error_message(error)
+            if not isinstance(error, Exception):
+                raise
+        return StageResult(
+            self.run_id,
+            stage_index,
+            attempt,
+            status,
+            perf_counter() - started,
+            error_type,
+            error_message,
+        )

@@ -1,7 +1,6 @@
 """Isolated experiment interpreter; launched only by the GPU scheduler."""
 
 import os
-import pickle
 import runpy
 import signal
 import sys
@@ -9,20 +8,53 @@ import threading
 import types
 from contextlib import suppress
 from pathlib import Path
+from time import monotonic
 
-from .experiment import Experiment
-from .gpu_memory import watch as watch_gpu_memory
-from .limits import watch
-from .storage import PickleSerializer, RunLock, read_record, write_record
+from .context import _error_message
+from .events import Status
+from .experiment import Experiment, StageResult
+from .gpu_memory import limit as limit_gpu_memory
+from .gpu_memory import sample as gpu_memory
+from .ipc import worker_channel
+from .limits import events, own_cgroup, usage
+from .storage import PickleSerializer, RunLock, read_record
 
 
-class EventFile:
-    def __init__(self, path):
-        self.stream = path.open("ab", buffering=0)
+class IpcRecorder:
+    def __init__(self, channel):
+        self.channel = channel
 
     def record(self, event):
-        payload = pickle.dumps(event, protocol=pickle.HIGHEST_PROTOCOL)
-        self.stream.write(len(payload).to_bytes(8, "big") + payload)
+        self.channel.send({"type": "event", "event": event})
+
+
+def _resource_snapshot(directory):
+    host = usage(directory)
+    return {
+        "timestamp": monotonic(),
+        "host_current_kb": None if host is None else host[0],
+        "host_peak_kb": None if host is None else host[1],
+        "gpu": gpu_memory(),
+        "memory_events": events(directory),
+    }
+
+
+def _report_resources(channel, stop, interval):
+    directory = (
+        Path(os.environ["EXPMAN_CGROUP"])
+        if "EXPMAN_CGROUP" in os.environ
+        else own_cgroup()
+    )
+
+    def report():
+        try:
+            channel.send({"type": "resource", **_resource_snapshot(directory)})
+        except OSError:
+            stop.set()
+
+    while not stop.wait(interval):
+        report()
+    report()
 
 
 def _watch_parent():
@@ -36,25 +68,17 @@ def main():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     threading.Thread(target=_watch_parent, daemon=True).start()
     root = Path(sys.argv[1])
-    # Report a memory limit that refuses a charge before it can kill this process.
-    cap_stopped = threading.Event()
-    threading.Thread(
-        target=watch,
-        args=(
-            root / "memory_cap.pkl",
-            0.2,
-            cap_stopped,
-            os.environ.get("EXPMAN_CGROUP"),
-        ),
-        daemon=True,
-    ).start()
-    gpu_memory_stopped = threading.Event()
-    gpu_memory_thread = threading.Thread(
-        target=watch_gpu_memory,
-        args=(root / "gpu_memory.pkl", 0.2, gpu_memory_stopped),
+    channel = worker_channel(os.environ["EXPMAN_IPC_FD"])
+    resource_stopped = threading.Event()
+    resource_thread = threading.Thread(
+        target=_report_resources,
+        args=(channel, resource_stopped, float(os.environ["EXPMAN_POLL_INTERVAL"])),
         daemon=True,
     )
-    gpu_memory_thread.start()
+    resource_thread.start()
+    if "EXPMAN_GPU_LIMIT_KB" in os.environ:
+        with suppress(ValueError):
+            limit_gpu_memory(float(os.environ["EXPMAN_GPU_LIMIT_KB"]))
     metadata = read_record(root / "bootstrap.pkl", PickleSerializer())
     sys.path[:] = metadata["sys_path"]
     script = metadata["main_script"]
@@ -80,19 +104,57 @@ def main():
         _resume=True,
     )
     experiment._attempts = payload["attempts"]
-    recorder = EventFile(root / "events.bin")
+    recorder = IpcRecorder(channel)
     try:
         with RunLock(experiment.output_dir):
             try:
-                result = experiment.run(recorder=recorder)
-            except BaseException:
-                result = experiment.result.attempts[-1]
-            write_record(root / "result.pkl", result, experiment._store.serializer)
+                stage_index = payload.get("stage_index")
+                result = (
+                    experiment.run(recorder=recorder)
+                    if stage_index is None
+                    else experiment.run_stage(
+                        stage_index, attempt=payload["stage_attempt"], recorder=recorder
+                    )
+                )
+            except BaseException as error:
+                if stage_index is None:
+                    result = experiment.result.attempts[-1]
+                else:
+                    result = StageResult(
+                        experiment.run_id,
+                        stage_index,
+                        payload["stage_attempt"],
+                        Status.FAILED
+                        if isinstance(error, Exception)
+                        else Status.CANCELLED,
+                        0.0,
+                        type(error).__qualname__,
+                        _error_message(error),
+                    )
+            completed = (
+                None
+                if stage_index is None or result.status.value != "succeeded"
+                else experiment._store.completed((stage_index,))
+            )
+            with suppress(OSError):
+                channel.send(
+                    {
+                        "type": "finished",
+                        "result": result,
+                        "stage": stage_index,
+                        "dependencies": None
+                        if completed is None
+                        else completed.get("config_dependencies"),
+                        "resources": _resource_snapshot(
+                            Path(os.environ["EXPMAN_CGROUP"])
+                            if "EXPMAN_CGROUP" in os.environ
+                            else own_cgroup()
+                        ),
+                    }
+                )
     finally:
-        cap_stopped.set()
-        gpu_memory_stopped.set()
-        gpu_memory_thread.join()
-        recorder.stream.close()
+        resource_stopped.set()
+        resource_thread.join()
 
 
 if __name__ == "__main__":

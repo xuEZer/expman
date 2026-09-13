@@ -54,7 +54,16 @@ class Pipeline:
             )
         return result
 
-    def run(self, data: Any = None, ctx: RunContext | None = None) -> Any:
+    def run(
+        self,
+        data: Any = None,
+        ctx: RunContext | None = None,
+        *,
+        stop_after: int | None = None,
+    ) -> Any:
+        """Run through ``stop_after`` when supplied, otherwise the full Pipeline."""
+        if stop_after is not None and not 0 <= stop_after < len(self.stages):
+            raise ValueError("stop_after must identify a Pipeline stage")
         context = RunContext() if ctx is None else ctx
         base = context._stage_path
         if context.stage_id is not None:
@@ -104,6 +113,8 @@ class Pipeline:
                             reference = completed.get("_cache_ref")
                             parent = reference[2] if reference is not None else None
                             lookup = lookup and completed.get("_shared_reused", False)
+                        if stop_after == index:
+                            return data
                         continue
                 if shared is not None and lookup:
                     # Own in-progress work has priority over another run's result.
@@ -135,6 +146,8 @@ class Pipeline:
                                     restore_seconds=perf_counter() - restore_started,
                                 )
                             parent = reference[2]
+                            if stop_after == index:
+                                return data
                             continue
                     lookup = False
                 checkpoint = None
@@ -182,6 +195,8 @@ class Pipeline:
                         if shared is not None:
                             reference = store.completed_reference(position)
                             parent = reference[2] if reference is not None else None
+                        if stop_after == index:
+                            return data
                 except BaseException as error:
                     if store is not None:
                         status = (

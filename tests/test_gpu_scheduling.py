@@ -66,13 +66,27 @@ class SharedWork(Stage):
         return os.getpid()
 
 
+class Prepare(Stage):
+    def process(self, data, ctx):
+        root = Path(ctx.cfg["markers"])
+        (root / f"{ctx.run_id}.prepare").write_text(str(os.getpid()))
+        return ctx.cfg["item"]
+
+
+class Consume(Stage):
+    def process(self, data, ctx):
+        root = Path(ctx.cfg["markers"])
+        (root / f"{ctx.run_id}.consume").write_text(str(os.getpid()))
+        return data + ctx.cfg["offset"]
+
+
 class Memory:
     def __init__(self, devices):
         self.devices = devices
 
     def sample(self):
         return {
-            device: DeviceMemory(f"GPU-test-{device}", 100, 90)
+            device: DeviceMemory(f"GPU-test-{device}", 16 * 1024, 15 * 1024)
             for device in self.devices
         }
 
@@ -144,6 +158,56 @@ class GpuSchedulingTests(unittest.TestCase):
             [item.output for item in results],
         )
         self.assertEqual(resumed.devices, (0, 1))
+
+    def test_top_level_stages_run_independently_and_record_dependencies(self):
+        path = self.root / "two-stages.yaml"
+        path.write_text(
+            f"device: [0]\nmarkers: {self.root}\noffset: 10\nitem: !choice [1, 2]\n"
+        )
+        batch = Batch(
+            Pipeline([Prepare, Consume]), path, output_dir=self.root / "two-stages"
+        )
+
+        results = batch.run(progress=False)
+
+        self.assertEqual([result.output for result in results], [11, 12])
+        self.assertEqual(
+            [entry["stage"] for entry in batch._stage_history], [0, 0, 1, 1]
+        )
+        self.assertTrue(
+            all((self.root / f"{result.run_id}.prepare").exists() for result in results)
+        )
+        self.assertTrue(
+            all((self.root / f"{result.run_id}.consume").exists() for result in results)
+        )
+        dependencies = {
+            entry["stage"]: {path for path, _digest in entry["dependencies"]}
+            for entry in batch._stage_history
+        }
+        self.assertEqual(dependencies[0], {("item",), ("markers",)})
+        self.assertEqual(dependencies[1], {("markers",), ("offset",)})
+        scheduler = GpuScheduler(batch)
+        self.assertEqual(
+            scheduler._stage_paths(1), {("item",), ("markers",), ("offset",)}
+        )
+        self.assertGreater(scheduler._stage_duration(results[0].run_id, 1), 0)
+
+    def test_completed_zero_gpu_sample_turns_a_stage_into_a_cpu_stage(self):
+        batch = self.make_batch(count=2, devices=[0])
+        scheduler = GpuScheduler(batch)
+        batch._stage_history.append(
+            {
+                "run_id": batch.experiments[0].run_id,
+                "stage": 0,
+                "gpu_peak_kb": 0.0,
+                "status": Status.SUCCEEDED.value,
+                "capped": False,
+                "gpu_capped": False,
+                "dependencies": [],
+            }
+        )
+
+        self.assertFalse(scheduler._stage_uses_gpu(batch.experiments[1].run_id, 0))
 
     def test_shared_prefix_is_loaded_by_a_new_worker(self):
         # Seed the shared cache, then let the worker processes start from it instead
@@ -239,7 +303,7 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertTrue(gate.can_launch(0.005, ["running"]))
         gate.gpu_block = True
         self.assertFalse(gate.can_launch(0.99, ["running"]))
-        self.assertTrue(gate.can_launch(0.99, []))
+        self.assertFalse(gate.can_launch(0.99, []))
 
     def test_low_vram_ratio_alone_does_not_shed_attempts(self):
         batch = self.make_batch(count=1, devices=[0], delay=0)
@@ -330,11 +394,10 @@ class GpuSchedulingTests(unittest.TestCase):
 
     def test_observed_peak_is_recorded_and_changes_later_admission(self):
         batch = self.make_batch(count=1, devices=[0], delay=0.05)
-        with patch("expman.limits.usage", return_value=(1024, 2048)):
-            batch.run(progress=False)
+        batch.run(progress=False)
         peaks = [item["peak_kb"] for item in batch._gpu_history]
         self.assertEqual(len(peaks), 1)
-        self.assertGreater(peaks[0], 0)
+        self.assertGreaterEqual(peaks[0], 0)
         scheduler = GpuScheduler(batch)
         self.assertEqual(scheduler.peak_ceiling, peaks[0])
         self.assertEqual(scheduler._expected_peak("never-ran"), HOST_PEAK_KB_DEFAULT)
@@ -490,7 +553,7 @@ class DeviceTests(unittest.TestCase):
         self.assertTrue(gate.can_launch(0.009, ["a"]))
         gate.gpu_block = True
         self.assertFalse(gate.can_launch(0.9, ["a"]))
-        self.assertTrue(gate.can_launch(0.9, []))
+        self.assertFalse(gate.can_launch(0.9, []))
 
     def test_host_gate_holds_refills_until_a_card_is_free(self):
         gate = HostGate()

@@ -6,10 +6,10 @@ Direct cgroupfs is used when this process may write there; otherwise a transient
 systemd user scope carries the same limits, because systemd can create the cgroup
 even where the mount is read-only for us.
 
-A worker killed by its own cap would take the evidence with it, so a watcher inside
-the worker writes the cap record as soon as the kernel reports that the limit
-refused a charge (``memory.events`` ``max``/``oom_kill``), and the parent also
-samples the cgroup while the worker lives.
+The worker reports its cgroup counters through the scheduler IPC channel on each
+tick.  If the kernel kills it before that final report, the parent reads only the
+worker's cgroup counters once during exit handling; no per-tick parent-side cgroup
+polling is needed.
 """
 
 import shutil
@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import devices
-from .storage import PickleSerializer, write_record
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 SYSTEMD_RUN = "systemd-run"
@@ -126,17 +125,6 @@ def join(directory: Path, pid: int) -> bool:
     return True
 
 
-def limit_of(directory: Path | None) -> float:
-    """The cgroup's own memory.max in kilobytes, or 0.0 when unreadable or unset."""
-    if directory is None:
-        return 0.0
-    try:
-        value = (directory / "memory.max").read_text().strip()
-    except OSError:
-        return 0.0
-    return 0.0 if value == "max" else float(value.split()[0]) / 1024
-
-
 def usage(directory: Path | None) -> tuple[float, float] | None:
     """Current and peak resident kilobytes of a cgroup, or None if unreadable."""
     if directory is None:
@@ -167,9 +155,9 @@ def events(directory: Path | None) -> dict[str, float]:
 def refused(counts: dict[str, float]) -> bool:
     """Whether the kernel reports that this cgroup's limit refused a charge.
 
-    The counters only move once the kernel is out of options, so a worker also
-    reports a peak that came close to its own limit (see ``near_cap``): that record
-    is written before the kill, while a kill-path counter may never be observed.
+    The counters only move once the kernel is out of options.  The worker also
+    reports a peak that came close to its own limit (see ``near_cap``), which
+    catches a kill path before the parent can receive a final IPC report.
     """
     return any(
         counts.get(key, 0.0) > 0
@@ -180,31 +168,3 @@ def refused(counts: dict[str, float]) -> bool:
 def near_cap(peak_kb: float, limit_kb: float) -> bool:
     """Whether an observed peak came close enough to its limit to have hit it."""
     return limit_kb > 0 and peak_kb >= limit_kb * devices.CAPACITY_NEAR
-
-
-def watch(record: Path, interval: float, stop, directory: str | None = None) -> None:
-    """Write this worker's cap record as soon as its limit refuses a charge.
-
-    Runs inside the worker: a cgroup OOM kill would otherwise leave the parent with
-    nothing but an unexplained SIGKILL. The record is written before the kill, and
-    written again when the watcher stops, so a normal exit still reports the peak
-    (the event counters are cumulative, so the later write keeps the evidence).
-    """
-    directory = None if directory is None else Path(directory)
-    if directory is None:
-        directory = own_cgroup()
-    limit_kb = limit_of(directory)
-    while not stop.wait(interval):
-        counts = events(directory)
-        observed = usage(directory)
-        capped = observed is not None and near_cap(observed[1], limit_kb)
-        if refused(counts) or capped:
-            write_record(
-                record, {"events": counts, "usage": observed}, PickleSerializer()
-            )
-            break
-    write_record(
-        record,
-        {"events": events(directory), "usage": usage(directory)},
-        PickleSerializer(),
-    )

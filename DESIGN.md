@@ -232,7 +232,7 @@ Batch 构造时加载 YAML，并按展开顺序创建 Experiment；也接受一�
 
 `Batch.run()` 返回按配置顺序排列的 `tuple[ExperimentResult, ...]`，不受实际重试顺序影响。每个结果包含稳定 `run_id` 和全部 `AttemptResult`。
 
-AttemptResult 记录尝试编号、状态、耗时、输出及错误摘要。ExperimentResult 的状态和输出取最后一次尝试，耗时为全部尝试耗时之和；尚未执行时状态为 `pending`、输出为 `None`。结果是尝试历史的快照。输出不随结果常驻内存：AttemptResult 只保留摘要和 OutputSource，`output` 每次访问按来源重新读取——GPU 尝试读 worker 的 `result.pkl`（ResultOutput），顺序执行和 resume 读该 run 的最终阶段快照（SnapshotOutput，经 RunStore 解析共享引用）。因此父进程内存不随已完成实验数增长，中断后 `batch.results` 仍能读到全部输出，代价是每次访问都产生一个新的副本，修改不回写记录，重复使用需要调用方自行保存引用。Batch 在顺序路径完成一个尝试后释放其输出，worker 结果与 resume 记录只保留来源；读取记录时父进程的峰值内存约为一个尝试的输出。
+AttemptResult 记录尝试编号、状态、耗时、输出及错误摘要。ExperimentResult 的状态和输出取最后一次尝试，耗时为全部尝试耗时之和；尚未执行时状态为 `pending`、输出为 `None`。结果是尝试历史的快照。输出不随结果常驻内存：AttemptResult 只保留摘要和最终阶段 SnapshotOutput，`output` 每次按阶段快照读取。因此父进程内存不随已完成实验数增长，中断后 `batch.results` 仍能读到全部输出，代价是每次访问都产生一个新的副本，修改不回写记录，重复使用需要调用方自行保存引用。
 
 Batch 默认使用一个内存 Recorder 收集所有实验事件，可传入自定义记录器。事件层次为 Experiment 尝试 → Pipeline → Stage，通过 `run_id`、`attempt` 和父子执行 ID 关联。记录器普通故障继续采用尽力交付语义，不将一次成功业务执行转为重试。
 
@@ -342,17 +342,15 @@ YAML 顶层 `device` 是 Batch 级的非负、不重复 NVIDIA GPU 编号列表�
 
 `GpuScheduler` 在主进程持有 Batch 锁并管理多个独立解释器；单个实验的每次尝试使用新的进程组。bootstrap 先安装父进程 EOF 监听，再导入用户模块和反序列化 Pipeline/Serializer。入口脚本的顶层 Stage 可复用，主入口必须有 main guard；局部类和闭包不满足默认进程传输契约。工作进程持有实验目录锁，避免同一实验快照被两个执行者写入。
 
-每卡 Gate 只维护 `gpu_block`。默认内存门槛 0.01（1%）与显存查询超时 3 秒定义于 devices 模块，显存与主机内存共用同一门槛常量；没有启动间隔或每卡并发上限，每卡每个 tick 最多启动一个实验。每个调度 tick（0.2 秒）重新读取两者，不使用过期读数。读数大于等于门槛时，一次增加一个实验。读数小于门槛时置该卡 `gpu_block`、kill 该卡最新启动的进程组；读数仍不足时每个 tick 继续减载一个。该卡有实验以非压力原因退出（成功、失败或中断）时清除 `gpu_block`，减载自身的退出不清除，因此不会立即补位；空卡只要读数满足门槛即可重启。GPU UUID 在连续采样间变化或设备缺失属于不可恢复的设备一致性错误，终止调度并清理子进程，避免使用错误数据继续启动。
+调度任务是一个顶层 Stage。调度器只派发尚未完成的目标 Stage；子进程在进入目标前恢复已有前缀快照，禁止隐式执行缺失的上游 Stage。完成消息携带 StageResult（状态、耗时）、该进程最终的 cgroup 内存当前值/峰值、可选 PyTorch 分配器显存当前值/峰值和配置依赖；普通 Recorder 事件也通过同一私有 socket IPC 传输。调度器每个 tick 读取全局主机与整卡显存，并消费 IPC，但不逐个查询 worker 的 `/proc` 或 cgroup；仅在 worker 已退出而 IPC 来不及报告 cgroup OOM 时读取一次该 cgroup 的事件计数。
 
-主机内存是每个实验进程共用的资源，单独由全局 HostGate 的 `mem_block` 把关，采样 `/proc/meminfo` 的 `MemTotal`、`MemAvailable`，并同时读取 swap 供外部观察。`MemAvailable` 比例低于门槛时置 `mem_block`，所有卡都停止派发，并 kill 全局最近启动的一个实验；减载后只要还有实验在运行就不补位，直到某个实验以非压力原因退出（成功、失败或中断）才清除，没有运行实验时只由内存比例决定。显存与主机内存各自判定：同一次读数中两者都不足时，两边各自减载一个。减载仍按尝试处理：退出记为 cancelled，不占失败预算，实验回到队列等待重试。swap 不参与任何准入或减载判定。
+每个顶层 Stage 使用独立的耗时、主机峰值和显存峰值模型。特征为滚动累积配置读取路径：所有上游 Stage 的依赖与当前 Stage 已观测依赖共同组成输入身份；此前缀相同即上游输入相同。无样本时以完整配置选择异质冷启动组合；有样本时从资源可行候选中选择与同 Stage 样本距离最大的配置。模型缓存只在新的 Stage 完成时失效，tick 的瞬时资源报告不会训练模型。
 
-显存或主机内存查询失败、超时、读数缺失或数值无效时，调度按主机内存不足处理：清除旧读数、发出 RuntimeWarning、置 `mem_block`，并 kill 最近启动的一个实验，下一个 tick 重新查询，批次继续运行。
+未知 Stage 的主机和显存峰值各为 1 GiB。主机准入要求 `MemAvailable - HOST_RESERVE_KB` 足以覆盖新 Stage 的 cgroup 合约和所有运行 worker 尚未使用的合约部分；每个 cgroup `memory.max` 是模型峰值的 110%。拒绝申请或接近上限时，这条 Stage 样本是右删失观测，并抬升该组合的下界后重试。GPU 准入按整卡空闲显存及同卡 PyTorch 尚未使用的分配器合约计算；PyTorch 可用时以 `set_per_process_memory_fraction` 应用该合约。没有 PyTorch 遥测并不被当作 CPU 证据；只有显式报告零峰值的已采样 Stage 才进入不占卡的 CPU 通道。
 
-主进程先原子保存 `active_gpu: {run_id: device}` 再创建进程。尝试输入、原子结果和追加事件文件位于实验的 attempts 子目录；子进程直接保存原有阶段快照/checkpoint 和 SQLite 指标。主进程读取完成结果、汇总 Recorder 事件，原子更新尝试摘要、设备/并发历史和队列；返回结果仍按配置展开顺序。结果记录只用于校验和摘要，尝试输出改由 ResultOutput 按需读取，父进程不随完成数累积输出对象。普通进程异常退出算失败，默认一次重试；显存调度 kill 和 Ctrl+C 算 cancelled，不占失败预算。Ctrl+C 先 kill 所有进程组，再做主进程记录。父进程硬退出由子进程 EOF 监听负责清理；resume 对清单中的全部活动成员补记未知时长中断并优先恢复。
+每卡 Gate 在 CUDA OOM 后拒绝新增 Stage，直至同卡另一个 worker 正常结束；阻塞状态写入 Batch 清单以覆盖 resume。所有卡均被阻塞且没有 CPU Stage 可以运行时，调度器报告阻塞错误，避免无界等待或继续试探。主机读数紧张/失败仍使用全局 HostGate 减载最新 worker。GPU UUID 变化或设备缺失属于不可恢复的一致性错误。
 
-主进程定期记录各运行实验经历的同卡并发数时间积分，结束后保存平均并发、设备编号/UUID 和经过时间。GPU ETA 沿用整实验累计耗时观测与删失处理，将设备和并发条件加入回归；每次联合抽样产生各成员剩余量，在当前每卡槽位下模拟队列，输出最晚完成时间的中心预测区间。空闲卡仅在余量满足门槛时获得一个预测槽位；不预测未来升降并发轨迹。主机内存低于门槛时预测只保留已占用的槽位，不再为空闲卡分配新槽位，与压力期间停止派发和减载的准入规则一致；没有实验在运行且主机内存不足时剩余时间未知。设备迁移和并发变化用汇总特征近似，不能识别所有 GPU 内竞争、模型加载和外部负载影响；区间仍未校准。信息价值选择保留原有实验配置启发式，准入由显存与主机内存共同决定，两者都不是下一个实验的需求估计。
-
-测试使用真实独立解释器、进程组 SIGKILL、父进程 SIGINT/SIGKILL、共享 SQLite 和可控显存观测，覆盖退出门控、设备可见性在导入前生效、记录汇总、阶段/checkpoint 恢复和最晚完成时间聚合；真实 NVIDIA 工作负载验证需在可访问 GPU 的环境中进行。
+主进程在创建 worker 前原子保存活动 Stage、Stage 尝试编号与队列状态；Stage 快照/checkpoint 和 SQLite 指标仍由子进程写入。完成 IPC 驱动主进程更新 Stage 历史、最终 ExperimentResult、设备/并发历史和队列。硬退出时父进程 EOF 监听清理进程组；resume 对活动 Stage 补记中断并从相应 Stage 重试。真实 NVIDIA 验证仍应在可访问 GPU、安装 optional PyTorch 的环境执行。
 
 
 ## 随机数生命周期

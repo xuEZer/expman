@@ -20,7 +20,9 @@ class Memory:
     def __init__(self, selected):
         self.selected = selected
     def sample(self):
-        return {index: devices.DeviceMemory(f"GPU-test-{index}", 100, 90)
+        return {index: devices.DeviceMemory(
+            f"GPU-test-{index}", 16 * 1024, 15 * 1024
+        )
                 for index in self.selected}
 
 class Work(Stage):

@@ -64,6 +64,10 @@ class Batch:
             validate_seed(config.get("seed", 0))
         self.devices = configured_devices(configs)
         self._active_gpu = {}
+        self._stage_progress = {}
+        self._stage_attempts = {}
+        self._stage_elapsed = {}
+        self._stage_history = []
         self._gpu_history = []
         self._gpu_memory = {}
         self._gpu_blocks = {}
@@ -87,6 +91,10 @@ class Batch:
             )
             for config in configs
         )
+        self._stage_progress = {experiment.run_id: 0 for experiment in self.experiments}
+        self._stage_elapsed = {
+            experiment.run_id: 0.0 for experiment in self.experiments
+        }
         self._time_estimator = TimeEstimator(self.experiments)
         self.max_retries = max_retries
         self.recorder = InMemoryRecorder() if recorder is None else recorder
@@ -164,7 +172,12 @@ class Batch:
             "queue": list(self._queue),
             "active": self._active,
             "active_gpu": dict(self._active_gpu),
+            "stage_progress": dict(self._stage_progress),
+            "stage_attempts": dict(self._stage_attempts),
+            "stage_elapsed": dict(self._stage_elapsed),
+            "stage_history": list(self._stage_history),
             "gpu_history": list(self._gpu_history),
+            "gpu_blocks": dict(self._gpu_blocks),
             "estimation": {
                 "version": 1,
                 "execution": "gpu" if self.devices else "sequential",
@@ -219,6 +232,10 @@ class Batch:
         self.recorder = InMemoryRecorder() if recorder is None else recorder
         self._state_lock = RLock()
         self._started = False
+        self._stage_progress = dict(manifest.get("stage_progress", {}))
+        self._stage_attempts = dict(manifest.get("stage_attempts", {}))
+        self._stage_elapsed = dict(manifest.get("stage_elapsed", {}))
+        self._stage_history = list(manifest.get("stage_history", []))
         experiments = []
         for entry in manifest["experiments"]:
             run_id = entry["run_id"]
@@ -262,6 +279,14 @@ class Batch:
                 )
             experiments.append(experiment)
         self.experiments = tuple(experiments)
+        self._stage_progress = {
+            experiment.run_id: int(self._stage_progress.get(experiment.run_id, 0))
+            for experiment in self.experiments
+        }
+        self._stage_elapsed = {
+            experiment.run_id: float(self._stage_elapsed.get(experiment.run_id, 0.0))
+            for experiment in self.experiments
+        }
         self.devices = configured_devices([item.cfg for item in experiments])
         if bool(self.devices) != (estimation["execution"] == "gpu"):
             raise StorageError(
@@ -269,7 +294,13 @@ class Batch:
             )
         self._active_gpu = {}
         self._gpu_memory = {}
-        self._gpu_blocks = {}
+        blocks = manifest.get("gpu_blocks", {})
+        if not isinstance(blocks, dict) or any(
+            device not in self.devices or type(blocked) is not bool
+            for device, blocked in blocks.items()
+        ):
+            raise StorageError("invalid persisted GPU blocks")
+        self._gpu_blocks = dict(blocks)
         self._host_memory = {}
         self._gpu_running_info = {}
         history = manifest.get("gpu_history", [])
@@ -281,8 +312,11 @@ class Batch:
             or item.get("run_id") not in attempts_by_id
             or type(item.get("attempt")) is not int
             or not 1 <= item["attempt"] <= attempts_by_id[item["run_id"]]
-            or item.get("device") not in self.devices
-            or not isinstance(item.get("uuid"), str)
+            or (
+                item.get("device") is not None
+                and item.get("device") not in self.devices
+            )
+            or (item.get("uuid") is not None and not isinstance(item.get("uuid"), str))
             or any(
                 type(item.get(key)) not in (int, float)
                 or not math.isfinite(item[key])
@@ -308,7 +342,9 @@ class Batch:
         if (
             not isinstance(active_gpu, dict)
             or any(
-                run_id not in ids or run_id in self._queue or device not in self.devices
+                run_id not in ids
+                or run_id in self._queue
+                or (device is not None and device not in self.devices)
                 for run_id, device in active_gpu.items()
             )
             or (active is not None and active_gpu)

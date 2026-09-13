@@ -1,5 +1,6 @@
 """Conditional makespan intervals using observed concurrent experiment durations."""
 
+import os
 from collections import defaultdict
 
 from ._time_model import DurationModel, features
@@ -8,7 +9,10 @@ from .estimation import TimeEstimate, _quantile
 
 def estimate_parallel(batch, coverage):
     with batch._state_lock:
-        active = dict(batch._active_gpu)
+        active = {
+            run_id: "cpu" if device is None else device
+            for run_id, device in batch._active_gpu.items()
+        }
         queue = list(batch._queue)
         history = list(batch._gpu_history)
         running = dict(batch._gpu_running_info)
@@ -31,17 +35,24 @@ def estimate_parallel(batch, coverage):
         for device, count in counts.items()
         if count or not blocks.get(device, False)
     }
+    cpu_count = sum(device == "cpu" for device in active.values())
+    if cpu_count:
+        capacity["cpu"] = max(cpu_count, os.cpu_count() or 1)
     if host.get("tight", False) or not host.get("admits_next", True):
         # Host RAM shortage, or a reserve that cannot cover one more attempt of
         # the largest peak on record, pauses every launch and sheds running
         # attempts, so the forecast keeps only the slots already occupied.
         capacity = {device: count for device, count in counts.items() if count}
+        if cpu_count:
+            capacity["cpu"] = cpu_count
     if not capacity:
         return TimeEstimate(None, None, coverage, len(completed), len(pending))
     # This forecast conditions on the present slot counts. It does not assume
     # fair GPU sharing: observed wall times and contention are model inputs.
     assignments = dict(active)
-    loads = dict(counts)
+    loads = {
+        device: sum(value == device for value in active.values()) for device in capacity
+    }
     for run_id in queue:
         device = min(capacity, key=lambda item: loads[item] / capacity[item])
         assignments[run_id] = device
@@ -62,7 +73,7 @@ def estimate_parallel(batch, coverage):
         )
         if experiment.run_id in assignments:
             device = assignments[experiment.run_id]
-            concurrency = max(1, counts[device])
+            concurrency = max(1, loads[device])
         else:
             device = records[-1]["device"] if records else -1
         configs.append(

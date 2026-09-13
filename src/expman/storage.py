@@ -216,6 +216,8 @@ class RunStore:
             **self.random_snapshot(),
             "elapsed_seconds": self.elapsed(position),
         }
+        if self.reads is not None:
+            record["config_dependencies"] = self.reads.export()
         if (
             self.shared is not None
             and self.cache_position == position
