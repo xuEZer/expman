@@ -20,7 +20,6 @@ from expman.devices import (
     NvidiaMemory,
     fits_reserve,
     nvidia_smi,
-    residency_kb,
 )
 from expman.scheduling import Gate, GpuScheduler, HostGate
 
@@ -331,7 +330,8 @@ class GpuSchedulingTests(unittest.TestCase):
 
     def test_observed_peak_is_recorded_and_changes_later_admission(self):
         batch = self.make_batch(count=1, devices=[0], delay=0.05)
-        batch.run(progress=False)
+        with patch("expman.limits.usage", return_value=(1024, 2048)):
+            batch.run(progress=False)
         peaks = [item["peak_kb"] for item in batch._gpu_history]
         self.assertEqual(len(peaks), 1)
         self.assertGreater(peaks[0], 0)
@@ -530,14 +530,6 @@ class DeviceTests(unittest.TestCase):
         self.assertFalse(fits_reserve(roomy, 2 * 1024**2 + 1))
         self.assertFalse(fits_reserve(paging, 1))
         self.assertFalse(fits_reserve(None, 1))
-
-    def test_residency_reports_current_and_peak_for_a_live_process(self):
-        residency = residency_kb(os.getpid())
-        self.assertIsNotNone(residency)
-        current, peak = residency
-        self.assertGreater(current, 0)
-        self.assertGreaterEqual(peak, current)
-        self.assertIsNone(residency_kb(2**30))
 
     def test_query_timeout_is_an_observation_error_with_the_default_timeout(self):
         with (

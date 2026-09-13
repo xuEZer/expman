@@ -258,23 +258,3 @@ class MeminfoMonitor:
             return False
         previous, self._paged = self._paged, paged
         return previous is not None and paged > previous
-
-
-def residency_kb(pid: int) -> tuple[float, float] | None:
-    """Current and peak resident set of a live process in kB; None if unreadable.
-
-    Peak is what admission charges a running worker for: the gap between what it
-    holds now and the most it has been seen to need.
-    """
-    try:
-        current = peak = None
-        for line in (PROC_ROOT / str(pid) / "status").read_text().splitlines():
-            if line.startswith("VmRSS:"):
-                current = float(line.split()[1])
-            elif line.startswith("VmHWM:"):
-                peak = float(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        return None
-    if current is None or peak is None:
-        return None
-    return current, peak

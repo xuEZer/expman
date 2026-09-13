@@ -62,6 +62,10 @@ class Worker:
     # it has ever held. Admission reserves the gap between the two.
     resident_kb: float = 0.0
     peak_kb: float = 0.0
+    gpu_allocated_kb: float | None = None
+    gpu_reserved_kb: float | None = None
+    gpu_peak_allocated_kb: float | None = None
+    gpu_peak_reserved_kb: float | None = None
     cap_hit: bool = False
     buffer: bytes = field(default=b"", repr=False)
 
@@ -102,10 +106,9 @@ class GpuScheduler:
             count = sum(item.device == worker.device for item in self.workers.values())
             worker.area += (now - max(self.last_tick, worker.started)) * count
             residency = limits.usage(worker.limit.cgroup if worker.limit else None)
-            if residency is None:
-                residency = devices.residency_kb(worker.process.pid)
             if residency is not None:
                 worker.resident_kb, worker.peak_kb = residency
+            self._gpu_memory_report(worker)
             if worker.limit is not None and limits.refused(
                 limits.events(worker.limit.cgroup)
             ):
@@ -120,9 +123,44 @@ class GpuScheduler:
                     "duration": max(0.0, now - worker.started),
                     "resident_kb": worker.resident_kb,
                     "peak_kb": worker.peak_kb,
+                    "gpu_allocated_kb": worker.gpu_allocated_kb,
+                    "gpu_reserved_kb": worker.gpu_reserved_kb,
+                    "gpu_peak_allocated_kb": worker.gpu_peak_allocated_kb,
+                    "gpu_peak_reserved_kb": worker.gpu_peak_reserved_kb,
                 }
                 for run_id, worker in self.workers.items()
             }
+
+    @staticmethod
+    def _gpu_memory_report(worker):
+        """Read the latest atomically published PyTorch allocator telemetry."""
+        path = worker.root / "gpu_memory.pkl"
+        if not path.exists():
+            return
+        try:
+            report = read_record(path, PickleSerializer())
+        except Exception:
+            return
+        if not isinstance(report, dict):
+            return
+        fields = (
+            "gpu_allocated_kb",
+            "gpu_reserved_kb",
+            "gpu_peak_allocated_kb",
+            "gpu_peak_reserved_kb",
+        )
+        values = [report.get(field) for field in fields]
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0
+            for value in values
+        ):
+            return
+        (
+            worker.gpu_allocated_kb,
+            worker.gpu_reserved_kb,
+            worker.gpu_peak_allocated_kb,
+            worker.gpu_peak_reserved_kb,
+        ) = values
 
     def _events(self, worker):
         path = worker.root / "events.bin"
@@ -361,6 +399,7 @@ class GpuScheduler:
         _kill_group(worker.process)  # Also reap experiment-owned helper processes.
         worker.process.wait()
         worker.process.stdin.close()
+        self._gpu_memory_report(worker)
         while (worker.root / "events.bin").exists():
             before = worker.offset
             self._events(worker)

@@ -11,6 +11,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from .experiment import Experiment
+from .gpu_memory import watch as watch_gpu_memory
 from .limits import watch
 from .storage import PickleSerializer, RunLock, read_record, write_record
 
@@ -47,6 +48,13 @@ def main():
         ),
         daemon=True,
     ).start()
+    gpu_memory_stopped = threading.Event()
+    gpu_memory_thread = threading.Thread(
+        target=watch_gpu_memory,
+        args=(root / "gpu_memory.pkl", 0.2, gpu_memory_stopped),
+        daemon=True,
+    )
+    gpu_memory_thread.start()
     metadata = read_record(root / "bootstrap.pkl", PickleSerializer())
     sys.path[:] = metadata["sys_path"]
     script = metadata["main_script"]
@@ -82,6 +90,8 @@ def main():
             write_record(root / "result.pkl", result, experiment._store.serializer)
     finally:
         cap_stopped.set()
+        gpu_memory_stopped.set()
+        gpu_memory_thread.join()
         recorder.stream.close()
 
 
