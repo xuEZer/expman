@@ -72,9 +72,6 @@ class BatchProgress:
         with self.batch._state_lock:
             pending = set(self.batch._queue)
             pending.update(self.batch._active_gpu)
-            active = self.batch._active
-            if active is not None:
-                pending.add(active)
             succeeded = failed = 0
             current = None
             for index, experiment in enumerate(self.batch.experiments, start=1):
@@ -82,7 +79,7 @@ class BatchProgress:
                 status = attempts[-1].status if attempts else Status.PENDING
                 succeeded += status is Status.SUCCEEDED
                 failed += status is Status.FAILED and experiment.run_id not in pending
-                if experiment.run_id == active:
+                if experiment.run_id in self.batch._active_gpu:
                     current = index
             cards = " ".join(
                 f"GPU{device}:{sum(value == device for value in self.batch._active_gpu.values())}运行"

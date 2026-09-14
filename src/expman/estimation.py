@@ -1,4 +1,4 @@
-"""Experiment-level remaining-time intervals for sequential batches."""
+"""Experiment-level remaining-time intervals used by Batch estimates."""
 
 import math
 from dataclasses import dataclass

@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- `Batch` 统一使用 GPU Stage 调度；`device` 必填且必须是非空 GPU 编号列表，根部 `seed` 也必须显式提供，不再隐式使用 `0`。
+
 - `nvidia-smi` 在 PATH 中找不到时回退到 WSL2 的 `/usr/lib/wsl/lib/nvidia-smi`，避免 WSL2 下按未配置 PATH 启动批次时显存查询全部失败。
 
 - 尝试输出不再常驻父进程：AttemptResult 只保留状态、耗时、错误摘要和读取来源，`result.output` 按需从 worker 结果记录或最终阶段快照读取，内存占用不随已完成实验数增长，中断后 `batch.results` 仍可读取全部输出。读取契约不变，但直接构造 AttemptResult 时输出字段名由 `output` 改为 `_output`。

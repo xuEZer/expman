@@ -2,7 +2,6 @@ import os
 import sqlite3
 import subprocess
 import tempfile
-import threading
 import unittest
 from itertools import pairwise
 from pathlib import Path
@@ -118,6 +117,7 @@ class GpuSchedulingTests(unittest.TestCase):
 
         cfg = {
             "device": [0, 1] if devices is None else devices,
+            "seed": 0,
             "markers": str(self.root),
             "crash": False,
             "fail_once": False,
@@ -164,7 +164,7 @@ class GpuSchedulingTests(unittest.TestCase):
     def test_top_level_stages_run_independently_and_record_dependencies(self):
         path = self.root / "two-stages.yaml"
         path.write_text(
-            f"device: [0]\nmarkers: {self.root}\noffset: 10\nitem: !choice [1, 2]\n"
+            f"device: [0]\nseed: 0\nmarkers: {self.root}\noffset: 10\nitem: !choice [1, 2]\n"
         )
         batch = Batch(
             Pipeline([Prepare, Consume]), path, output_dir=self.root / "two-stages"
@@ -268,11 +268,11 @@ class GpuSchedulingTests(unittest.TestCase):
         # experiments point at the same cache entry.
         output_dir = self.root / "shared-two"
         path = self.root / "shared.yaml"
-        path.write_text("device: [0]\nunused: !choice [1, 2]\n")
+        path.write_text("device: [0]\nseed: 0\nunused: !choice [1, 2]\n")
         batch = Batch(Pipeline([SharedWork]), path, output_dir=output_dir)
         seeded = Experiment(
             Pipeline([SharedWork]),
-            {"unused": 0},
+            {"seed": 0, "unused": 0},
             output_dir=self.root / "seed",
             _cache_root=output_dir / "cache",
         ).run()
@@ -298,6 +298,7 @@ class GpuSchedulingTests(unittest.TestCase):
                     Pipeline([GpuWork]),
                     {
                         "device": [0],
+                        "seed": 0,
                         "markers": temporary,
                         "wait_for_release": False,
                         "delay": 0.1,
@@ -532,65 +533,50 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertGreaterEqual(len(stamps), 10)
         self.assertLess(max(gaps), 0.1)
 
-    def test_slow_background_scores_do_not_block_worker_launches(self):
+    def test_experiment_level_priority_refresh_is_not_used(self):
         batch = self.make_batch(count=2, delay=0.1, devices=[0])
-        entered = threading.Event()
-        release = threading.Event()
-        errors = []
-
-        def slow_scores(pending):
-            entered.set()
-            if not release.wait(60):
-                raise RuntimeError("test did not release background computation")
-
-        def run():
-            try:
-                batch.run(progress=False)
-            except BaseException as error:
-                errors.append(error)
-
-        with patch.object(
-            batch._time_estimator, "refresh_priorities", side_effect=slow_scores
-        ):
-            thread = threading.Thread(target=run)
-            thread.start()
-            try:
-                self.assertTrue(entered.wait(3))
-                # Each isolated worker initializes the default PyTorch/CUDA
-                # runtime before it reaches the Stage marker. That setup can
-                # take longer than the scheduling assertion itself on a cold
-                # driver, so wait for the observable worker outcome rather
-                # than imposing an unrelated startup-time budget.
-                deadline = monotonic() + 45
-                while (
-                    len(list(self.root.glob("*.checkpoint"))) < 2
-                    and monotonic() < deadline
-                ):
-                    sleep(0.01)
-                self.assertEqual(len(list(self.root.glob("*.checkpoint"))), 2)
-                self.assertFalse(release.is_set())
-            finally:
-                release.set()
-                thread.join(20)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(errors, [])
-        self.assertTrue(
-            all(result.status is Status.SUCCEEDED for result in batch.results)
-        )
+        with patch.object(batch._time_estimator, "refresh_priorities") as refresh:
+            results = batch.run(progress=False)
+        refresh.assert_not_called()
+        self.assertTrue(all(result.status is Status.SUCCEEDED for result in results))
 
 
 class DeviceTests(unittest.TestCase):
+    def test_device_and_seed_are_required_before_creating_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(ConfigError, "device is required"):
+                Batch(Pipeline([]), {"seed": 0}, output_dir=root / "no-device")
+            with self.assertRaisesRegex(ValueError, "seed is required"):
+                Batch(Pipeline([]), {"device": [0]}, output_dir=root / "no-seed")
+            with self.assertRaisesRegex(ValueError, "seed is required"):
+                Experiment(Pipeline([]), {}, output_dir=root / "experiment-no-seed")
+            with self.assertRaisesRegex(ConfigError, "nonempty"):
+                Batch(
+                    Pipeline([]),
+                    {"device": [], "seed": 0},
+                    output_dir=root / "empty-device",
+                )
+            self.assertFalse((root / "no-device").exists())
+            self.assertFalse((root / "no-seed").exists())
+            self.assertFalse((root / "experiment-no-seed").exists())
+            self.assertFalse((root / "empty-device").exists())
+
     def test_device_is_a_batch_wide_plain_list(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for value in (None, 0, [True], [-1], [0, 0], ["0"]):
                 with self.subTest(value=value), self.assertRaises(ConfigError):
-                    Batch(Pipeline([]), {"device": value}, output_dir=root / "unused")
+                    Batch(
+                        Pipeline([]),
+                        {"device": value, "seed": 0},
+                        output_dir=root / "unused",
+                    )
             cfg = root / "experiment.yaml"
-            cfg.write_text("device: !choice [[0], [1]]\n")
+            cfg.write_text("device: !choice [[0], [1]]\nseed: 0\n")
             with self.assertRaises(ConfigError):
                 Batch(Pipeline([]), cfg, output_dir=root / "unused")
-            cfg.write_text("device: [0, 1]\nx: !choice [1, 2]\n")
+            cfg.write_text("device: [0, 1]\nseed: 0\nx: !choice [1, 2]\n")
             batch = Batch(Pipeline([]), cfg, output_dir=root / "batch")
             self.assertEqual(len(batch.experiments), 2)
             self.assertEqual(batch.devices, (0, 1))

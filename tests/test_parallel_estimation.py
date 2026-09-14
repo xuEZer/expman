@@ -11,7 +11,7 @@ from expman.parallel_estimation import estimate_parallel
 class ParallelEstimationTests(unittest.TestCase):
     def make_batch(self, root, devices):
         cfg = root / "cfg.yaml"
-        cfg.write_text(f"device: {devices}\nitem: !choice [0, 1, 2]\n")
+        cfg.write_text(f"device: {devices}\nseed: 0\nitem: !choice [0, 1, 2]\n")
         batch = Batch(Pipeline([]), cfg, output_dir=root / "batch")
         first = batch.experiments[0]
         first._attempts.append(AttemptResult(first.run_id, 1, Status.SUCCEEDED, 10))

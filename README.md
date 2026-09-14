@@ -61,6 +61,7 @@ for event in recorder.events:
 ```yaml
 # experiment.yaml
 seed: !choice [0, 1, 2]
+device: [0]
 models:
   forecasting:
     name: patchtst
@@ -256,7 +257,7 @@ python examples/estimate_time.py
 
 `Batch.resume()` 从持久化尝试历史重建估计，保留覆盖设置。一次实验的已知尝试耗时累计使用，不把一次短续跑当作新的完整实验样本。进程突然结束且耗时未知的实验，其恢复后的完成结果不作为精确训练样本。失败尝试也不作为成功完成样本。
 
-顺序执行的估计使用同一 Batch 的历史数据；GPU 并发执行的估计见下节。`TimeEstimate` 的秒数上下界、`completed_samples`、`remaining_experiments` 和 `coverage` 可供程序读取。区间基于配置回归与耗时分布假设，`calibrated=False` 表示尚未经过实际工作负载校准；样本少、配置差异大或执行环境改变时，范围可能很宽。出现数值无法表示的上界时，该端显示问号。当前版本不对外部 GPU 竞争或未来失败次数做专门建模。
+并发执行的估计见下节。`TimeEstimate` 的秒数上下界、`completed_samples`、`remaining_experiments` 和 `coverage` 可供程序读取。区间基于配置回归与耗时分布假设，`calibrated=False` 表示尚未经过实际工作负载校准；样本少、配置差异大或执行环境改变时，范围可能很宽。出现数值无法表示的上界时，该端显示问号。当前版本不对外部 GPU 竞争或未来失败次数做专门建模。
 
 
 ### 多卡并发
@@ -268,13 +269,13 @@ device: [0, 1, 3]
 epochs: !choice [20, 40]
 ```
 
-`device` 是整个 Batch 的设备列表，不展开为实验组合，也不允许使用 `!choice`。省略或 `[]` 使用原有 CPU 顺序执行路径；框架不改写用户的模型构建逻辑。`ctx.cfg` 保留完整的原始设备列表。GPU Batch 的每个顶层 Stage 都在独立解释器中运行，并分配一张可见的 GPU，业务代码可统一使用 `cuda:0`；不使用 CUDA 的 Stage 不会因此产生显存占用。绑定通过启动环境中的 GPU UUID 设置，在导入用户 Stage 模块前生效。
+`device` 是整个 Batch 必填的设备列表，不展开为实验组合，也不允许使用 `!choice` 或空列表。框架不改写用户的模型构建逻辑。`ctx.cfg` 保留完整的原始设备列表。每个顶层 Stage 都在独立解释器中运行，并分配一张可见的 GPU，业务代码可统一使用 `cuda:0`；不使用 CUDA 的 Stage 不会因此产生显存占用。绑定通过启动环境中的 GPU UUID 设置，在导入用户 Stage 模块前生效。
 
 GPU Batch 以**顶层 Stage**为调度单元，而不是以整个 Pipeline 为单元。子进程只实际执行被派发的一个 Stage；此前完成的顶层 Stage 从快照恢复。每次完成会把该 Stage 的耗时、cgroup 内存当前值/峰值、PyTorch 分配器显存当前值/峰值和配置读取依赖通过私有 IPC 通知调度器；Recorder 事件也走同一通道，不再靠轮询 worker 目录中的结果或事件文件。
 
 模型按 Stage 分开保存。特征是滚动累积的配置依赖：某 Stage 的上游 Stage 已读取路径与它自身已观测的读取路径共同决定特征。因此前缀依赖相同表示上游输入相同。冷启动时使用完整配置挑选彼此更远的组合；有样本后，参数距离既用于候选排序，也用于从同 Stage 的最近历史样本中取保守经验分位数。耗时、主机内存峰值和显存峰值不会向未采样参数空间作概率外推：结果受有限历史样本约束；cgroup 截断的主机峰值仅按固定系数抬高一次，显存合约还不会超过物理卡容量。模型只在收到新的完成样本时重建，tick 不会用正在运行的瞬时数据改变估计。
 
-默认值在 [devices.py](src/expman/devices.py) 中：主机预留 `HOST_RESERVE_KB = 1048576`（1 GiB），未知 Stage 的主机和显存峰值均为 1 GiB。每个 tick（`POLL_INTERVAL = 1.0` 秒）读取全局主机余量与 `nvidia-smi` 的整卡空闲显存，并收取 worker 的 IPC 上报；随后从每个就绪 Stage 取有限的异质参数候选，以有界 beam search 选择主机内存和各卡显存的联合装箱计划。计划优先最小化归一化的剩余资源向量，参数距离只用于打破资源效果相近的选择；因此显存型和内存型 Stage 会共同填充资源，而不会形成全局的前序 Stage 屏障。启动前必须满足：全局可用主机内存减预留，能覆盖新 Stage 的 cgroup 合约和每个运行 worker 尚未用到的合约部分；GPU 也必须覆盖新 Stage 的显存合约及同卡 worker 尚未使用的 PyTorch 分配器合约部分。`device: []` 仍使用原有 CPU 顺序执行路径。
+默认值在 [devices.py](src/expman/devices.py) 中：主机预留 `HOST_RESERVE_KB = 1048576`（1 GiB），未知 Stage 的主机和显存峰值均为 1 GiB。每个 tick（`POLL_INTERVAL = 1.0` 秒）读取全局主机余量与 `nvidia-smi` 的整卡空闲显存，并收取 worker 的 IPC 上报；随后从每个就绪 Stage 取有限的异质参数候选，以有界 beam search 选择主机内存和各卡显存的联合装箱计划。计划优先最小化归一化的剩余资源向量，参数距离只用于打破资源效果相近的选择；因此显存型和内存型 Stage 会共同填充资源，而不会形成全局的前序 Stage 屏障。启动前必须满足：全局可用主机内存减预留，能覆盖新 Stage 的 cgroup 合约和每个运行 worker 尚未用到的合约部分；GPU 也必须覆盖新 Stage 的显存合约及同卡 worker 尚未使用的 PyTorch 分配器合约部分。
 
 每个 worker 的主机内存上限由 cgroup `memory.max` 强制为其估计峰值的 110%（保留最低启动值）。cgroup 拒绝申请或峰值接近上限时，该 Stage 以更高的下界重新估计并重试，不消耗普通失败重试次数。显存上限使用 PyTorch 的 `torch.cuda.set_per_process_memory_fraction`；不使用其分配器的运行时无法得到通用的进程级显存硬上限。成功样本均报告零 PyTorch 峰值的 Stage 仍会分配可见 GPU，但其后续任务不预留显存、也不设置 PyTorch 分配器上限。
 
@@ -300,10 +301,11 @@ python examples/multi_gpu.py --resume runs/<batch_id>
 
 ### 随机种子与随机状态恢复
 
-Experiment 启动时自动读取根部 `seed`，默认 `0`，在构造和执行 Stage 前设置 Python `random`、环境中已安装的 NumPy 全局随机生成器，以及 PyTorch CPU/CUDA 随机种子。种子必须是 `0` 到 `2**32 - 1` 的整数，不接受布尔值。嵌套配置中的同名字段由用户代码解释。缺省值不补写原配置；业务代码若需要读取种子，应在 YAML 中显式填写根部 `seed`。
+Experiment 启动时读取必填的根部 `seed`，并在构造和执行 Stage 前设置 Python `random`、环境中已安装的 NumPy 全局随机生成器，以及 PyTorch CPU/CUDA 随机种子。种子必须是 `0` 到 `2**32 - 1` 的整数，不接受布尔值。嵌套配置中的同名字段由用户代码解释。
 
 ```yaml
 seed: 42
+device: [0]
 models:
   forecasting:
     name: patchtst

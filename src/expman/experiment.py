@@ -135,7 +135,9 @@ class Experiment:
             raise TypeError("cfg must be a dictionary")
         self.pipeline = pipeline
         self._cfg = deepcopy(cfg)
-        validate_seed(self._cfg.get("seed", 0))
+        if "seed" not in self._cfg:
+            raise ValueError("seed is required")
+        validate_seed(self._cfg["seed"])
         freeze(self._cfg)
         self._run_id = uuid4().hex if run_id is None else run_id
         _name(self._run_id, "run_id")
@@ -157,7 +159,7 @@ class Experiment:
             self._store.shared = PrefixCache(
                 _cache_root,
                 pipeline.signature(),
-                self._cfg.get("seed", 0),
+                self._cfg["seed"],
                 self._store.serializer,
             )
             self._store.reads = self._reads
@@ -222,7 +224,7 @@ class Experiment:
         error_type = None
         error_message = None
         try:
-            rng = RandomStateManager(self._cfg.get("seed", 0))
+            rng = RandomStateManager(self._cfg["seed"])
             initial = self.output_dir / "rng_initial.pkl"
             if initial.exists():
                 rng.restore(read_record(initial, self._store.serializer))
@@ -276,7 +278,7 @@ class Experiment:
         status = Status.SUCCEEDED
         error_type = error_message = None
         try:
-            rng = RandomStateManager(self._cfg.get("seed", 0))
+            rng = RandomStateManager(self._cfg["seed"])
             initial = self.output_dir / "rng_initial.pkl"
             if initial.exists():
                 rng.restore(read_record(initial, self._store.serializer))

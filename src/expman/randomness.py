@@ -125,7 +125,7 @@ class RandomStateManager:
             raise StorageError(f"could not restore random state: {error}") from error
 
 
-def seed_everything(seed: int = 0) -> None:
+def seed_everything(seed: int) -> None:
     """Seed Python and installed NumPy/PyTorch global generators.
 
     Independent generators, data-loader workers and deterministic GPU algorithms

@@ -1,6 +1,5 @@
 """Durable experiment queues with bounded retries and recovery."""
 
-import gc
 import math
 import warnings
 from collections import deque
@@ -60,9 +59,11 @@ class Batch:
             )
         self.estimate_coverage = validate_coverage(estimate_coverage)
         configs = [cfg] if isinstance(cfg, dict) else load_configs(cfg)
-        for config in configs:
-            validate_seed(config.get("seed", 0))
         self.devices = configured_devices(configs)
+        for config in configs:
+            if "seed" not in config:
+                raise ValueError("seed is required")
+            validate_seed(config["seed"])
         self._active_gpu = {}
         self._stage_progress = {}
         self._stage_attempts = {}
@@ -103,7 +104,6 @@ class Batch:
         self._session_started = None
         self._last_estimate = None
         self._queue = deque(experiment.run_id for experiment in self.experiments)
-        self._active = None
         self._save()
 
     @property
@@ -134,10 +134,6 @@ class Batch:
         while not stopped.is_set():
             try:
                 try:
-                    if self.devices:
-                        with self._state_lock:
-                            pending = list(self._queue) + list(self._active_gpu)
-                        self._time_estimator.refresh_priorities(pending)
                     self._refresh_estimate(self.estimate_coverage)
                 finally:
                     self._save_timing()
@@ -169,7 +165,7 @@ class Batch:
             "max_retries": self.max_retries,
             "experiments": experiments,
             "queue": list(self._queue),
-            "active": self._active,
+            "active": None,
             "active_gpu": dict(self._active_gpu),
             "stage_progress": dict(self._stage_progress),
             "stage_attempts": dict(self._stage_attempts),
@@ -178,7 +174,7 @@ class Batch:
             "gpu_history": list(self._gpu_history),
             "estimation": {
                 "version": 1,
-                "execution": "gpu" if self.devices else "sequential",
+                "execution": "gpu",
                 "coverage": self.estimate_coverage,
             },
         }
@@ -211,12 +207,12 @@ class Batch:
         ):
             raise StorageError("unsupported or invalid batch manifest")
         estimation = manifest.get(
-            "estimation", {"version": 1, "execution": "sequential", "coverage": 0.8}
+            "estimation", {"version": 1, "execution": "gpu", "coverage": 0.8}
         )
         if (
             not isinstance(estimation, dict)
             or estimation.get("version") != 1
-            or estimation.get("execution") not in ("sequential", "gpu")
+            or estimation.get("execution") != "gpu"
         ):
             raise StorageError("unsupported estimation environment or version")
         self.estimate_coverage = validate_coverage(estimation.get("coverage"))
@@ -286,10 +282,6 @@ class Batch:
             for experiment in self.experiments
         }
         self.devices = configured_devices([item.cfg for item in experiments])
-        if bool(self.devices) != (estimation["execution"] == "gpu"):
-            raise StorageError(
-                "device configuration does not match execution environment"
-            )
         self._active_gpu = {}
         self._gpu_memory = {}
         self._host_memory = {}
@@ -326,22 +318,18 @@ class Batch:
             len(ids) != len(experiments)
             or len(set(self._queue)) != len(self._queue)
             or any(run_id not in ids for run_id in self._queue)
-            or (active is not None and (active not in ids or active in self._queue))
+            or active is not None
         ):
             raise StorageError("invalid persisted experiment queue")
         active_gpu = manifest.get("active_gpu", {})
-        if (
-            not isinstance(active_gpu, dict)
-            or any(
-                run_id not in ids
-                or run_id in self._queue
-                or (device is not None and device not in self.devices)
-                for run_id, device in active_gpu.items()
-            )
-            or (active is not None and active_gpu)
+        if not isinstance(active_gpu, dict) or any(
+            run_id not in ids
+            or run_id in self._queue
+            or (device is not None and device not in self.devices)
+            for run_id, device in active_gpu.items()
         ):
             raise StorageError("invalid persisted GPU workers")
-        interrupted = list(active_gpu) if active_gpu else ([active] if active else [])
+        interrupted = list(active_gpu)
         for active in reversed(interrupted):
             experiment = next(
                 item for item in self.experiments if item.run_id == active
@@ -357,7 +345,6 @@ class Batch:
                 )
             )
             self._queue.appendleft(active)
-        self._active = None
         self._elapsed_seconds = 0.0
         self._session_started = None
         self._last_estimate = None
@@ -413,8 +400,6 @@ class Batch:
         """Read the latest background estimate without fitting on the CLI thread."""
         with self._state_lock:
             pending = set(self._queue) | set(self._active_gpu)
-            if self._active is not None:
-                pending.add(self._active)
             if not pending:
                 return TimeEstimate(0.0, 0.0, self.estimate_coverage, 0, 0)
             if (
@@ -427,15 +412,10 @@ class Batch:
     def _refresh_estimate(self, level):
         with self._state_lock:
             pending = set(self._queue)
-            if self._active is not None:
-                pending.add(self._active)
             pending.update(self._active_gpu)
-        if self.devices:
-            from .parallel_estimation import estimate_parallel
+        from .parallel_estimation import estimate_parallel
 
-            estimate = estimate_parallel(self, level)
-        else:
-            estimate = self._time_estimator.estimate(pending, level)
+        estimate = estimate_parallel(self, level)
         with self._state_lock:
             if (
                 estimate.lower_seconds is not None
@@ -450,24 +430,6 @@ class Batch:
             ):
                 return self._last_estimate
         return estimate
-
-    def _next_experiment(self) -> str:
-        # Resume an interrupted member first. Failed attempts keep their tail retry
-        # order; information-based scheduling applies to fresh experiments.
-        by_id = {item.run_id: item for item in self.experiments}
-        if by_id[self._queue[0]].result.status is Status.CANCELLED:
-            return self._queue.popleft()
-        fresh = [run_id for run_id in self._queue if not by_id[run_id].result.attempts]
-        if not fresh:
-            return self._queue.popleft()
-        choose = (
-            self._time_estimator.choose_cached
-            if self.devices
-            else self._time_estimator.choose
-        )
-        chosen = choose(fresh, remaining_ids=list(self._queue))
-        self._queue.remove(chosen)
-        return chosen
 
     def run(
         self, *, progress: bool = True, refresh_interval: float = 1.0
@@ -497,11 +459,9 @@ class Batch:
             timing_thread.start()
             try:
                 display.start()
-                if self.devices:
-                    from .scheduling import GpuScheduler
+                from .scheduling import GpuScheduler
 
-                    return GpuScheduler(self).run()
-                return self._run_queue()
+                return GpuScheduler(self).run()
             except BaseException as caught:
                 error = caught
                 raise
@@ -523,39 +483,3 @@ class Batch:
                         RecoveryWarning,
                         stacklevel=2,
                     )
-
-    def _run_queue(self) -> tuple[ExperimentResult, ...]:
-        experiments = {experiment.run_id: experiment for experiment in self.experiments}
-        while self._queue:
-            with self._state_lock:
-                self._active = self._next_experiment()
-            experiment = experiments[self._active]
-            self._save()
-            try:
-                result = experiment.run(recorder=self.recorder)
-                experiment._release_output()
-            except BaseException:
-                with self._state_lock:
-                    self._queue.appendleft(self._active)
-                    self._active = None
-                try:
-                    self._save()
-                except Exception as error:
-                    warnings.warn(
-                        f"could not record interruption: {error}",
-                        RecoveryWarning,
-                        stacklevel=2,
-                    )
-                raise
-            if result.status is Status.FAILED:
-                gc.collect()
-                failures = sum(
-                    item.status is Status.FAILED for item in experiment.result.attempts
-                )
-                if failures <= self.max_retries:
-                    with self._state_lock:
-                        self._queue.append(experiment.run_id)
-            with self._state_lock:
-                self._active = None
-            self._save()
-        return self.results

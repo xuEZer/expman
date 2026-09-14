@@ -47,7 +47,9 @@ if __name__ == "__main__":
         batch = Batch.resume(Pipeline([Work]), root / "batch")
     else:
         cfg = root / "experiment.yaml"
-        cfg.write_text(f"device: [0, 1]\\nmarkers: {root}\\nitem: !choice [1, 2]\\n")
+        cfg.write_text(
+            f"device: [0, 1]\\nseed: 0\\nmarkers: {root}\\nitem: !choice [1, 2]\\n"
+        )
         batch = Batch(Pipeline([Work]), cfg, output_dir=root / "batch")
     results = batch.run(refresh_interval=0.02)
     expected = random.Random(0)

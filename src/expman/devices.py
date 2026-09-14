@@ -78,14 +78,17 @@ def cuda_out_of_memory(error_type, error_message) -> bool:
 def configured_devices(configs) -> tuple[int, ...]:
     selections = []
     for cfg in configs:
-        value = cfg.get("device", [])
+        if "device" not in cfg:
+            raise ConfigError("device is required for GPU Batch scheduling")
+        value = cfg["device"]
         if (
             not isinstance(value, list)
+            or not value
             or any(type(item) is not int or item < 0 for item in value)
             or len(set(value)) != len(value)
         ):
             raise ConfigError(
-                "device must be a list of distinct nonnegative GPU indices"
+                "device must be a nonempty list of distinct nonnegative GPU indices"
             )
         selections.append(tuple(value))
     if selections and any(item != selections[0] for item in selections):

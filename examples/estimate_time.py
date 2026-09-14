@@ -1,4 +1,4 @@
-"""Display experiment-level time intervals while a sequential batch runs."""
+"""Display experiment-level time intervals while a GPU Batch runs."""
 
 from pathlib import Path
 from time import sleep

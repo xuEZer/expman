@@ -1,6 +1,5 @@
 """Conditional makespan intervals using observed concurrent experiment durations."""
 
-import os
 from collections import defaultdict
 
 from ._time_model import DurationModel, features
@@ -9,10 +8,7 @@ from .estimation import TimeEstimate, _quantile
 
 def estimate_parallel(batch, coverage):
     with batch._state_lock:
-        active = {
-            run_id: "cpu" if device is None else device
-            for run_id, device in batch._active_gpu.items()
-        }
+        active = dict(batch._active_gpu)
         queue = list(batch._queue)
         history = list(batch._gpu_history)
         running = dict(batch._gpu_running_info)
@@ -28,16 +24,11 @@ def estimate_parallel(batch, coverage):
         for device in batch.devices
     }
     capacity = {device: max(1, count) for device, count in counts.items()}
-    cpu_count = sum(device == "cpu" for device in active.values())
-    if cpu_count:
-        capacity["cpu"] = max(cpu_count, os.cpu_count() or 1)
     if host.get("tight", False) or not host.get("admits_next", True):
         # Host RAM shortage, or a reserve that cannot cover one more attempt of
         # the largest peak on record, pauses every launch and sheds running
         # attempts, so the forecast keeps only the slots already occupied.
         capacity = {device: count for device, count in counts.items() if count}
-        if cpu_count:
-            capacity["cpu"] = cpu_count
     if not capacity:
         return TimeEstimate(None, None, coverage, len(completed), len(pending))
     # This forecast conditions on the present slot counts. It does not assume

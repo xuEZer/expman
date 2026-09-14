@@ -333,12 +333,12 @@ Experiment 通过单调时钟测量整个尝试，运行中的起始时刻仅保
 
 每次选择新实验时，根据完整观测的回归后验，计算对剩余总成本不确定性的近似减少量。以总成本关于系数的梯度 s 和后验协方差形状 V 为基础，候选 x 的评分为 `(sᵀ V x)² / (1 + xᵀ V x)`。这是调度启发式；删失观测不冒充完整样本来计算该闭式评分。冷启动与评分相同时，使用到已尝试配置的距离鼓励覆盖新取值，最终以配置顺序稳定打破平局。信息调度应用于首次执行成员；取消成员优先恢复，失败成员仍在新实验之后按原队尾顺序重试。
 
-执行环境为 `sequential` 或 `gpu`，估计配置版本和环境类型保存到清单，旧清单默认按顺序执行处理，未知版本/环境拒绝加载。模型仅使用当前 Batch 的记录，不自动跨机器校准；外部资源竞争、未来额外失败和停机/人工等待未单独建模。
+执行环境固定为 `gpu`，估计配置版本和环境类型保存到清单；旧的顺序执行清单和未知版本/环境拒绝加载。模型仅使用当前 Batch 的记录，不自动跨机器校准；外部资源竞争、未来额外失败和停机/人工等待未单独建模。
 
 
 ## 多卡进程调度
 
-YAML 顶层 `device` 是 Batch 级的非负、不重复 NVIDIA GPU 编号列表，所有展开成员一致；不接受 `!choice`。省略或空列表继续 CPU 顺序执行。GPU 分配不改写只读 `ctx.cfg`；子进程启动前用 GPU UUID 设置 `CUDA_VISIBLE_DEVICES`，同一实验只使用一张卡。
+YAML 顶层 `device` 是 Batch 级必填的非空、非负且不重复的 NVIDIA GPU 编号列表，所有展开成员一致；不接受 `!choice`。GPU 分配不改写只读 `ctx.cfg`；子进程启动前用 GPU UUID 设置 `CUDA_VISIBLE_DEVICES`，同一实验只使用一张卡。
 
 `GpuScheduler` 在主进程持有 Batch 锁并管理多个独立解释器；单个实验的每次尝试使用新的进程组。bootstrap 先安装父进程 EOF 监听，再导入用户模块和反序列化 Pipeline/Serializer。入口脚本的顶层 Stage 可复用，主入口必须有 main guard；局部类和闭包不满足默认进程传输契约。工作进程持有实验目录锁，避免同一实验快照被两个执行者写入。
 
@@ -355,7 +355,7 @@ YAML 顶层 `device` 是 Batch 级的非负、不重复 NVIDIA GPU 编号列表�
 
 ## 随机数生命周期
 
-根部 `seed` 是 run 级框架参数，缺省值 0，只接受 uint32 范围整数，不向原配置补写字段。Batch 在创建目录前验证每份配置，Experiment 也独立验证。`RandomStateManager` 在尝试开始时加载 Python、NumPy/PyTorch；首次执行设种子并原子保存 rng_initial.pkl，之后的尝试读取该记录。依赖损坏等导入错误继续传播。GPU 子进程已在导入这些库前绑定可见设备。
+根部 `seed` 是 run 级必填框架参数，只接受 uint32 范围整数。Batch 在创建目录前验证每份配置，Experiment 也独立验证。`RandomStateManager` 在尝试开始时加载 Python、NumPy/PyTorch；首次执行设种子并原子保存 rng_initial.pkl，之后的尝试读取该记录。依赖损坏等导入错误继续传播。GPU 子进程已在导入这些库前绑定可见设备。
 
 RunStore 的运行期 rng 服务负责为完成快照/checkpoint 加入独立 rng_state 字段。状态包含格式版本、有效 seed、Python 状态、NumPy 全局状态（普通标量/列表）、PyTorch CPU/CUDA 状态（bytes 列表）；不放进 ctx.state，不将库模块或运行期管理器序列化。公开 seed_everything() 提供相同的初始化行为。
 

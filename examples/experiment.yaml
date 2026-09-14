@@ -1,4 +1,5 @@
 seed: !choice [0, 1]
+device: [0]
 
 models:
   imputation: !choice
