@@ -24,16 +24,11 @@ PLAN_CANDIDATES_PER_STAGE = 32
 PLAN_BEAM_WIDTH = 128
 
 
-@dataclass
 class HostGate:
-    """Admission for host RAM, which every worker process shares."""
-
-    mem_block: bool = False
+    """Admission from the current host-memory observation only."""
 
     def can_launch(self, host, running):
-        if host is None or host.tight:
-            return False
-        return not self.mem_block or not running
+        return not (host is None or host.tight)
 
 
 @dataclass
@@ -113,6 +108,15 @@ class GpuScheduler:
         self.peaks = PeakEstimator.from_batch(batch)
         self._stage_peak_models = {}
         self._stage_duration_models = {}
+        # Progress rendering and ETA calculation both ask for Stage groups often.
+        # A group is determined by the configuration plus the dependency paths
+        # discovered from completed Stages; recomputing those paths by scanning the
+        # complete history for every rendered row made the presentation threads
+        # contend with dispatch on large Batches.  Keep an incremental index instead.
+        self._stage_paths_cache = {}
+        self._stage_group_cache = {}
+        self._stage_history_seen = 0
+        self._sync_stage_groups()
         batch._scheduler = self
         self._probe_pending = not any(
             experiment.result.attempts for experiment in batch.experiments
@@ -126,29 +130,65 @@ class GpuScheduler:
         the upstream value is reusable.  Current-Stage reads join that prefix as
         soon as the first sample supplies them.
         """
-        paths = set()
-        for entry in self.batch._stage_history:
-            if entry.get("stage", -1) > stage_index:
+        self._sync_stage_groups()
+        return set(self._stage_paths_cache.get(stage_index, ()))
+
+    def _sync_stage_groups(self):
+        """Incorporate newly recorded dependencies into the reusable-group index."""
+        history = self.batch._stage_history
+        if len(history) < self._stage_history_seen:
+            # Tests and recovery tooling may replace history wholesale.  Rebuild
+            # rather than retaining identities derived from a discarded record.
+            self._stage_paths_cache.clear()
+            self._stage_group_cache.clear()
+            self._stage_history_seen = 0
+        stage_count = len(self.batch.experiments[0].pipeline.stages)
+        for entry in history[self._stage_history_seen :]:
+            source_stage = entry.get("stage")
+            if not isinstance(source_stage, int):
                 continue
-            for dependency in entry.get("dependencies") or ():
-                if isinstance(dependency, tuple) and len(dependency) == 2:
-                    path, _digest = dependency
-                    if isinstance(path, tuple):
-                        paths.add(path)
-        return paths
+            paths = {
+                path
+                for dependency in entry.get("dependencies") or ()
+                if isinstance(dependency, tuple)
+                and len(dependency) == 2
+                and isinstance((path := dependency[0]), tuple)
+            }
+            if not paths:
+                continue
+            # A Stage consumes every preceding output, so a new read at Stage S
+            # changes the identity of S and each later Stage, but never an earlier
+            # one.
+            for stage_index in range(max(0, source_stage), stage_count):
+                known = self._stage_paths_cache.setdefault(stage_index, set())
+                if not paths.issubset(known):
+                    known.update(paths)
+                    self._stage_group_cache.pop(stage_index, None)
+        self._stage_history_seen = len(history)
+
+    def _append_stage_history(self, entry):
+        """Record one Stage result and refresh only affected group identities."""
+        self.batch._stage_history.append(entry)
+        self._sync_stage_groups()
 
     def _stage_group(self, run_id, stage_index):
         """Return the reusable work identity of one top-level Stage."""
+        self._sync_stage_groups()
+        cached = self._stage_group_cache.setdefault(stage_index, {})
+        if run_id in cached:
+            return cached[run_id]
         experiment = next(
             item for item in self.batch.experiments if item.run_id == run_id
         )
         config = experiment._cfg
         paths = sorted(self._stage_paths(stage_index), key=repr)
-        return (
+        group = (
             stage_index,
             config_observation(config, ("seed",)),
             tuple((path, config_observation(config, path)) for path in paths),
         )
+        cached[run_id] = group
+        return group
 
     def _remaining_stage_groups(self, queue, running):
         """Return one representative for every not-yet-materialized Stage group."""
@@ -178,6 +218,29 @@ class GpuScheduler:
                 if group not in completed and group not in groups:
                     groups[group] = (run_id, stage_index)
         return groups, set(active)
+
+    def stage_completion(self):
+        """Return completed and total reusable parameter groups per Stage."""
+        if self._probe_pending:
+            return None
+        totals = {}
+        for experiment in self.batch.experiments:
+            for stage_index in range(len(experiment.pipeline.stages)):
+                totals.setdefault(stage_index, set()).add(
+                    self._stage_group(experiment.run_id, stage_index)
+                )
+        completed = {stage_index: set() for stage_index in totals}
+        for entry in self.batch._stage_history:
+            if entry.get("status") != Status.SUCCEEDED.value:
+                continue
+            run_id, stage_index = entry.get("run_id"), entry.get("stage")
+            if not isinstance(run_id, str) or stage_index not in completed:
+                continue
+            completed[stage_index].add(self._stage_group(run_id, stage_index))
+        return tuple(
+            (stage_index, len(completed[stage_index]), len(groups))
+            for stage_index, groups in sorted(totals.items())
+        )
 
     def _stage_vectors(self, stage_index):
         """Encode only the rolling dependency prefix of a Stage's inputs."""
@@ -499,23 +562,18 @@ class GpuScheduler:
         return memory, host
 
     def _relieve(self, memory, host):
-        """Hold blocked cards and shed the newest attempt of each tight resource."""
+        """Shed one worker for this tick's host-memory pressure."""
         if host is None:
-            # Without a reading the host cannot be assumed to have room, so this
-            # checks as host memory shortage: block launches and drop one attempt.
-            self.host_gate.mem_block = True
+            # Without a reading the host cannot be assumed to have room. A later
+            # healthy reading immediately reopens admission.
             if self.workers:
                 self._shed(self._newest())
             return
-        if host.tight:
+        if host.tight and self.workers:
             # Host RAM is shared by every worker process: drop the newest attempt
-            # globally and stop refilling any card until one of the survivors
-            # exits on its own. One attempt per tick, not one decisive sweep: the
-            # shed frees its memory by the next tick, so pressure that survives
-            # the reserve keeps shedding until the reading recovers.
-            self.host_gate.mem_block = True
-            if self.workers:
-                self._shed(self._newest())
+            # globally. One attempt per tick, not one decisive sweep: a healthy
+            # reading on the next tick permits greedy refilling immediately.
+            self._shed(self._newest())
 
     def _newest(self):
         return max(self.workers, key=lambda run_id: self.workers[run_id].started)
@@ -705,7 +763,7 @@ class GpuScheduler:
                 )
                 self.batch._stage_attempts[f"{run_id}:{stage_index}"] = attempt
                 self.batch._queue.remove(run_id)
-                self.batch._stage_history.append(
+                self._append_stage_history(
                     {
                         "run_id": run_id,
                         "stage": stage_index,
@@ -979,7 +1037,7 @@ class GpuScheduler:
                             report.get("stage"), int
                         ):
                             continue
-                        self.batch._stage_history.append(
+                        self._append_stage_history(
                             {
                                 "run_id": run_id,
                                 "stage": report["stage"],
@@ -1048,7 +1106,7 @@ class GpuScheduler:
                 "reused": worker.reused,
                 "dependencies": worker.dependencies,
             }
-            self.batch._stage_history.append(observation)
+            self._append_stage_history(observation)
             self._stage_peak_models.pop((worker.stage_index, "peak_kb"), None)
             self._stage_peak_models.pop((worker.stage_index, "gpu_peak_kb"), None)
             self._stage_duration_models.pop(worker.stage_index, None)
@@ -1101,9 +1159,6 @@ class GpuScheduler:
                         error_message=result.error_message,
                     )
                 )
-            if cancelled != "MemoryPressure" and not capped:
-                # A natural exit frees host pressure for subsequent admission.
-                self.host_gate.mem_block = False
             self.batch._save()
 
     def run(self):

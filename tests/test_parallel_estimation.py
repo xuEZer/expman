@@ -1,8 +1,10 @@
+import io
 import tempfile
 import unittest
 from pathlib import Path
 
 from expman import Batch, Pipeline, Stage, Status
+from expman.progress import BatchProgress
 from expman.scheduling import GpuScheduler
 
 
@@ -46,6 +48,7 @@ class ParallelEstimationTests(unittest.TestCase):
                 ]
             )
             scheduler = GpuScheduler(batch)
+            scheduler._probe_pending = False
 
             estimate = batch.estimate()
 
@@ -53,9 +56,14 @@ class ParallelEstimationTests(unittest.TestCase):
             # Stage 1 still needs one representative for item=1 and item=2.
             self.assertEqual(estimate.lower_seconds, 40.0)
             self.assertEqual(estimate.upper_seconds, 40.0)
+            self.assertEqual(str(estimate), "00:00:01")
             self.assertEqual(estimate.completed_samples, 2)
             self.assertEqual(estimate.remaining_experiments, 2)
             self.assertIs(batch._scheduler, scheduler)
+            progress = BatchProgress(batch, enabled=True, interval=1)
+            progress.stream = io.StringIO()
+            progress._render()
+            self.assertIn("Stage0:1/1 Stage1:1/3", progress.stream.getvalue())
 
 
 if __name__ == "__main__":

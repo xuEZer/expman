@@ -247,6 +247,28 @@ class GpuSchedulingTests(unittest.TestCase):
 
         self.assertEqual(len(candidates), 1)
 
+    def test_new_dependency_invalidates_cached_stage_groups(self):
+        batch = self.make_batch(count=2, devices=[0])
+        scheduler = GpuScheduler(batch)
+        first, second = (item.run_id for item in batch.experiments)
+
+        self.assertEqual(
+            scheduler._stage_group(first, 0), scheduler._stage_group(second, 0)
+        )
+        scheduler._append_stage_history(
+            {
+                "run_id": first,
+                "stage": 0,
+                "status": Status.SUCCEEDED.value,
+                "dependencies": [(("item",), "sample")],
+            }
+        )
+
+        self.assertEqual(scheduler._stage_paths(0), {("item",)})
+        self.assertNotEqual(
+            scheduler._stage_group(first, 0), scheduler._stage_group(second, 0)
+        )
+
     def test_probe_uses_the_largest_currently_allocatable_resources(self):
         batch = self.make_batch(count=1, devices=[0, 1])
         scheduler = GpuScheduler(batch)
@@ -413,7 +435,7 @@ class GpuSchedulingTests(unittest.TestCase):
         memory = {0: DeviceMemory("GPU-test-0", 1000, 5)}
         host = HostMemory(64 * 1024**2, 48 * 1024**2, 0, 0)
         scheduler._relieve(memory, host)
-        self.assertFalse(scheduler.host_gate.mem_block)
+        self.assertTrue(scheduler.host_gate.can_launch(host, []))
 
     def test_host_memory_shortage_pauses_launches_until_it_recovers(self):
         batch = self.make_batch(count=1, devices=[0], delay=0.05)
@@ -431,7 +453,7 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(pressured, [0] * 5)
         self.assertEqual(results[0].status, Status.SUCCEEDED)
 
-    def test_host_memory_pressure_sheds_newest_attempt_and_holds_other_cards(self):
+    def test_host_memory_pressure_sheds_newest_attempt_and_refills_on_recovery(self):
         batch = self.make_batch(count=3, devices=[0, 1], delay=0, wait_for_release=True)
         dropped = []
         held = []
@@ -463,8 +485,8 @@ class GpuSchedulingTests(unittest.TestCase):
         # Two workers were active, so the shed worker could otherwise have been
         # replaced immediately; host pressure must hold every refill globally.
         self.assertEqual(len(cards), 2)
-        # While the surviving attempt runs, no replacement starts on any card.
-        self.assertEqual(set(held), {1})
+        # The next healthy reading refills without waiting for the survivor.
+        self.assertIn(2, held)
         result = next(item for item in results if item.run_id == dropped[0])
         self.assertEqual(result.attempts[0].status, Status.CANCELLED)
         self.assertEqual(result.attempts[0].error_type, "MemoryPressure")
@@ -617,12 +639,10 @@ class DeviceTests(unittest.TestCase):
             self.assertEqual(len(batch.experiments), 2)
             self.assertEqual(batch.devices, (0, 1))
 
-    def test_host_gate_holds_refills_until_a_card_is_free(self):
+    def test_host_gate_uses_only_the_current_observation(self):
         gate = HostGate()
         roomy = HostMemory(64 * 1024**2, 48 * 1024**2, 0, 0)
         self.assertTrue(gate.can_launch(roomy, ["a"]))
-        gate.mem_block = True
-        self.assertFalse(gate.can_launch(roomy, ["a"]))
         self.assertTrue(gate.can_launch(roomy, []))
         self.assertFalse(gate.can_launch(None, []))
 

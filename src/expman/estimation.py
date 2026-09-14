@@ -35,7 +35,7 @@ class TimeEstimate:
     calibrated: bool = False
 
     def __str__(self) -> str:
-        return f"{_clock(self.lower_seconds, upper=False)}～{_clock(self.upper_seconds, upper=True)}"
+        return _clock(self.upper_seconds, upper=True)
 
 
 def _quantile(values, probability):
