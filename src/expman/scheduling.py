@@ -12,8 +12,8 @@ from pathlib import Path
 from time import perf_counter, sleep
 
 from . import devices, limits
-from ._memory_model import PeakEstimator
-from ._time_model import DurationModel, features
+from ._memory_model import LocalQuantileEstimator, PeakEstimator
+from ._time_model import features
 from .events import Status
 from .experiment import AttemptResult, SnapshotOutput, StageResult
 from .ipc import Channel
@@ -21,23 +21,6 @@ from .storage import PickleSerializer, RecoveryWarning, write_record
 
 PLAN_CANDIDATES_PER_STAGE = 32
 PLAN_BEAM_WIDTH = 128
-
-
-@dataclass
-class Gate:
-    """One card's admission, held after a CUDA out-of-memory failure.
-
-    The block stops *adding* attempts to a card that already ran out of device
-    memory.  It is released only when another worker on that card ends normally,
-    which proves that external device pressure has changed.
-    """
-
-    gpu_block: bool = False
-
-    def can_launch(self, ratio, running):
-        # ``ratio`` is retained for API compatibility only. There is no
-        # percentage-based VRAM admission threshold anymore.
-        return not self.gpu_block
 
 
 @dataclass
@@ -117,10 +100,6 @@ class GpuScheduler:
         self.batch = batch
         self.monitor = devices.NvidiaMemory(batch.devices)
         self.host = devices.MeminfoMonitor()
-        self.gates = {
-            device: Gate(batch._gpu_blocks.get(device, False))
-            for device in batch.devices
-        }
         self.host_gate = HostGate()
         self.workers = {}
         self.last_tick = perf_counter()
@@ -178,40 +157,28 @@ class GpuScheduler:
 
     def _stage_peak(self, run_id, stage_index, field, default):
         """Lazily fit one configuration-based peak model per top-level Stage."""
-        if field == "gpu_peak_kb":
-            reported = [
-                entry.get(field)
-                for entry in self.batch._stage_history
-                if entry.get("stage") == stage_index
-                and entry.get("status") == Status.SUCCEEDED.value
-                and not entry.get("gpu_capped")
-                and isinstance(entry.get(field), (int, float))
-            ]
-            # A Stage always receives a card, but confirmed zero PyTorch use
-            # needs no VRAM reservation or allocator cap. Missing optional
-            # telemetry remains a cold-start default rather than false evidence
-            # of zero use.
-            if reported and not any(value > 0.0 for value in reported):
-                return 0.0
         key = (stage_index, field)
         model = self._stage_peak_models.get(key)
         if model is None:
             vectors, indices = self._stage_vectors(stage_index)
-            model = PeakEstimator(vectors, indices, default_kb=default)
+            model = LocalQuantileEstimator(
+                vectors,
+                indices,
+                default,
+                include_zero=field == "gpu_peak_kb",
+            )
             for entry in self.batch._stage_history:
                 if entry.get("stage") != stage_index:
                     continue
                 model.record(
-                    {
-                        "run_id": entry.get("run_id"),
-                        "peak_kb": entry.get(field),
-                        "capped": entry.get(
-                            "capped" if field == "peak_kb" else "gpu_capped", False
-                        ),
-                    }
+                    entry.get("run_id"),
+                    entry.get(field),
+                    capped=entry.get(
+                        "capped" if field == "peak_kb" else "gpu_capped", False
+                    ),
                 )
             self._stage_peak_models[key] = model
-        return model.estimate_kb(run_id)
+        return model.estimate(run_id)
 
     def _stage_duration(self, run_id, stage_index):
         """Estimate one Stage duration from its completed dependency samples.
@@ -228,7 +195,8 @@ class GpuScheduler:
             for entry in self.batch._stage_history:
                 if entry.get("stage") != stage_index:
                     continue
-                row = indices.get(entry.get("run_id"))
+                entry_run_id = entry.get("run_id")
+                row = indices.get(entry_run_id)
                 duration = entry.get("stage_duration_seconds")
                 if (
                     row is None
@@ -237,22 +205,29 @@ class GpuScheduler:
                 ):
                     continue
                 if entry.get("status") == Status.SUCCEEDED.value:
-                    completed.append((row, duration))
+                    completed.append((entry_run_id, duration))
                 elif entry.get("status") == Status.CANCELLED.value:
-                    censored.append((row, duration))
+                    censored.append((entry_run_id, duration))
             if not completed:
                 self._stage_duration_models[stage_index] = False
                 return None
-            model = DurationModel(vectors, completed, censored)
+            model = LocalQuantileEstimator(
+                vectors,
+                indices,
+                0.0,
+                quantile=self.batch.estimate_coverage,
+                # A cancelled duration is already a finite lower bound. Unlike
+                # a cgroup peak it does not need a resource retry bump.
+                margin=1.0,
+            )
+            for entry_run_id, duration in completed:
+                model.record(entry_run_id, duration)
+            for entry_run_id, duration in censored:
+                model.record(entry_run_id, duration, capped=True)
             self._stage_duration_models[stage_index] = model
         if model is False:
             return None
-        row = self._stage_vectors(stage_index)[1].get(run_id)
-        return (
-            None
-            if row is None
-            else model.upper_quantile(row, self.batch.estimate_coverage)
-        )
+        return model.estimate(run_id)
 
     @property
     def peak_ceiling(self):
@@ -263,7 +238,7 @@ class GpuScheduler:
         """Return the feature-based reservation for one pending run."""
         return self.peaks.estimate_kb(run_id)
 
-    def _stage_candidates(self, stage_index):
+    def _stage_candidates(self, stage_index, gpu_capacity_kb):
         """Return diverse ready candidates for one Stage and its own history only."""
         batch = self.batch
         run_ids = [
@@ -318,7 +293,10 @@ class GpuScheduler:
                     stage_index,
                     host_estimate,
                     limits.cap_kb(host_estimate),
-                    gpu_estimate * devices.CAPACITY_FACTOR,
+                    min(
+                        gpu_estimate * devices.CAPACITY_FACTOR,
+                        gpu_capacity_kb,
+                    ),
                     self._stage_duration(run_id, stage_index),
                     1.0 - rank / denominator,
                 )
@@ -547,14 +525,7 @@ class GpuScheduler:
     def _launch_plan(self, memory, host):
         """Choose a bounded multi-resource packing plan for this scheduler tick."""
         host_capacity, available_gpu = self._resource_left(memory, host)
-        devices_in_plan = tuple(
-            device
-            for device, gate in self.gates.items()
-            if gate.can_launch(
-                memory[device].free_ratio,
-                [worker for worker in self.workers.values() if worker.device == device],
-            )
-        )
+        devices_in_plan = tuple(memory)
         if host_capacity <= 0 or not devices_in_plan:
             return ()
         gpu_capacities = tuple(
@@ -563,8 +534,9 @@ class GpuScheduler:
         stages = sorted(
             {self.batch._stage_progress[run_id] for run_id in self.batch._queue}
         )
+        gpu_capacity_kb = min(memory[device].total * 1024 for device in devices_in_plan)
         candidates = self._interleave(
-            [self._stage_candidates(stage) for stage in stages]
+            [self._stage_candidates(stage, gpu_capacity_kb) for stage in stages]
         )
         plans = [Plan(host_capacity, gpu_capacities)]
         for candidate in candidates:
@@ -802,6 +774,24 @@ class GpuScheduler:
                     else "attempt stopped by its memory limit"
                 ),
             )
+        cuda_out_of_memory = devices.cuda_out_of_memory(
+            result.error_type, result.error_message
+        )
+        gpu_capped = cuda_out_of_memory
+        if gpu_capped and cancelled is None and result.status is not Status.SUCCEEDED:
+            # CUDA uses the same error for a process allocator limit and an
+            # external allocation refusal. Both mean this Stage needs a larger
+            # contract on its next attempt; resource admission will decide when
+            # that expanded contract fits again.
+            result = replace(
+                result,
+                status=Status.CANCELLED,
+                error_type="GpuMemoryLimit",
+                error_message=(
+                    "attempt reached its PyTorch memory limit of "
+                    f"{worker.gpu_contract_kb / 1024:.0f} MiB"
+                ),
+            )
         with self.batch._state_lock:
             experiment._active_started = None
             stage_key = f"{run_id}:{worker.stage_index}"
@@ -818,10 +808,17 @@ class GpuScheduler:
                 "stage_duration_seconds": result.duration_seconds,
                 "status": result.status.value,
                 "peak_kb": peak_kb,
-                "gpu_peak_kb": worker.gpu_peak_reserved_kb,
-                "gpu_capped": devices.cuda_out_of_memory(
-                    result.error_type, result.error_message
+                # An OOM proves the demand exceeded the attempted contract even
+                # when PyTorch could not report its final allocator counters.
+                "gpu_peak_kb": max(
+                    worker.gpu_peak_reserved_kb or 0.0,
+                    (
+                        max(worker.gpu_contract_kb, devices.GPU_PEAK_KB_DEFAULT)
+                        if gpu_capped
+                        else 0.0
+                    ),
                 ),
+                "gpu_capped": gpu_capped,
                 "capped": capped,
                 "dependencies": worker.dependencies,
             }
@@ -877,26 +874,9 @@ class GpuScheduler:
                         error_message=result.error_message,
                     )
                 )
-            out_of_memory = devices.cuda_out_of_memory(
-                result.error_type, result.error_message
-            )
-            if out_of_memory and worker.device is not None:
-                # Device memory is only known to be short once a kernel failed.
-                self.gates[worker.device].gpu_block = True
             if cancelled != "MemoryPressure" and not capped:
-                # A natural exit frees memory: release the host block, and release
-                # the card's block unless the attempt itself ran out of device
-                # memory (that block is lifted by an attempt that ends normally).
+                # A natural exit frees host pressure for subsequent admission.
                 self.host_gate.mem_block = False
-                if (
-                    not out_of_memory
-                    and result.status in (Status.SUCCEEDED, Status.FAILED)
-                    and worker.device is not None
-                ):
-                    self.gates[worker.device].gpu_block = False
-            self.batch._gpu_blocks = {
-                device: gate.gpu_block for device, gate in self.gates.items()
-            }
             self.batch._save()
 
     def run(self):
@@ -916,15 +896,6 @@ class GpuScheduler:
                 launching = self.host_gate.can_launch(host, list(self.workers))
                 if launching and memory is not None:
                     self._launch_available(memory, host)
-                if (
-                    self.batch._queue
-                    and not self.workers
-                    and all(gate.gpu_block for gate in self.gates.values())
-                ):
-                    raise RuntimeError(
-                        "all configured GPUs are blocked after CUDA out of memory; "
-                        "wait for a normal worker completion before resuming"
-                    )
                 sleep(devices.POLL_INTERVAL)
             return self.batch.results
         except BaseException:

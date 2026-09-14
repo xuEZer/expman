@@ -70,7 +70,6 @@ class Batch:
         self._stage_history = []
         self._gpu_history = []
         self._gpu_memory = {}
-        self._gpu_blocks = {}
         self._host_memory = {}
         self._gpu_running_info = {}
         self.output_dir = (
@@ -177,7 +176,6 @@ class Batch:
             "stage_elapsed": dict(self._stage_elapsed),
             "stage_history": list(self._stage_history),
             "gpu_history": list(self._gpu_history),
-            "gpu_blocks": dict(self._gpu_blocks),
             "estimation": {
                 "version": 1,
                 "execution": "gpu" if self.devices else "sequential",
@@ -294,13 +292,6 @@ class Batch:
             )
         self._active_gpu = {}
         self._gpu_memory = {}
-        blocks = manifest.get("gpu_blocks", {})
-        if not isinstance(blocks, dict) or any(
-            device not in self.devices or type(blocked) is not bool
-            for device, blocked in blocks.items()
-        ):
-            raise StorageError("invalid persisted GPU blocks")
-        self._gpu_blocks = dict(blocks)
         self._host_memory = {}
         self._gpu_running_info = {}
         history = manifest.get("gpu_history", [])

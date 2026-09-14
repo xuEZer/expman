@@ -1,34 +1,106 @@
-"""Host memory peak estimates derived from experiment configuration features.
+"""Bounded local estimates for per-Stage resource peaks.
 
-One estimate drives both admission (how much host RAM an attempt is charged) and
-the cgroup cap that enforces it. It comes from the same censored log-normal
-regression used for durations, read at a high quantile: under-estimating a peak
-costs the host, while over-estimating only costs throughput. A run stopped by its
-own cap is a right-censored observation, and raises that run's own floor to the
-peak it was seen to reach times a margin, so a refused attempt comes back with
-room to grow instead of being refused forever.
+Resource admission needs a conservative estimate, but a sparse high-dimensional
+regression can turn modest uncertainty in log space into an arbitrarily large
+number after exponentiation. The scheduler therefore uses nearby, finite
+observations from the same Stage. A capped cgroup sample is a lower bound, so it
+receives one fixed bump; it is never extrapolated into an unbounded tail.
 """
 
 from dataclasses import dataclass, field
+from math import ceil, isfinite
 
 from . import devices
-from ._time_model import DurationModel
+
+LOCAL_MIN_SAMPLES = 4
+LOCAL_NEIGHBORS = 8
+
+
+@dataclass
+class LocalQuantileEstimator:
+    """A bounded high-quantile estimate from nearby configuration samples.
+
+    ``vectors`` are feature rows for all candidate runs and ``indices`` maps a
+    run id to its row. With only a few samples the Stage-wide observations are
+    safer than a spurious feature split. Once enough samples exist, only the
+    closest configurations participate. In either case the returned value is an
+    empirical order statistic, bounded by the largest finite adjusted sample.
+    """
+
+    vectors: list
+    indices: dict
+    default: float
+    quantile: float = devices.PEAK_QUANTILE
+    margin: float = devices.PEAK_BUMP_MARGIN
+    include_zero: bool = False
+    observations: list[tuple[int, float]] = field(default_factory=list)
+    floors: dict = field(default_factory=dict)
+
+    def record(self, run_id, value, *, capped=False):
+        """Add one finite observation, applying one bounded cap retry bump."""
+        row = self.indices.get(run_id)
+        if row is None or not isinstance(value, (int, float)):
+            return
+        value = float(value)
+        if not isfinite(value) or value < 0 or (value == 0 and not self.include_zero):
+            return
+        adjusted = value * self.margin if capped else value
+        self.observations.append((row, adjusted))
+        if capped:
+            self.floors[run_id] = max(self.floors.get(run_id, 0.0), adjusted)
+
+    @staticmethod
+    def _distance(left, right):
+        # Feature rows start with an intercept, which cannot distinguish runs.
+        return sum((a - b) ** 2 for a, b in zip(left[1:], right[1:], strict=True))
+
+    def _nearby(self, row):
+        if len(self.observations) < LOCAL_MIN_SAMPLES:
+            return [value for _, value in self.observations]
+        closest = sorted(
+            self.observations,
+            key=lambda item: self._distance(row, self.vectors[item[0]]),
+        )[:LOCAL_NEIGHBORS]
+        return [value for _, value in closest]
+
+    def estimate(self, run_id):
+        """Return a finite conservative local estimate for ``run_id``."""
+        floor = self.floors.get(run_id, 0.0)
+        index = self.indices.get(run_id)
+        if index is None or not self.observations:
+            return max(self.default, floor)
+        values = sorted(self._nearby(self.vectors[index]))
+        # Higher order statistic: never interpolate below a sample when the
+        # requested percentile falls between two observations.
+        position = max(0, min(len(values) - 1, ceil(self.quantile * len(values)) - 1))
+        return max(values[position], floor)
 
 
 @dataclass
 class PeakEstimator:
-    """Per-run host memory peaks for one Batch, in kilobytes."""
+    """Per-run host-memory estimates for a Batch, in kilobytes.
+
+    This compatibility wrapper also supplies the Batch-wide ceiling used for
+    cold-start admission. Stage-level callers normally use
+    :class:`LocalQuantileEstimator` directly.
+    """
 
     vectors: list
     indices: dict
     default_kb: float = devices.HOST_PEAK_KB_DEFAULT
     quantile: float = devices.PEAK_QUANTILE
     margin: float = devices.PEAK_BUMP_MARGIN
-    observed: list = field(default_factory=list)
-    censored: list = field(default_factory=list)
-    floors: dict = field(default_factory=dict)
     ceiling_kb: float = 0.0
-    _model: object = None
+    _local: LocalQuantileEstimator = field(init=False)
+
+    def __post_init__(self):
+        self._local = LocalQuantileEstimator(
+            self.vectors,
+            self.indices,
+            self.default_kb,
+            self.quantile,
+            self.margin,
+        )
 
     @classmethod
     def from_batch(cls, batch):
@@ -38,34 +110,16 @@ class PeakEstimator:
         return estimator
 
     def record(self, entry):
-        """Fold one finished attempt's observed peak into the observations."""
-        peak = float(entry.get("peak_kb") or 0.0)
-        row = self.indices.get(entry.get("run_id"))
-        if row is None or peak <= 0:
-            return
-        self.ceiling_kb = max(self.ceiling_kb, peak)
-        if entry.get("capped"):
-            # The attempt was stopped at its cap, so the peak it reached is only a
-            # lower bound on what it needed.
-            self.censored.append((row, peak))
-            self.floors[entry["run_id"]] = max(
-                self.floors.get(entry["run_id"], 0.0), peak * self.margin
+        """Fold one finished attempt's observed peak into the local samples."""
+        peak = entry.get("peak_kb")
+        capped = bool(entry.get("capped"))
+        self._local.record(entry.get("run_id"), peak, capped=capped)
+        if isinstance(peak, (int, float)) and peak > 0:
+            self.ceiling_kb = max(
+                self.ceiling_kb,
+                float(peak) * self.margin if capped else float(peak),
             )
-        else:
-            self.observed.append((row, peak))
-        self._model = None
 
     def estimate_kb(self, run_id):
-        """Peak reserved for one run: regression upper quantile, floored by bumps.
-
-        A configuration with no observation at all falls back to the batch default,
-        which is the cold start for a whole Batch and for a run whose row is
-        unknown.
-        """
-        floor = self.floors.get(run_id, 0.0)
-        row = self.indices.get(run_id)
-        if row is None or not self.observed:
-            return max(self.default_kb, floor)
-        if self._model is None:
-            self._model = DurationModel(self.vectors, self.observed, self.censored)
-        return max(self._model.upper_quantile(row, self.quantile), floor)
+        """Return the bounded local reservation, including any retry floor."""
+        return self._local.estimate(run_id)

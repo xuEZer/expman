@@ -8,10 +8,9 @@ from pathlib import Path
 
 from .config import ConfigError
 
-# Device memory carries no ratio threshold: a card admits work until a kernel run
-# actually fails with CUDA out of memory, which then blocks further launches on
-# that card while it still has attempts running (see Gate). Signatures come from
-# PyTorch's own error type and message.
+# Device memory carries no ratio threshold: CUDA OOM is treated as evidence that
+# the Stage needs a larger next contract. Signatures come from PyTorch's own
+# error type and message.
 CUDA_OOM_TYPE = "OutOfMemoryError"
 CUDA_OOM_MARKERS = (
     "CUDA out of memory",
@@ -32,7 +31,7 @@ HOST_PEAK_KB_DEFAULT = 1024 * 1024
 # samples that never report PyTorch CUDA usage will subsequently receive no GPU
 # contract and can run without occupying a card.
 GPU_PEAK_KB_DEFAULT = 1024 * 1024
-# Level of the log-normal peak regression used for admission. A high quantile
+# Empirical percentile of nearby Stage samples used for admission. It is high
 # because the reserve has to bound the next attempt, not describe the average one.
 PEAK_QUANTILE = 0.9
 # A run stopped by its own cgroup cap comes back with this much more than the peak
@@ -69,12 +68,7 @@ class MemoryObservationError(RuntimeError):
 
 
 def cuda_out_of_memory(error_type, error_message) -> bool:
-    """Whether a failed attempt ran out of device memory.
-
-    Device memory is only observed after the fact: the reading cannot predict what
-    the next kernel will ask for, so the first real allocation failure is what tells
-    the scheduler a card has no room left.
-    """
+    """Whether a failed attempt exceeded the CUDA memory available to it."""
     if error_type == CUDA_OOM_TYPE and "out of memory" in (error_message or "").lower():
         return True
     message = error_message or ""

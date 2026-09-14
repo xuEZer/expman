@@ -22,7 +22,7 @@ from expman.devices import (
     fits_reserve,
     nvidia_smi,
 )
-from expman.scheduling import Gate, GpuScheduler, HostGate
+from expman.scheduling import GpuScheduler, HostGate
 
 IMPORT_DEVICE = os.environ.get("CUDA_VISIBLE_DEVICES")
 
@@ -216,6 +216,17 @@ class GpuSchedulingTests(unittest.TestCase):
             0.0,
         )
 
+    def test_gpu_contract_never_exceeds_physical_card_capacity(self):
+        batch = self.make_batch(count=2, devices=[0])
+        scheduler = GpuScheduler(batch)
+        capacity_kb = 3 * 1024
+
+        with patch.object(scheduler, "_stage_peak", return_value=100 * capacity_kb):
+            candidates = scheduler._stage_candidates(0, capacity_kb)
+
+        self.assertTrue(candidates)
+        self.assertTrue(all(item.gpu_contract_kb == capacity_kb for item in candidates))
+
     def test_tick_greedily_fills_a_card(self):
         batch = self.make_batch(count=4, devices=[0])
         scheduler = GpuScheduler(batch)
@@ -340,21 +351,13 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(attempt.output["device"], "GPU-test-0")
         self.assertEqual(result.output["device"], "GPU-test-0")
 
-    def test_cuda_oom_block_allows_only_existing_work_until_normal_exit(self):
-        gate = Gate()
-        self.assertTrue(gate.can_launch(0.005, ["running"]))
-        gate.gpu_block = True
-        self.assertFalse(gate.can_launch(0.99, ["running"]))
-        self.assertFalse(gate.can_launch(0.99, []))
-
     def test_low_vram_ratio_alone_does_not_shed_attempts(self):
         batch = self.make_batch(count=1, devices=[0], delay=0)
         scheduler = GpuScheduler(batch)
-        scheduler.gates[0].gpu_block = False
         memory = {0: DeviceMemory("GPU-test-0", 1000, 5)}
         host = HostMemory(64 * 1024**2, 48 * 1024**2, 0, 0)
         scheduler._relieve(memory, host)
-        self.assertFalse(scheduler.gates[0].gpu_block)
+        self.assertFalse(scheduler.host_gate.mem_block)
 
     def test_host_memory_shortage_pauses_launches_until_it_recovers(self):
         batch = self.make_batch(count=1, devices=[0], delay=0.05)
@@ -586,14 +589,6 @@ class DeviceTests(unittest.TestCase):
             batch = Batch(Pipeline([]), cfg, output_dir=root / "batch")
             self.assertEqual(len(batch.experiments), 2)
             self.assertEqual(batch.devices, (0, 1))
-
-    def test_gate_ignores_ratio_and_empty_card_fallback(self):
-        gate = Gate()
-        self.assertTrue(gate.can_launch(0.01, ["a"]))
-        self.assertTrue(gate.can_launch(0.009, ["a"]))
-        gate.gpu_block = True
-        self.assertFalse(gate.can_launch(0.9, ["a"]))
-        self.assertFalse(gate.can_launch(0.9, []))
 
     def test_host_gate_holds_refills_until_a_card_is_free(self):
         gate = HostGate()
