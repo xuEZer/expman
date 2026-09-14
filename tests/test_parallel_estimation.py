@@ -1,100 +1,61 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
-from expman import Batch, Pipeline, Status
-from expman.experiment import AttemptResult
-from expman.parallel_estimation import estimate_parallel
+from expman import Batch, Pipeline, Stage, Status
+from expman.scheduling import GpuScheduler
+
+
+class First(Stage):
+    def process(self, data, ctx):
+        return data
+
+
+class Second(Stage):
+    def process(self, data, ctx):
+        return ctx.cfg["item"]
 
 
 class ParallelEstimationTests(unittest.TestCase):
-    def make_batch(self, root, devices):
-        cfg = root / "cfg.yaml"
-        cfg.write_text(f"device: {devices}\nseed: 0\nitem: !choice [0, 1, 2]\n")
-        batch = Batch(Pipeline([]), cfg, output_dir=root / "batch")
-        first = batch.experiments[0]
-        first._attempts.append(AttemptResult(first.run_id, 1, Status.SUCCEEDED, 10))
-        batch._gpu_history.append(
-            {
-                "run_id": first.run_id,
-                "attempt": 1,
-                "device": 0,
-                "uuid": "GPU-0",
-                "concurrency": 1,
-                "duration": 10,
-            }
-        )
-        batch._queue.remove(first.run_id)
-        batch._gpu_memory = dict.fromkeys(devices, 0.9)
-        return batch
-
-    def test_makespan_uses_individual_active_predictions(self):
-        for devices, expected in (([0], 200), ([0, 1], 100)):
-            with (
-                self.subTest(devices=devices),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                batch = self.make_batch(Path(temporary), devices)
-                second, third = batch.experiments[1:]
-                batch._active_gpu[second.run_id] = 0
-                batch._queue.remove(second.run_id)
-                if len(devices) == 2:
-                    batch._active_gpu[third.run_id] = 1
-                    batch._queue.remove(third.run_id)
-                with patch(
-                    "expman.parallel_estimation.DurationModel.draws",
-                    return_value=iter([[100, 100]]),
-                ):
-                    estimate = estimate_parallel(batch, 0.8)
-                self.assertEqual(estimate.lower_seconds, expected)
-                self.assertEqual(estimate.upper_seconds, expected)
-                self.assertFalse(estimate.calibrated)
-
-    def test_no_available_card_leaves_wait_time_unknown(self):
+    def test_eta_counts_only_unmaterialized_stage_parameter_groups(self):
         with tempfile.TemporaryDirectory() as temporary:
-            batch = self.make_batch(Path(temporary), [0])
-            batch._gpu_memory = {0: 0.005}
-            self.assertIsNotNone(batch.estimate().upper_seconds)
+            root = Path(temporary)
+            cfg = root / "cfg.yaml"
+            cfg.write_text("device: [0]\nseed: 0\nitem: !choice [0, 1, 2]\n")
+            batch = Batch(Pipeline([First, Second]), cfg, output_dir=root / "batch")
+            first = batch.experiments[0]
+            batch._queue.remove(first.run_id)
+            batch._stage_history.extend(
+                [
+                    {
+                        "run_id": first.run_id,
+                        "stage": 0,
+                        "status": Status.SUCCEEDED.value,
+                        "reused": False,
+                        "stage_duration_seconds": 10.0,
+                        "dependencies": [],
+                    },
+                    {
+                        "run_id": first.run_id,
+                        "stage": 1,
+                        "status": Status.SUCCEEDED.value,
+                        "reused": False,
+                        "stage_duration_seconds": 20.0,
+                        "dependencies": [(("item",), "sample")],
+                    },
+                ]
+            )
+            scheduler = GpuScheduler(batch)
 
-    def test_host_memory_pressure_keeps_only_the_occupied_slots(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            batch = self.make_batch(Path(temporary), [0, 1])
-            second = batch.experiments[1]
-            batch._active_gpu[second.run_id] = 0
-            batch._queue.remove(second.run_id)
-            with patch(
-                "expman.parallel_estimation.DurationModel.draws",
-                return_value=iter([[100, 100]]),
-            ):
-                estimate = estimate_parallel(batch, 0.8)
-            self.assertEqual(estimate.upper_seconds, 100)
-            batch._host_memory = {"tight": True}
-            with patch(
-                "expman.parallel_estimation.DurationModel.draws",
-                return_value=iter([[100, 100]]),
-            ):
-                pressured = estimate_parallel(batch, 0.8)
-            # The free card gets no slot, so the queued experiment waits for the
-            # running one instead of starting beside it.
-            self.assertEqual(pressured.upper_seconds, 200)
-
-    def test_host_memory_pressure_without_running_work_is_unknown(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            batch = self.make_batch(Path(temporary), [0])
-            batch._host_memory = {"tight": True}
-            self.assertIsNone(batch.estimate().upper_seconds)
-
-    def test_observed_contention_is_used_as_a_model_feature(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            batch = self.make_batch(Path(temporary), [0, 1])
-            second = batch.experiments[1]
-            batch._active_gpu[second.run_id] = 1
-            batch._queue.remove(second.run_id)
             estimate = batch.estimate()
-            self.assertEqual(estimate.completed_samples, 1)
+
+            # Stage 0 has one config-independent cache group, already completed.
+            # Stage 1 still needs one representative for item=1 and item=2.
+            self.assertEqual(estimate.lower_seconds, 40.0)
+            self.assertEqual(estimate.upper_seconds, 40.0)
+            self.assertEqual(estimate.completed_samples, 2)
             self.assertEqual(estimate.remaining_experiments, 2)
-            self.assertGreaterEqual(estimate.upper_seconds, estimate.lower_seconds)
+            self.assertIs(batch._scheduler, scheduler)
 
 
 if __name__ == "__main__":

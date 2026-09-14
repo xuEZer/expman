@@ -14,6 +14,7 @@ from time import perf_counter, sleep
 from . import devices, limits
 from ._memory_model import LocalQuantileEstimator, PeakEstimator
 from ._time_model import features
+from .dependencies import observation as config_observation
 from .events import Status
 from .experiment import AttemptResult, SnapshotOutput, StageResult
 from .ipc import Channel
@@ -43,7 +44,7 @@ class Worker:
     uuid: str | None
     root: Path
     started: float
-    stage_index: int = 0
+    stage_index: int | None = 0
     stage_attempt: int = 1
     channel: Channel | None = None
     gpu_contract_kb: float = 0.0
@@ -62,6 +63,9 @@ class Worker:
     memory_events: dict = field(default_factory=dict)
     finished: StageResult | None = None
     dependencies: list | None = None
+    stage_reports: list | None = None
+    reused: bool = False
+    probe: bool = False
     cap_hit: bool = False
 
 
@@ -109,6 +113,10 @@ class GpuScheduler:
         self.peaks = PeakEstimator.from_batch(batch)
         self._stage_peak_models = {}
         self._stage_duration_models = {}
+        batch._scheduler = self
+        self._probe_pending = not any(
+            experiment.result.attempts for experiment in batch.experiments
+        )
 
     def _stage_paths(self, stage_index):
         """Return the rolling configuration dependencies for one top-level Stage.
@@ -128,6 +136,48 @@ class GpuScheduler:
                     if isinstance(path, tuple):
                         paths.add(path)
         return paths
+
+    def _stage_group(self, run_id, stage_index):
+        """Return the reusable work identity of one top-level Stage."""
+        experiment = next(
+            item for item in self.batch.experiments if item.run_id == run_id
+        )
+        config = experiment._cfg
+        paths = sorted(self._stage_paths(stage_index), key=repr)
+        return (
+            stage_index,
+            config_observation(config, ("seed",)),
+            tuple((path, config_observation(config, path)) for path in paths),
+        )
+
+    def _remaining_stage_groups(self, queue, running):
+        """Return one representative for every not-yet-materialized Stage group."""
+        completed = {
+            self._stage_group(entry["run_id"], entry["stage"])
+            for entry in self.batch._stage_history
+            if (
+                entry.get("status") == Status.SUCCEEDED.value
+                and isinstance(entry.get("run_id"), str)
+                and isinstance(entry.get("stage"), int)
+            )
+        }
+        active = {}
+        for run_id, details in running.items():
+            stage_index = details.get("stage_index")
+            if details.get("probe") or not isinstance(stage_index, int):
+                return None
+            active[self._stage_group(run_id, stage_index)] = (run_id, stage_index)
+        groups = dict(active)
+        for run_id in queue:
+            start = self.batch._stage_progress[run_id]
+            experiment = next(
+                item for item in self.batch.experiments if item.run_id == run_id
+            )
+            for stage_index in range(start, len(experiment.pipeline.stages)):
+                group = self._stage_group(run_id, stage_index)
+                if group not in completed and group not in groups:
+                    groups[group] = (run_id, stage_index)
+        return groups, set(active)
 
     def _stage_vectors(self, stage_index):
         """Encode only the rolling dependency prefix of a Stage's inputs."""
@@ -168,7 +218,7 @@ class GpuScheduler:
                 include_zero=field == "gpu_peak_kb",
             )
             for entry in self.batch._stage_history:
-                if entry.get("stage") != stage_index:
+                if entry.get("stage") != stage_index or entry.get("reused"):
                     continue
                 model.record(
                     entry.get("run_id"),
@@ -193,7 +243,7 @@ class GpuScheduler:
             completed = []
             censored = []
             for entry in self.batch._stage_history:
-                if entry.get("stage") != stage_index:
+                if entry.get("stage") != stage_index or entry.get("reused"):
                     continue
                 entry_run_id = entry.get("run_id")
                 row = indices.get(entry_run_id)
@@ -246,13 +296,31 @@ class GpuScheduler:
             for run_id in batch._queue
             if batch._stage_progress[run_id] == stage_index
         ]
+        if not self._probe_pending:
+            # Dependency groups are known after the complete-pipeline probe.
+            # Keep exactly one representative runnable; cache materialization
+            # advances every other member once that representative finishes.
+            representatives = {}
+            for run_id in run_ids:
+                group = self._stage_group(run_id, stage_index)
+                previous = representatives.get(group)
+                if previous is None or (
+                    f"{run_id}:{stage_index}" in batch._stage_attempts
+                    and f"{previous}:{stage_index}" not in batch._stage_attempts
+                ):
+                    representatives[group] = run_id
+            run_ids = list(representatives.values())
         if not run_ids:
             return []
         vectors, indices = self._stage_vectors(stage_index)
         sampled = [
             indices[entry["run_id"]]
             for entry in batch._stage_history
-            if entry.get("stage") == stage_index and entry.get("run_id") in indices
+            if (
+                entry.get("stage") == stage_index
+                and not entry.get("reused")
+                and entry.get("run_id") in indices
+            )
         ]
 
         def novelty(run_id):
@@ -330,6 +398,8 @@ class GpuScheduler:
                     "concurrency": worker.area / max(now - worker.started, 1e-9),
                     "duration": max(0.0, now - worker.started),
                     "expected_seconds": worker.expected_seconds,
+                    "stage_index": worker.stage_index,
+                    "probe": worker.probe,
                     "resident_kb": worker.resident_kb,
                     "peak_kb": worker.peak_kb,
                     "gpu_allocated_kb": worker.gpu_allocated_kb,
@@ -352,12 +422,17 @@ class GpuScheduler:
                 self.batch.recorder.record(message["event"])
             elif kind == "resource":
                 self._resources(worker, message)
-            elif kind == "finished" and isinstance(message.get("result"), StageResult):
+            elif kind == "finished" and isinstance(
+                message.get("result"), (StageResult, AttemptResult)
+            ):
                 worker.finished = message["result"]
                 dependencies = message.get("dependencies")
                 worker.dependencies = (
                     dependencies if isinstance(dependencies, list) else None
                 )
+                worker.reused = message.get("reused") is True
+                reports = message.get("stage_reports")
+                worker.stage_reports = reports if isinstance(reports, list) else None
                 resources = message.get("resources")
                 if isinstance(resources, dict):
                     self._resources(worker, resources)
@@ -572,14 +647,103 @@ class GpuScheduler:
         for candidate, device in self._launch_plan(memory, host):
             self._launch(device, memory[device], host, candidate)
 
-    def _launch(self, device, memory, host, candidate):
+    def _probe_candidate(self, memory, host):
+        """Give the dependency probe this tick's entire allocatable capacity."""
+        device, observation = max(memory.items(), key=lambda item: item[1].free)
+        host_estimate = host.headroom_kb / devices.CAPACITY_FACTOR
+        host_contract = limits.cap_kb(host_estimate)
+        # ``cap_kb`` has a startup floor.  Do not let that floor turn a tiny
+        # headroom into an overcommitted probe.
+        if host_contract > host.headroom_kb:
+            return None
+        return device, Candidate(
+            self.batch._queue[0],
+            0,
+            host_estimate,
+            host_contract,
+            observation.free * 1024,
+            None,
+            1.0,
+        )
+
+    def _materialize_reuses(self):
+        """Advance cache-equivalent Stage members without creating a worker."""
+        changed = False
+        while True:
+            advanced = False
+            for run_id in list(self.batch._queue):
+                experiment = next(
+                    item for item in self.batch.experiments if item.run_id == run_id
+                )
+                stage_index = self.batch._stage_progress[run_id]
+                store = experiment._store
+                shared = store.shared
+                if shared is None:
+                    continue
+                parent = "root"
+                if stage_index:
+                    parent_ref = store.completed_reference((stage_index - 1,))
+                    if parent_ref is None:
+                        continue
+                    parent = parent_ref[2]
+                candidate = shared.find(parent, (stage_index,), experiment._cfg)
+                if candidate is None:
+                    continue
+                reference, completed = candidate
+                attempt = (
+                    self.batch._stage_attempts.get(f"{run_id}:{stage_index}", 0) + 1
+                )
+                store.metrics.restore(run_id, attempt, completed.get("metrics", []))
+                store.reference((stage_index,), reference, reused=True)
+                store.status(
+                    (stage_index,),
+                    Status.SUCCEEDED.value,
+                    attempt,
+                    reused=True,
+                    elapsed_seconds=completed.get("elapsed_seconds"),
+                    restore_seconds=0.0,
+                )
+                self.batch._stage_attempts[f"{run_id}:{stage_index}"] = attempt
+                self.batch._queue.remove(run_id)
+                self.batch._stage_history.append(
+                    {
+                        "run_id": run_id,
+                        "stage": stage_index,
+                        "attempt": attempt,
+                        "status": Status.SUCCEEDED.value,
+                        "reused": True,
+                        "dependencies": completed.get("config_dependencies"),
+                    }
+                )
+                if stage_index == len(experiment.pipeline.stages) - 1:
+                    experiment._attempts.append(
+                        AttemptResult(
+                            run_id,
+                            len(experiment.result.attempts) + 1,
+                            Status.SUCCEEDED,
+                            self.batch._stage_elapsed[run_id],
+                            output_source=SnapshotOutput(store, (stage_index,)),
+                        )
+                    )
+                else:
+                    self.batch._stage_progress[run_id] += 1
+                    self.batch._queue.append(run_id)
+                changed = advanced = True
+                break
+            if not advanced:
+                break
+        if changed:
+            self.batch._save()
+        return changed
+
+    def _launch(self, device, memory, host, candidate, *, probe=False):
         batch = self.batch
         with batch._state_lock:
             if candidate.run_id not in batch._queue:
                 return False
             batch._queue.remove(candidate.run_id)
         run_id = candidate.run_id
-        stage_index = candidate.stage_index
+        stage_index = None if probe else candidate.stage_index
         host_estimate = candidate.host_estimate_kb
         host_contract = candidate.host_contract_kb
         gpu_contract = candidate.gpu_contract_kb
@@ -595,13 +759,16 @@ class GpuScheduler:
         with batch._state_lock:
             batch._active_gpu[run_id] = device
         experiment = next(item for item in batch.experiments if item.run_id == run_id)
-        stage_key = f"{run_id}:{stage_index}"
+        # A full-Pipeline probe is also the first execution attempt of Stage 0.
+        # If it is interrupted, Stage 0 must resume as attempt 2 so user
+        # checkpoint/retry logic does not mistake the recovery for a new run.
+        stage_key = f"{run_id}:{0 if probe else stage_index}"
         previous_stage_attempt = batch._stage_attempts.get(stage_key)
         stage_attempt = (previous_stage_attempt or 0) + 1
         root = (
             experiment.output_dir
             / "attempts"
-            / f"stage-{stage_index}"
+            / ("probe" if probe else f"stage-{stage_index}")
             / str(stage_attempt)
         )
         process = None
@@ -659,7 +826,7 @@ class GpuScheduler:
             # The unit is unique per attempt: systemd unloads a finished scope
             # asynchronously, and a retry must not collide with the previous one.
             limit = limits.memory_limit(
-                f"expman-{run_id[:12]}-{stage_index}-{stage_attempt}",
+                f"expman-{run_id[:12]}-{'probe' if probe else stage_index}-{stage_attempt}",
                 host_estimate,
             )
             if limit.cgroup is not None:
@@ -712,6 +879,7 @@ class GpuScheduler:
                 gpu_contract_kb=gpu_contract,
                 expected_seconds=duration_estimate,
                 limit=limit,
+                probe=probe,
             )
             parent_socket = None
         except BaseException:
@@ -792,6 +960,63 @@ class GpuScheduler:
                     f"{worker.gpu_contract_kb / 1024:.0f} MiB"
                 ),
             )
+        if worker.probe:
+            with self.batch._state_lock:
+                experiment._active_started = None
+                # The probe executes Stage 0 as part of the complete Pipeline.
+                # Preserve that attempt number even when the probe is interrupted:
+                # the first normal Stage-0 worker must resume as attempt 2.
+                self.batch._stage_attempts[f"{run_id}:0"] = worker.stage_attempt
+                self.batch._active_gpu.pop(run_id)
+                self.batch._gpu_running_info.pop(run_id, None)
+                del self.workers[run_id]
+                if worker.channel is not None:
+                    worker.channel.socket.close()
+                self._probe_pending = False
+                if result.status is Status.SUCCEEDED:
+                    for report in worker.stage_reports or ():
+                        if not isinstance(report, dict) or not isinstance(
+                            report.get("stage"), int
+                        ):
+                            continue
+                        self.batch._stage_history.append(
+                            {
+                                "run_id": run_id,
+                                "stage": report["stage"],
+                                "status": Status.SUCCEEDED.value,
+                                "reused": True,
+                                "probe": True,
+                                "dependencies": report.get("dependencies"),
+                            }
+                        )
+                    experiment._attempts.append(
+                        AttemptResult(
+                            run_id,
+                            len(experiment.result.attempts) + 1,
+                            Status.SUCCEEDED,
+                            duration,
+                            output_source=SnapshotOutput(
+                                experiment._store,
+                                (len(experiment.pipeline.stages) - 1,),
+                            )
+                            if experiment.pipeline.stages
+                            else None,
+                        )
+                    )
+                else:
+                    experiment._attempts.append(
+                        AttemptResult(
+                            run_id,
+                            len(experiment.result.attempts) + 1,
+                            result.status,
+                            duration,
+                            error_type=result.error_type,
+                            error_message=result.error_message,
+                        )
+                    )
+                    self.batch._queue.appendleft(run_id)
+                self.batch._save()
+            return
         with self.batch._state_lock:
             experiment._active_started = None
             stage_key = f"{run_id}:{worker.stage_index}"
@@ -820,6 +1045,7 @@ class GpuScheduler:
                 ),
                 "gpu_capped": gpu_capped,
                 "capped": capped,
+                "reused": worker.reused,
                 "dependencies": worker.dependencies,
             }
             self.batch._stage_history.append(observation)
@@ -847,7 +1073,8 @@ class GpuScheduler:
                 )
                 experiment._attempts.append(final)
                 self.batch._gpu_history.append(observation)
-                self.peaks.record(observation)
+                if not worker.reused:
+                    self.peaks.record(observation)
             elif (
                 result.status is Status.CANCELLED
                 or worker.stage_attempt <= self.batch.max_retries
@@ -895,7 +1122,16 @@ class GpuScheduler:
                 self._relieve(memory, host)
                 launching = self.host_gate.can_launch(host, list(self.workers))
                 if launching and memory is not None:
-                    self._launch_available(memory, host)
+                    if self._probe_pending and not self.workers and self.batch._queue:
+                        probe = self._probe_candidate(memory, host)
+                        if probe is not None:
+                            device, candidate = probe
+                            self._launch(
+                                device, memory[device], host, candidate, probe=True
+                            )
+                    elif not self._probe_pending:
+                        self._materialize_reuses()
+                        self._launch_available(memory, host)
                 sleep(devices.POLL_INTERVAL)
             return self.batch.results
         except BaseException:

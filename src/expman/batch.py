@@ -96,6 +96,7 @@ class Batch:
             experiment.run_id: 0.0 for experiment in self.experiments
         }
         self._time_estimator = TimeEstimator(self.experiments)
+        self._scheduler = None
         self.max_retries = max_retries
         self.recorder = InMemoryRecorder() if recorder is None else recorder
         self._state_lock = RLock()
@@ -311,6 +312,7 @@ class Batch:
             raise StorageError("invalid persisted GPU observations")
         self._gpu_history = list(history)
         self._time_estimator = TimeEstimator(self.experiments)
+        self._scheduler = None
         ids = {experiment.run_id for experiment in self.experiments}
         self._queue = deque(manifest["queue"])
         active = manifest["active"]
@@ -415,7 +417,12 @@ class Batch:
             pending.update(self._active_gpu)
         from .parallel_estimation import estimate_parallel
 
-        estimate = estimate_parallel(self, level)
+        scheduler = self._scheduler
+        estimate = (
+            TimeEstimate(None, None, level, 0, len(pending))
+            if scheduler is None
+            else estimate_parallel(scheduler, level)
+        )
         with self._state_lock:
             if (
                 estimate.lower_seconds is not None

@@ -73,25 +73,22 @@ class BatchProgress:
             pending = set(self.batch._queue)
             pending.update(self.batch._active_gpu)
             succeeded = failed = 0
-            current = None
-            for index, experiment in enumerate(self.batch.experiments, start=1):
+            for experiment in self.batch.experiments:
                 attempts, _ = experiment._timing_snapshot()
                 status = attempts[-1].status if attempts else Status.PENDING
                 succeeded += status is Status.SUCCEEDED
                 failed += status is Status.FAILED and experiment.run_id not in pending
-                if experiment.run_id in self.batch._active_gpu:
-                    current = index
             cards = " ".join(
                 f"GPU{device}:{sum(value == device for value in self.batch._active_gpu.values())}运行"
                 for device in self.batch.devices
             )
-            return len(self.batch.experiments), succeeded, failed, current, cards
+            return len(self.batch.experiments), succeeded, failed, cards
 
     def _render(self, *, label="运行中", final=False) -> None:
         if self.disabled:
             return
         try:
-            total, succeeded, failed, current, cards = self._snapshot()
+            total, succeeded, failed, cards = self._snapshot()
             try:
                 remaining = str(self.batch._display_estimate())
             except Exception:
@@ -105,16 +102,14 @@ class BatchProgress:
                 return
             completed = succeeded + failed
             percent = 100 if total == 0 else completed * 100 // total
-            position = f" | 当前 {current}/{total}" if current is not None else ""
-            if cards:
-                position += f" | {cards}"
+            cards = f" | {cards}" if cards else ""
             minutes = int(max(0, self.batch.elapsed_seconds) // 60)
             days, minutes = divmod(minutes, 24 * 60)
             hours, minutes = divmod(minutes, 60)
             elapsed = f"{days:02d}:{hours:02d}:{minutes:02d}"
             line = (
                 f"{label} {completed}/{total} ({percent}%)"
-                f" | 成功 {succeeded} 失败 {failed}{position}"
+                f" | 成功 {succeeded} 失败 {failed}{cards}"
                 f" | 已运行 {elapsed} | 剩余 {remaining}"
             )
             if not self.tty and line == self.last_line and not final:

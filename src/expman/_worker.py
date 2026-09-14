@@ -140,6 +140,20 @@ def main():
                 if stage_index is None or result.status.value != "succeeded"
                 else experiment._store.completed((stage_index,))
             )
+            stage_reports = None
+            if stage_index is None and result.status.value == "succeeded":
+                stage_reports = []
+                for index in range(len(experiment.pipeline.stages)):
+                    record = experiment._store.completed((index,))
+                    if record is None:
+                        continue
+                    stage_reports.append(
+                        {
+                            "stage": index,
+                            "dependencies": record.get("config_dependencies"),
+                            "reused": bool(record.get("_shared_reused", False)),
+                        }
+                    )
             with suppress(OSError):
                 channel.send(
                     {
@@ -149,6 +163,11 @@ def main():
                         "dependencies": None
                         if completed is None
                         else completed.get("config_dependencies"),
+                        "reused": bool(
+                            completed is not None
+                            and completed.get("_shared_reused", False)
+                        ),
+                        "stage_reports": stage_reports,
                         "resources": _resource_snapshot(_resource_cgroup()),
                     }
                 )
