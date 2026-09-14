@@ -9,28 +9,22 @@
 - **每次提交前必须通过 `ruff check .` 和 `ruff format --check .`，包括仅修改文档的提交。** 修复后重新检查，暂存确认过的改动，再提交。
 - 合并前检查变更、运行测试和示例，确认工作区没有实验数据、密钥、构建产物或本地环境文件。
 
-首次配置开发环境（在已激活的虚拟环境中执行）：
+项目使用 uv 管理唯一的锁定环境，开发工具、NumPy 和 PyTorch 都是默认依赖。首次配置执行：
 
 ```bash
-python -m pip install -e '.[dev]'
-pre-commit install --install-hooks
+uv sync
+uv run pre-commit install --install-hooks
 ```
 
-运行完整测试时安装可选后端：
-
-```bash
-python -m pip install -e '.[dev,optional]'
-```
-
-使用 uv 时，安装命令可替换为 `uv pip install -e '.[dev]'`。每次新克隆仓库或重建虚拟环境后，都需要重新安装 hook。
+每次新克隆仓库或重建环境后，都需要重新安装 hook。
 
 提交前检查：
 
 ```bash
-ruff check .
-ruff format --check .
-python -m unittest discover -s tests -v
-python examples/basic_pipeline.py
+uv run ruff check .
+uv run ruff format --check .
+uv run python -m unittest discover -s tests -v
+uv run python examples/basic_pipeline.py
 git diff --check
 git status --short
 ```
@@ -68,21 +62,20 @@ git status --short
 
 ## 完整后端验证
 
-需要验证完整功能时，使用安装了 NumPy、CUDA 版 PyTorch 且能访问实际 NVIDIA GPU 的环境运行：
+需要验证完整功能时，在可访问实际 NVIDIA GPU 的环境运行：
 
 ```bash
-python scripts/test_full.py
+uv run python scripts/test_full.py
 ```
 
 该入口执行全部测试，并将任何 skip 视为验证未完成（非零退出码）。缺少依赖、GPU 不可访问或显存不足时，修复环境后重跑；不要删除测试或取消跳过条件来获得通过。普通 unittest 命令仍可用于最小依赖环境的兼容性测试，其结果不能替代完整后端验证。
 
-当前开发机可以复用已有 CUDA 依赖，保持项目源码优先：
+当前开发机运行时也保持项目源码优先：
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 \
 CUDA_VISIBLE_DEVICES=GPU-23e616ac-ab14-91bd-71e2-ac9a8887337b \
-PYTHONPATH="$PWD/src:/home/cxz/code/SAITS/.venv/lib/python3.12/site-packages" \
-.venv/bin/python scripts/test_full.py
+uv run python scripts/test_full.py
 ```
 
-上面的依赖路径和 GPU UUID 仅适用于当前开发机；其他机器使用自己的完整测试环境。沙箱阻止 GPU 访问时，需要在获准访问 GPU 的执行环境运行。
+上面的 GPU UUID 仅适用于当前开发机；其他机器使用自己的完整测试环境。沙箱阻止 GPU 访问时，需要在获准访问 GPU 的执行环境运行。

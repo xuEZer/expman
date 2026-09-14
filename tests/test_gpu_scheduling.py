@@ -540,7 +540,7 @@ class GpuSchedulingTests(unittest.TestCase):
 
         def slow_scores(pending):
             entered.set()
-            if not release.wait(20):
+            if not release.wait(60):
                 raise RuntimeError("test did not release background computation")
 
         def run():
@@ -556,7 +556,12 @@ class GpuSchedulingTests(unittest.TestCase):
             thread.start()
             try:
                 self.assertTrue(entered.wait(3))
-                deadline = monotonic() + 10
+                # Each isolated worker initializes the default PyTorch/CUDA
+                # runtime before it reaches the Stage marker. That setup can
+                # take longer than the scheduling assertion itself on a cold
+                # driver, so wait for the observable worker outcome rather
+                # than imposing an unrelated startup-time budget.
+                deadline = monotonic() + 45
                 while (
                     len(list(self.root.glob("*.checkpoint"))) < 2
                     and monotonic() < deadline

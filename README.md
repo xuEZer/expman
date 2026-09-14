@@ -6,19 +6,15 @@
 
 ## 安装与运行
 
-在项目目录中执行：
+项目统一由 [uv](https://docs.astral.sh/uv/) 管理；运行、测试和开发使用同一个锁定环境，其中包括 NumPy、PyTorch、Ruff 和 pre-commit。先安装 uv，再在项目目录执行：
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -e .
-python examples/basic_pipeline.py
-python examples/load_experiments.py
-python examples/batch_pipeline.py
-python examples/checkpoint_pipeline.py
+uv sync
+uv run python examples/basic_pipeline.py
+uv run python examples/load_experiments.py
+uv run python examples/batch_pipeline.py
+uv run python examples/checkpoint_pipeline.py
 ```
-
-使用 uv 时，可以通过 `uv venv` 创建环境，再执行 `uv pip install -e .`。
 
 ## 定义实验阶段
 
@@ -185,11 +181,11 @@ results = batch.run()
 ## 开发
 
 ```bash
-python -m pip install -e '.[dev]'
-pre-commit install --install-hooks
-ruff check .
-ruff format --check .
-python -m unittest discover -s tests -v
+uv sync
+uv run pre-commit install --install-hooks
+uv run ruff check .
+uv run ruff format --check .
+uv run python -m unittest discover -s tests -v
 ```
 
 每次 Git 提交前必须通过 Ruff lint 和格式检查，提交 hook 会自动执行这两项检查。
@@ -280,7 +276,7 @@ GPU Batch 以**顶层 Stage**为调度单元，而不是以整个 Pipeline 为�
 
 默认值在 [devices.py](src/expman/devices.py) 中：主机预留 `HOST_RESERVE_KB = 1048576`（1 GiB），未知 Stage 的主机和显存峰值均为 1 GiB。每个 tick（`POLL_INTERVAL = 1.0` 秒）读取全局主机余量与 `nvidia-smi` 的整卡空闲显存，并收取 worker 的 IPC 上报；随后从每个就绪 Stage 取有限的异质参数候选，以有界 beam search 选择主机内存和各卡显存的联合装箱计划。计划优先最小化归一化的剩余资源向量，参数距离只用于打破资源效果相近的选择；因此显存型和内存型 Stage 会共同填充资源，而不会形成全局的前序 Stage 屏障。启动前必须满足：全局可用主机内存减预留，能覆盖新 Stage 的 cgroup 合约和每个运行 worker 尚未用到的合约部分；GPU 也必须覆盖新 Stage 的显存合约及同卡 worker 尚未使用的 PyTorch 分配器合约部分。`device: []` 仍使用原有 CPU 顺序执行路径。
 
-每个 worker 的主机内存上限由 cgroup `memory.max` 强制为其估计峰值的 110%（保留最低启动值）。cgroup 拒绝申请或峰值接近上限时，该 Stage 以更高的下界重新估计并重试，不消耗普通失败重试次数。显存上限使用可选 PyTorch 的 `torch.cuda.set_per_process_memory_fraction`；未安装 PyTorch 或不使用其分配器时无法得到通用的进程级显存硬上限。成功样本均报告零 PyTorch 峰值的 Stage 仍会分配可见 GPU，但其后续任务不预留显存、也不设置 PyTorch 分配器上限。
+每个 worker 的主机内存上限由 cgroup `memory.max` 强制为其估计峰值的 110%（保留最低启动值）。cgroup 拒绝申请或峰值接近上限时，该 Stage 以更高的下界重新估计并重试，不消耗普通失败重试次数。显存上限使用 PyTorch 的 `torch.cuda.set_per_process_memory_fraction`；不使用其分配器的运行时无法得到通用的进程级显存硬上限。成功样本均报告零 PyTorch 峰值的 Stage 仍会分配可见 GPU，但其后续任务不预留显存、也不设置 PyTorch 分配器上限。
 
 不再有显存比例门槛或 CUDA OOM 封卡。无论是 PyTorch 分配器上限还是外部竞争导致的 CUDA OOM，都会作为该 Stage 超出当前显存合约的证据：调度器以本次合约为有限下界提高下一次分配并重试。每个 tick 仍根据最新整卡空闲显存和运行 worker 尚未使用的合约部分决定可行派发；主机内存读数失败或持续紧张仍暂停新增派发并按原有规则减载最新 worker。
 
@@ -313,7 +309,7 @@ models:
     name: patchtst
 ```
 
-NumPy/PyTorch 是可选依赖，run 启动时会主动导入已安装的库，不需要用户预先 import；未安装时跳过，已安装但导入失败则正常报错。可以在库外单独调用相同的初始化函数：
+NumPy/PyTorch 包含在 uv 锁定环境中；run 启动时主动导入它们，不需要用户预先 import。手动删改环境导致导入失败时会正常报错。可以在库外单独调用相同的初始化函数：
 
 ```python
 from expman import seed_everything

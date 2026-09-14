@@ -12,12 +12,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install '.[dev]'
-      - run: ruff check .
-      - run: ruff format --check .
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
 
   test:
     runs-on: ubuntu-latest
@@ -26,26 +27,28 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install '.[optional]'
-      - run: python -m unittest discover -s tests -v
-      - run: python examples/basic_pipeline.py
-      - run: python examples/load_experiments.py
-      - run: python examples/batch_pipeline.py
-      - run: python examples/checkpoint_pipeline.py
-      - run: python examples/estimate_time.py
-      - run: python examples/multi_gpu.py
-      - run: python examples/random_state.py
-      - run: python examples/shared_prefix.py
+      - run: uv sync --locked
+      - run: uv run python -m unittest discover -s tests -v
+      - run: uv run python examples/basic_pipeline.py
+      - run: uv run python examples/load_experiments.py
+      - run: uv run python examples/batch_pipeline.py
+      - run: uv run python examples/checkpoint_pipeline.py
+      - run: uv run python examples/estimate_time.py
+      - run: uv run python examples/multi_gpu.py
+      - run: uv run python examples/random_state.py
+      - run: uv run python examples/shared_prefix.py
 
   random-backends:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install '.[optional]'
-      - run: python -m unittest discover -s tests -p test_randomness.py -v
+      - run: uv sync --locked
+      - run: uv run python -m unittest discover -s tests -p test_randomness.py -v

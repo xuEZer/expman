@@ -342,7 +342,7 @@ YAML 顶层 `device` 是 Batch 级的非负、不重复 NVIDIA GPU 编号列表�
 
 `GpuScheduler` 在主进程持有 Batch 锁并管理多个独立解释器；单个实验的每次尝试使用新的进程组。bootstrap 先安装父进程 EOF 监听，再导入用户模块和反序列化 Pipeline/Serializer。入口脚本的顶层 Stage 可复用，主入口必须有 main guard；局部类和闭包不满足默认进程传输契约。工作进程持有实验目录锁，避免同一实验快照被两个执行者写入。
 
-调度任务是一个顶层 Stage。调度器只派发尚未完成的目标 Stage；子进程在进入目标前恢复已有前缀快照，禁止隐式执行缺失的上游 Stage。完成消息携带 StageResult（状态、耗时）、该进程最终的 cgroup 内存当前值/峰值、可选 PyTorch 分配器显存当前值/峰值和配置依赖；普通 Recorder 事件也通过同一私有 socket IPC 传输。调度器每个 tick 读取全局主机与整卡显存，并消费 IPC，但不逐个查询 worker 的 `/proc` 或 cgroup；仅在 worker 已退出而 IPC 来不及报告 cgroup OOM 时读取一次该 cgroup 的事件计数。
+调度任务是一个顶层 Stage。调度器只派发尚未完成的目标 Stage；子进程在进入目标前恢复已有前缀快照，禁止隐式执行缺失的上游 Stage。完成消息携带 StageResult（状态、耗时）、该进程最终的 cgroup 内存当前值/峰值、PyTorch 分配器显存当前值/峰值和配置依赖；普通 Recorder 事件也通过同一私有 socket IPC 传输。调度器每个 tick 读取全局主机与整卡显存，并消费 IPC，但不逐个查询 worker 的 `/proc` 或 cgroup；仅在 worker 已退出而 IPC 来不及报告 cgroup OOM 时读取一次该 cgroup 的事件计数。
 
 每个顶层 Stage 使用独立的耗时、主机峰值和显存峰值模型。特征为滚动累积配置读取路径：所有上游 Stage 的依赖与当前 Stage 已观测依赖共同组成输入身份；此前缀相同即上游输入相同。无样本时以完整配置选择异质冷启动组合；有样本时从资源可行候选中选择与同 Stage 样本距离最大的配置。估计取同 Stage 最近配置的保守经验分位数，样本不足时取整个 Stage 的分位数；因此不会因稀疏高维数据向未采样区域产生无界外推。模型缓存只在新的 Stage 完成时失效，tick 的瞬时资源报告不会训练模型。
 
@@ -350,12 +350,12 @@ YAML 顶层 `device` 是 Batch 级的非负、不重复 NVIDIA GPU 编号列表�
 
 没有显存比例门槛或 CUDA OOM 的整卡 gate。CUDA OOM 无论来自 expman 自己的 PyTorch 分配器合约还是外部竞争，都代表该 Stage 超过本次显存合约；历史以本次合约为有限下界，下一次采用提高后的合约重试而不消耗用户失败次数。每 tick 使用整卡空闲显存及运行 worker 尚未使用的合约部分重新做联合装箱，因此扩大后的合约只有在资源确实可用时才派发。主机读数紧张/失败仍使用全局 HostGate 减载最新 worker。GPU UUID 变化或设备缺失属于不可恢复的一致性错误。
 
-主进程在创建 worker 前原子保存活动 Stage、Stage 尝试编号与队列状态；Stage 快照/checkpoint 和 SQLite 指标仍由子进程写入。完成 IPC 驱动主进程更新 Stage 历史、最终 ExperimentResult、设备/并发历史和队列。硬退出时父进程 EOF 监听清理进程组；resume 对活动 Stage 补记中断并从相应 Stage 重试。真实 NVIDIA 验证仍应在可访问 GPU、安装 optional PyTorch 的环境执行。
+主进程在创建 worker 前原子保存活动 Stage、Stage 尝试编号与队列状态；Stage 快照/checkpoint 和 SQLite 指标仍由子进程写入。完成 IPC 驱动主进程更新 Stage 历史、最终 ExperimentResult、设备/并发历史和队列。硬退出时父进程 EOF 监听清理进程组；resume 对活动 Stage 补记中断并从相应 Stage 重试。真实 NVIDIA 验证仍应在可访问 GPU 的 uv 环境执行。
 
 
 ## 随机数生命周期
 
-根部 `seed` 是 run 级框架参数，缺省值 0，只接受 uint32 范围整数，不向原配置补写字段。Batch 在创建目录前验证每份配置，Experiment 也独立验证。`RandomStateManager` 在尝试开始时加载 Python、已安装 NumPy/PyTorch；首次执行设种子并原子保存 rng_initial.pkl，之后的尝试读取该记录。optional import 仅忽略目标包确实不存在，传递依赖损坏等错误继续传播。GPU 子进程已在导入这些库前绑定可见设备。
+根部 `seed` 是 run 级框架参数，缺省值 0，只接受 uint32 范围整数，不向原配置补写字段。Batch 在创建目录前验证每份配置，Experiment 也独立验证。`RandomStateManager` 在尝试开始时加载 Python、NumPy/PyTorch；首次执行设种子并原子保存 rng_initial.pkl，之后的尝试读取该记录。依赖损坏等导入错误继续传播。GPU 子进程已在导入这些库前绑定可见设备。
 
 RunStore 的运行期 rng 服务负责为完成快照/checkpoint 加入独立 rng_state 字段。状态包含格式版本、有效 seed、Python 状态、NumPy 全局状态（普通标量/列表）、PyTorch CPU/CUDA 状态（bytes 列表）；不放进 ctx.state，不将库模块或运行期管理器序列化。公开 seed_everything() 提供相同的初始化行为。
 

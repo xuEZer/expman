@@ -20,7 +20,7 @@
 
 ### Added
 
-- GPU Batch 改为按顶层 Stage 派发：已完成前缀从快照恢复，Stage 通过 IPC 上报完成状态、耗时、cgroup 内存峰值、可选 PyTorch 显存峰值、Recorder 事件和配置读取依赖。按滚动依赖特征分别估计每个 Stage 的耗时、主机内存和显存峰值，并优先尝试与既有样本距离更远的可行参数组合。
+- GPU Batch 改为按顶层 Stage 派发：已完成前缀从快照恢复，Stage 通过 IPC 上报完成状态、耗时、cgroup 内存峰值、PyTorch 显存峰值、Recorder 事件和配置读取依赖。按滚动依赖特征分别估计每个 Stage 的耗时、主机内存和显存峰值，并优先尝试与既有样本距离更远的可行参数组合。
 
 - GPU Stage 调度按同一 Stage 的近邻配置历史取有界经验分位数估计耗时、主机内存和显存峰值，避免稀疏特征回归产生无界外推；显存合约不超过物理卡容量。cgroup 或 CUDA 内存拒绝会把本次合约作为有限下界，提高后续尝试的资源分配并重试。显式零 PyTorch 显存样本不再预留显存，但 Stage 仍获得可见 GPU。
 
@@ -28,7 +28,7 @@
 
 - 同 Batch 连续前缀自动复用，保守配置读取追踪、共享快照引用、state/RNG/数值指标恢复及 GPU worker 接入。配置 get 和成员存在性查询改为显式报错。
 
-- 根部 seed（默认 0）初始化和 seed_everything()；Python、可选 NumPy/PyTorch 的全局随机状态随阶段快照与 checkpoint 原子保存、重试及进程恢复。
+- 根部 seed（默认 0）初始化和 seed_everything()；Python、NumPy/PyTorch 的全局随机状态随阶段快照与 checkpoint 原子保存、重试及进程恢复。
 
 - YAML `device` 驱动的多卡/同卡多进程执行，显存门槛准入、退出门控补位、直接 kill 及跨进程恢复。
 - 按卡 CLI 运行数、独立尝试日志、Recorder 汇总、并发 SQLite 写入和基于当前并发规模的剩余时间区间。
@@ -55,6 +55,8 @@
 - 固定版本的 Ruff lint、格式检查、每次提交自动执行的 pre-commit hook 和 CI 检查。
 
 ### Changed
+
+- 项目统一使用 uv 和提交的 `uv.lock` 管理唯一环境；NumPy、PyTorch、Ruff 与 pre-commit 都是默认依赖，安装、开发、CI 和完整验证均通过 `uv sync`、`uv run` 执行。
 
 - 新实验按估时信息价值选择执行顺序，取消成员优先续跑、失败成员保持队尾重试，结果顺序保持配置展开顺序。
 

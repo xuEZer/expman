@@ -8,13 +8,13 @@ version = "0.1.0"
 description = "Composable experiment pipelines with execution monitoring"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["PyYAML>=6.0,<7"]
-
-[project.optional-dependencies]
-dev = ["pre-commit==4.6.2", "ruff==0.16.6"]
-numpy = ["numpy>=1.26"]
-torch = ["torch>=2.0"]
-optional = ["numpy>=1.26", "torch>=2.0"]
+dependencies = [
+    "PyYAML>=6.0,<7",
+    "numpy>=1.26",
+    "pre-commit==4.6.2",
+    "ruff==0.16.6",
+    "torch>=2.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
