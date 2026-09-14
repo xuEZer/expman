@@ -152,6 +152,21 @@ class GpuScheduler:
 
     def _stage_peak(self, run_id, stage_index, field, default):
         """Lazily fit one configuration-based peak model per top-level Stage."""
+        if field == "gpu_peak_kb":
+            reported = [
+                entry.get(field)
+                for entry in self.batch._stage_history
+                if entry.get("stage") == stage_index
+                and entry.get("status") == Status.SUCCEEDED.value
+                and not entry.get("gpu_capped")
+                and isinstance(entry.get(field), (int, float))
+            ]
+            # A Stage always receives a card, but confirmed zero PyTorch use
+            # needs no VRAM reservation or allocator cap. Missing optional
+            # telemetry remains a cold-start default rather than false evidence
+            # of zero use.
+            if reported and not any(value > 0.0 for value in reported):
+                return 0.0
         key = (stage_index, field)
         model = self._stage_peak_models.get(key)
         if model is None:
@@ -222,33 +237,10 @@ class GpuScheduler:
         """Return the feature-based reservation for one pending run."""
         return self.peaks.estimate_kb(run_id)
 
-    def _stage_uses_gpu(self, run_id, stage_index):
-        """Use a card until a completed sample proves this Stage is CPU-only."""
-        samples = [
-            entry
-            for entry in self.batch._stage_history
-            if entry.get("stage") == stage_index
-            and entry.get("status") == Status.SUCCEEDED.value
-            and not entry.get("capped")
-            and not entry.get("gpu_capped")
-        ]
-        if not samples:
-            return True
-        reported = [entry.get("gpu_peak_kb") for entry in samples]
-        if any(not isinstance(value, (int, float)) for value in reported):
-            # PyTorch is optional.  Lack of telemetry is not evidence that a
-            # Stage is CPU-only, so keep the conservative GPU contract.
-            return True
-        return any(value > 0.0 for value in reported)
-
-    def _next_stage(self, uses_gpu):
-        """Take a compatible queued Stage, preferring distant sampled features."""
+    def _next_stage(self):
+        """Take a queued Stage, preferring distant sampled features."""
         batch = self.batch
-        candidates = [
-            run_id
-            for run_id in batch._queue
-            if self._stage_uses_gpu(run_id, batch._stage_progress[run_id]) == uses_gpu
-        ]
+        candidates = list(batch._queue)
         if not candidates:
             return None
         # A retry must retain its place: it is evidence about a known lower bound,
@@ -288,12 +280,6 @@ class GpuScheduler:
             chosen = max(candidates, key=distance)
         batch._queue.remove(chosen)
         return chosen
-
-    def _has_stage(self, uses_gpu):
-        return any(
-            self._stage_uses_gpu(run_id, self.batch._stage_progress[run_id]) == uses_gpu
-            for run_id in self.batch._queue
-        )
 
     def _account(self):
         now = perf_counter()
@@ -473,27 +459,48 @@ class GpuScheduler:
             needed += max(0.0, worker.gpu_contract_kb - (worker.gpu_reserved_kb or 0))
         return memory.free * 1024 >= needed
 
+    def _launch_available(self, memory, host):
+        """Greedily fill cards this tick until every usable card refuses work."""
+        unavailable = set()
+        while self.batch._queue:
+            launched = False
+            for device, gate in self.gates.items():
+                if device in unavailable:
+                    continue
+                running = [
+                    run_id
+                    for run_id, worker in self.workers.items()
+                    if worker.device == device
+                ]
+                if not gate.can_launch(memory[device].free_ratio, running):
+                    unavailable.add(device)
+                    continue
+                if self._launch(device, memory[device], host):
+                    launched = True
+                else:
+                    # The host or this card cannot admit the selected Stage.
+                    # Its state only improves after a later resource reading.
+                    unavailable.add(device)
+            if not launched:
+                return
+
     def _launch(self, device, memory, host):
         batch = self.batch
         with batch._state_lock:
-            run_id = self._next_stage(device is not None)
+            run_id = self._next_stage()
         if run_id is None:
             return False
         stage_index = batch._stage_progress[run_id]
         host_estimate = self._stage_peak(
             run_id, stage_index, "peak_kb", devices.HOST_PEAK_KB_DEFAULT
         )
-        gpu_estimate = (
-            self._stage_peak(
-                run_id, stage_index, "gpu_peak_kb", devices.GPU_PEAK_KB_DEFAULT
-            )
-            if device is not None
-            else 0.0
+        gpu_estimate = self._stage_peak(
+            run_id, stage_index, "gpu_peak_kb", devices.GPU_PEAK_KB_DEFAULT
         )
         host_contract = limits.cap_kb(host_estimate)
         gpu_contract = gpu_estimate * devices.CAPACITY_FACTOR
         duration_estimate = self._stage_duration(run_id, stage_index)
-        gpu_fits = device is None or self._admits_gpu(memory, device, gpu_contract)
+        gpu_fits = self._admits_gpu(memory, device, gpu_contract)
         if not self._admits(host, host_contract) or not gpu_fits:
             # Put the selection back at the front. Dispatching updated the
             # estimator's own state, and re-selecting the same run is idempotent,
@@ -561,10 +568,7 @@ class GpuScheduler:
             batch._stage_attempts[stage_key] = stage_attempt
             batch._save()  # Durable active membership precedes process creation.
             env = dict(os.environ)
-            if device is None:
-                env["CUDA_VISIBLE_DEVICES"] = ""
-            else:
-                env["CUDA_VISIBLE_DEVICES"] = memory.uuid
+            env["CUDA_VISIBLE_DEVICES"] = memory.uuid
             env["PYTHONPATH"] = os.pathsep.join(
                 str(Path(path).resolve()) for path in sys.path
             )
@@ -580,7 +584,7 @@ class GpuScheduler:
             parent_socket.setblocking(False)
             env["EXPMAN_IPC_FD"] = str(child_socket.fileno())
             env["EXPMAN_POLL_INTERVAL"] = str(devices.POLL_INTERVAL)
-            if device is not None:
+            if gpu_contract > 0:
                 env["EXPMAN_GPU_LIMIT_KB"] = str(gpu_contract)
             self._account()
             with (root / "output.log").open("ab", buffering=0) as log:
@@ -798,33 +802,11 @@ class GpuScheduler:
                 memory, host = self._observe()
                 self._relieve(memory, host)
                 launching = self.host_gate.can_launch(host, list(self.workers))
-                # A previously sampled Stage with no PyTorch allocator use is a
-                # CPU Stage.  It has no card contract and can be admitted solely
-                # by host-memory headroom; one launch per tick keeps the loop
-                # responsive while avoiding an unbounded burst of cold processes.
-                if launching and self._has_stage(False):
-                    self._launch(None, None, host)
-                for device, gate in self.gates.items():
-                    if memory is None:
-                        continue
-                    running = [
-                        key
-                        for key, worker in self.workers.items()
-                        if worker.device == device
-                    ]
-                    if (
-                        self.batch._queue
-                        and launching
-                        and gate.can_launch(memory[device].free_ratio, running)
-                        and not self._launch(device, memory[device], host)
-                    ):
-                        # Host RAM is shared, so one refused launch closes every
-                        # card for this tick.
-                        break
+                if launching and memory is not None:
+                    self._launch_available(memory, host)
                 if (
                     self.batch._queue
                     and not self.workers
-                    and not self._has_stage(False)
                     and all(gate.gpu_block for gate in self.gates.values())
                 ):
                     raise RuntimeError(

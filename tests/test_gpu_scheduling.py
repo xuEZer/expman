@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from expman import Batch, ConfigError, Experiment, Pipeline, Stage, Status, devices
 from expman.devices import (
+    GPU_PEAK_KB_DEFAULT,
     HOST_PEAK_KB_DEFAULT,
     HOST_RESERVE_KB,
     DeviceMemory,
@@ -193,7 +194,7 @@ class GpuSchedulingTests(unittest.TestCase):
         )
         self.assertGreater(scheduler._stage_duration(results[0].run_id, 1), 0)
 
-    def test_completed_zero_gpu_sample_turns_a_stage_into_a_cpu_stage(self):
+    def test_completed_zero_gpu_sample_needs_no_vram_reservation(self):
         batch = self.make_batch(count=2, devices=[0])
         scheduler = GpuScheduler(batch)
         batch._stage_history.append(
@@ -208,7 +209,29 @@ class GpuSchedulingTests(unittest.TestCase):
             }
         )
 
-        self.assertFalse(scheduler._stage_uses_gpu(batch.experiments[1].run_id, 0))
+        self.assertEqual(
+            scheduler._stage_peak(
+                batch.experiments[1].run_id, 0, "gpu_peak_kb", GPU_PEAK_KB_DEFAULT
+            ),
+            0.0,
+        )
+
+    def test_tick_greedily_fills_a_card(self):
+        batch = self.make_batch(count=4, devices=[0])
+        scheduler = GpuScheduler(batch)
+        started = []
+
+        def launch(device, memory, host):
+            if not batch._queue:
+                return False
+            started.append(device)
+            batch._queue.popleft()
+            return True
+
+        with patch.object(scheduler, "_launch", side_effect=launch):
+            scheduler._launch_available(Memory([0]).sample(), Host().sample())
+
+        self.assertEqual(started, [0, 0, 0, 0])
 
     def test_shared_prefix_is_loaded_by_a_new_worker(self):
         # Seed the shared cache, then let the worker processes start from it instead
@@ -409,22 +432,21 @@ class GpuSchedulingTests(unittest.TestCase):
         original_launch = GpuScheduler._launch
         launches = []
         failures = 0
-        launches_at_failure = []
+        failed_tick = False
 
         def counted(self, device, memory, host):
+            if failed_tick:
+                self.fail("a failed query launched work in the same tick")
             launches.append(device)
             return original_launch(self, device, memory, host)
 
         def failing(monitor):
-            nonlocal failures
+            nonlocal failed_tick, failures
             if failures < 2 and batch._active_gpu:
                 failures += 1
-                launches_at_failure.append(len(launches))
+                failed_tick = True
                 raise MemoryObservationError("meminfo unavailable")
-            if launches_at_failure and len(launches) != launches_at_failure[-1]:
-                self.fail("a failed query launched work before the next reading")
-            if launches_at_failure:
-                launches_at_failure.pop()
+            failed_tick = False
             return original(monitor)
 
         with (
@@ -434,7 +456,6 @@ class GpuSchedulingTests(unittest.TestCase):
         ):
             results = batch.run(progress=False)
         self.assertEqual(failures, 2)
-        self.assertEqual(launches_at_failure, [])
         shed = [
             attempt
             for result in results

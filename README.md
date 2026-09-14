@@ -272,17 +272,17 @@ device: [0, 1, 3]
 epochs: !choice [20, 40]
 ```
 
-`device` 是整个 Batch 的设备列表，不展开为实验组合，也不允许使用 `!choice`。省略或 `[]` 使用原有 CPU 顺序执行路径；框架不改写用户的模型构建逻辑。`ctx.cfg` 保留完整的原始设备列表。每个被分配到 GPU 的顶层 Stage 在独立解释器中运行，仅暴露分配到的 GPU，业务代码可统一使用 `cuda:0`。绑定通过启动环境中的 GPU UUID 设置，在导入用户 Stage 模块前生效。
+`device` 是整个 Batch 的设备列表，不展开为实验组合，也不允许使用 `!choice`。省略或 `[]` 使用原有 CPU 顺序执行路径；框架不改写用户的模型构建逻辑。`ctx.cfg` 保留完整的原始设备列表。GPU Batch 的每个顶层 Stage 都在独立解释器中运行，并分配一张可见的 GPU，业务代码可统一使用 `cuda:0`；不使用 CUDA 的 Stage 不会因此产生显存占用。绑定通过启动环境中的 GPU UUID 设置，在导入用户 Stage 模块前生效。
 
 GPU Batch 以**顶层 Stage**为调度单元，而不是以整个 Pipeline 为单元。子进程只实际执行被派发的一个 Stage；此前完成的顶层 Stage 从快照恢复。每次完成会把该 Stage 的耗时、cgroup 内存当前值/峰值、PyTorch 分配器显存当前值/峰值和配置读取依赖通过私有 IPC 通知调度器；Recorder 事件也走同一通道，不再靠轮询 worker 目录中的结果或事件文件。
 
 模型按 Stage 分开保存。特征是滚动累积的配置依赖：某 Stage 的上游 Stage 已读取路径与它自身已观测的读取路径共同决定特征。因此前缀依赖相同表示上游输入相同。冷启动时使用完整配置挑选彼此更远的组合；有样本后，资源可行的候选中优先选择与该 Stage 已采样组合特征距离最大的一个。耗时、主机内存峰值和显存峰值模型只在收到新的完成样本时重建，tick 不会用正在运行的瞬时数据改变估计。
 
-默认值在 [devices.py](src/expman/devices.py) 中：主机预留 `HOST_RESERVE_KB = 1048576`（1 GiB），未知 Stage 的主机和显存峰值均为 1 GiB。每个 tick（`POLL_INTERVAL = 1.0` 秒）读取全局主机余量与 `nvidia-smi` 的整卡空闲显存，并收取 worker 的 IPC 上报。启动前必须满足：全局可用主机内存减预留，能覆盖新 Stage 的 cgroup 合约和每个运行 worker 尚未用到的合约部分；GPU 也必须覆盖新 Stage 的显存合约及同卡 worker 尚未使用的 PyTorch 分配器合约部分。`device: []` 仍使用原有 CPU 顺序执行路径。
+默认值在 [devices.py](src/expman/devices.py) 中：主机预留 `HOST_RESERVE_KB = 1048576`（1 GiB），未知 Stage 的主机和显存峰值均为 1 GiB。每个 tick（`POLL_INTERVAL = 1.0` 秒）读取全局主机余量与 `nvidia-smi` 的整卡空闲显存，并收取 worker 的 IPC 上报；随后按卡轮转，贪心启动 Stage，直到主机内存或各卡显存不能再容纳新的合约。启动前必须满足：全局可用主机内存减预留，能覆盖新 Stage 的 cgroup 合约和每个运行 worker 尚未用到的合约部分；GPU 也必须覆盖新 Stage 的显存合约及同卡 worker 尚未使用的 PyTorch 分配器合约部分。`device: []` 仍使用原有 CPU 顺序执行路径。
 
-每个 worker 的主机内存上限由 cgroup `memory.max` 强制为其估计峰值的 110%（保留最低启动值）。cgroup 拒绝申请或峰值接近上限时，该 Stage 以更高的下界重新估计并重试，不消耗普通失败重试次数。显存上限使用可选 PyTorch 的 `torch.cuda.set_per_process_memory_fraction`；未安装 PyTorch 或不使用其分配器时无法得到通用的进程级显存硬上限，调度器会保守地继续把该 Stage 当作 GPU Stage。只有成功报告 PyTorch 峰值为零的已采样 Stage 才会自动转入 CPU 调度通道，无需在 Stage 类上声明资源类别。
+每个 worker 的主机内存上限由 cgroup `memory.max` 强制为其估计峰值的 110%（保留最低启动值）。cgroup 拒绝申请或峰值接近上限时，该 Stage 以更高的下界重新估计并重试，不消耗普通失败重试次数。显存上限使用可选 PyTorch 的 `torch.cuda.set_per_process_memory_fraction`；未安装 PyTorch 或不使用其分配器时无法得到通用的进程级显存硬上限。成功样本均报告零 PyTorch 峰值的 Stage 仍会分配可见 GPU，但其后续任务不预留显存、也不设置 PyTorch 分配器上限。
 
-不再有显存比例门槛。CUDA OOM 会阻塞该卡的新增派发，直到同卡另一个 worker 正常结束；该状态持久化到 Batch 清单。若所有卡都被这样阻塞且没有可运行的 CPU Stage，Batch 会报出明确错误而不会忙等或继续试探性启动。主机内存读数失败或持续紧张仍暂停新增派发并按原有规则减载最新 worker。
+不再有显存比例门槛。CUDA OOM 会阻塞该卡的新增派发，直到同卡另一个 worker 正常结束；该状态持久化到 Batch 清单。若所有卡都被这样阻塞且没有运行中的 worker，Batch 会报出明确错误而不会忙等或继续试探性启动。主机内存读数失败或持续紧张仍暂停新增派发并按原有规则减载最新 worker。
 
 Ctrl+C 立即停止调度并 kill 所有实验进程组，不要求子进程额外保存。主进程记录已知尝试耗时和中断队列；恢复复用阶段快照及最近有效 checkpoint。主进程突然结束时，子进程通过父进程管道 EOF 清理自己的进程组；未落盘的尝试耗时继续按未知处理。用户自行脱离实验进程组的外部服务不在管理范围内。
 
