@@ -221,17 +221,35 @@ class GpuSchedulingTests(unittest.TestCase):
         scheduler = GpuScheduler(batch)
         started = []
 
-        def launch(device, memory, host):
-            if not batch._queue:
-                return False
+        def launch(device, memory, host, candidate):
             started.append(device)
-            batch._queue.popleft()
+            batch._queue.remove(candidate.run_id)
             return True
 
         with patch.object(scheduler, "_launch", side_effect=launch):
             scheduler._launch_available(Memory([0]).sample(), Host().sample())
 
         self.assertEqual(started, [0, 0, 0, 0])
+
+    def test_tick_plan_combines_memory_and_gpu_stages(self):
+        batch = self.make_batch(count=8, devices=[0])
+        for experiment in batch.experiments[4:]:
+            batch._stage_progress[experiment.run_id] = 1
+        scheduler = GpuScheduler(batch)
+
+        def peak(run_id, stage, field, default):
+            if field == "peak_kb":
+                return (512 if stage == 0 else 1024) * 1024
+            return 0.0 if stage == 0 else 1024 * 1024
+
+        host = HostMemory(64 * 1024**2, HOST_RESERVE_KB + 5 * 1024**2, 0, 0)
+        memory = {0: DeviceMemory("GPU-test-0", 3000, 3000)}
+        with patch.object(scheduler, "_stage_peak", side_effect=peak):
+            plan = scheduler._launch_plan(memory, host)
+
+        stages = [candidate.stage_index for candidate, _device in plan]
+        self.assertEqual(stages.count(0), 4)
+        self.assertEqual(stages.count(1), 2)
 
     def test_shared_prefix_is_loaded_by_a_new_worker(self):
         # Seed the shared cache, then let the worker processes start from it instead
@@ -434,11 +452,11 @@ class GpuSchedulingTests(unittest.TestCase):
         failures = 0
         failed_tick = False
 
-        def counted(self, device, memory, host):
+        def counted(self, device, memory, host, candidate):
             if failed_tick:
                 self.fail("a failed query launched work in the same tick")
             launches.append(device)
-            return original_launch(self, device, memory, host)
+            return original_launch(self, device, memory, host, candidate)
 
         def failing(monitor):
             nonlocal failed_tick, failures
@@ -472,9 +490,9 @@ class GpuSchedulingTests(unittest.TestCase):
         launches = []
         failures = 0
 
-        def counted(self, device, memory, host):
+        def counted(self, device, memory, host, candidate):
             launches.append(device)
-            return original_launch(self, device, memory, host)
+            return original_launch(self, device, memory, host, candidate)
 
         def failing(monitor):
             nonlocal failures

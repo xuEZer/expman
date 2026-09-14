@@ -19,6 +19,9 @@ from .experiment import AttemptResult, SnapshotOutput, StageResult
 from .ipc import Channel
 from .storage import PickleSerializer, RecoveryWarning, write_record
 
+PLAN_CANDIDATES_PER_STAGE = 32
+PLAN_BEAM_WIDTH = 128
+
 
 @dataclass
 class Gate:
@@ -77,6 +80,29 @@ class Worker:
     finished: StageResult | None = None
     dependencies: list | None = None
     cap_hit: bool = False
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One ready Stage with its resource contracts for this scheduling tick."""
+
+    run_id: str
+    stage_index: int
+    host_estimate_kb: float
+    host_contract_kb: float
+    gpu_contract_kb: float
+    expected_seconds: float | None
+    novelty: float
+
+
+@dataclass(frozen=True)
+class Plan:
+    """A feasible placement of ready Stage candidates on the selected cards."""
+
+    host_left_kb: float
+    gpu_left_kb: tuple[float, ...]
+    placements: tuple[tuple[Candidate, int], ...] = ()
+    novelty: float = 0.0
 
 
 def _kill_group(process):
@@ -237,49 +263,78 @@ class GpuScheduler:
         """Return the feature-based reservation for one pending run."""
         return self.peaks.estimate_kb(run_id)
 
-    def _next_stage(self):
-        """Take a queued Stage, preferring distant sampled features."""
+    def _stage_candidates(self, stage_index):
+        """Return diverse ready candidates for one Stage and its own history only."""
         batch = self.batch
-        candidates = list(batch._queue)
-        if not candidates:
-            return None
-        # A retry must retain its place: it is evidence about a known lower bound,
-        # not a new exploratory configuration.
-        retry = next(
-            (
-                run_id
-                for run_id in candidates
-                if f"{run_id}:{batch._stage_progress[run_id]}" in batch._stage_attempts
-            ),
-            None,
-        )
-        if retry is not None:
-            batch._queue.remove(retry)
-            return retry
-        stage = batch._stage_progress[candidates[0]]
-        vectors, indices = self._stage_vectors(stage)
+        run_ids = [
+            run_id
+            for run_id in batch._queue
+            if batch._stage_progress[run_id] == stage_index
+        ]
+        if not run_ids:
+            return []
+        vectors, indices = self._stage_vectors(stage_index)
         sampled = [
             indices[entry["run_id"]]
             for entry in batch._stage_history
-            if entry.get("stage") == stage and entry.get("run_id") in indices
+            if entry.get("stage") == stage_index and entry.get("run_id") in indices
         ]
-        if not sampled:
-            chosen = candidates[0]
-        else:
 
-            def distance(run_id):
-                row = vectors[indices[run_id]][1:]
-                return min(
-                    sum(
-                        (left - right) ** 2
-                        for left, right in zip(row, vectors[item][1:], strict=True)
-                    )
-                    for item in sampled
+        def novelty(run_id):
+            if not sampled:
+                return 1.0
+            row = vectors[indices[run_id]][1:]
+            return min(
+                sum(
+                    (left - right) ** 2
+                    for left, right in zip(row, vectors[item][1:], strict=True)
                 )
+                for item in sampled
+            )
 
-            chosen = max(candidates, key=distance)
-        batch._queue.remove(chosen)
-        return chosen
+        retries, fresh = [], []
+        for run_id in run_ids:
+            value = novelty(run_id)
+            target = (
+                retries if f"{run_id}:{stage_index}" in batch._stage_attempts else fresh
+            )
+            target.append((run_id, value))
+        # Retries remain first within their own Stage.  New combinations then
+        # spread samples across that Stage's dependency-feature space.
+        ordered = retries + sorted(fresh, key=lambda item: item[1], reverse=True)
+        candidates = []
+        selected = ordered[:PLAN_CANDIDATES_PER_STAGE]
+        denominator = max(1, len(selected) - 1)
+        for rank, (run_id, _value) in enumerate(selected):
+            host_estimate = self._stage_peak(
+                run_id, stage_index, "peak_kb", devices.HOST_PEAK_KB_DEFAULT
+            )
+            gpu_estimate = self._stage_peak(
+                run_id, stage_index, "gpu_peak_kb", devices.GPU_PEAK_KB_DEFAULT
+            )
+            candidates.append(
+                Candidate(
+                    run_id,
+                    stage_index,
+                    host_estimate,
+                    limits.cap_kb(host_estimate),
+                    gpu_estimate * devices.CAPACITY_FACTOR,
+                    self._stage_duration(run_id, stage_index),
+                    1.0 - rank / denominator,
+                )
+            )
+        return candidates
+
+    @staticmethod
+    def _interleave(groups):
+        """Round-robin candidates so one Stage cannot consume beam search first."""
+        items = []
+        longest = max((len(group) for group in groups), default=0)
+        for index in range(longest):
+            for group in groups:
+                if index < len(group):
+                    items.append(group[index])
+        return items
 
     def _account(self):
         now = perf_counter()
@@ -459,47 +514,104 @@ class GpuScheduler:
             needed += max(0.0, worker.gpu_contract_kb - (worker.gpu_reserved_kb or 0))
         return memory.free * 1024 >= needed
 
-    def _launch_available(self, memory, host):
-        """Greedily fill cards this tick until every usable card refuses work."""
-        unavailable = set()
-        while self.batch._queue:
-            launched = False
-            for device, gate in self.gates.items():
-                if device in unavailable:
-                    continue
-                running = [
-                    run_id
-                    for run_id, worker in self.workers.items()
-                    if worker.device == device
-                ]
-                if not gate.can_launch(memory[device].free_ratio, running):
-                    unavailable.add(device)
-                    continue
-                if self._launch(device, memory[device], host):
-                    launched = True
-                else:
-                    # The host or this card cannot admit the selected Stage.
-                    # Its state only improves after a later resource reading.
-                    unavailable.add(device)
-            if not launched:
-                return
+    def _resource_left(self, memory, host):
+        """Capacity available after reserving every running worker's future growth."""
+        host_left = host.headroom_kb
+        for worker in self.workers.values():
+            reach = max(
+                worker.peak_kb,
+                0.0 if worker.limit is None else worker.limit.cap_kb,
+            )
+            host_left -= max(0.0, reach - worker.resident_kb)
+        gpu_left = {}
+        for device, observation in memory.items():
+            gpu_left[device] = observation.free * 1024 - sum(
+                max(0.0, worker.gpu_contract_kb - (worker.gpu_reserved_kb or 0))
+                for worker in self.workers.values()
+                if worker.device == device
+            )
+        return host_left, gpu_left
 
-    def _launch(self, device, memory, host):
+    @staticmethod
+    def _plan_score(plan, host_capacity, gpu_capacities):
+        """Prefer plans that jointly leave the least normalized resource behind."""
+        unused = (plan.host_left_kb / host_capacity) ** 2
+        unused += sum(
+            (left / capacity) ** 2
+            for left, capacity in zip(plan.gpu_left_kb, gpu_capacities, strict=True)
+            if capacity > 0
+        )
+        # Parameter diversity only breaks materially equivalent packing choices.
+        return -unused + 1e-6 * plan.novelty
+
+    def _launch_plan(self, memory, host):
+        """Choose a bounded multi-resource packing plan for this scheduler tick."""
+        host_capacity, available_gpu = self._resource_left(memory, host)
+        devices_in_plan = tuple(
+            device
+            for device, gate in self.gates.items()
+            if gate.can_launch(
+                memory[device].free_ratio,
+                [worker for worker in self.workers.values() if worker.device == device],
+            )
+        )
+        if host_capacity <= 0 or not devices_in_plan:
+            return ()
+        gpu_capacities = tuple(
+            max(0.0, available_gpu[device]) for device in devices_in_plan
+        )
+        stages = sorted(
+            {self.batch._stage_progress[run_id] for run_id in self.batch._queue}
+        )
+        candidates = self._interleave(
+            [self._stage_candidates(stage) for stage in stages]
+        )
+        plans = [Plan(host_capacity, gpu_capacities)]
+        for candidate in candidates:
+            expanded = list(plans)
+            for plan in plans:
+                if candidate.host_contract_kb > plan.host_left_kb:
+                    continue
+                for index, gpu_left in enumerate(plan.gpu_left_kb):
+                    if candidate.gpu_contract_kb > gpu_left:
+                        continue
+                    left = list(plan.gpu_left_kb)
+                    left[index] -= candidate.gpu_contract_kb
+                    expanded.append(
+                        Plan(
+                            plan.host_left_kb - candidate.host_contract_kb,
+                            tuple(left),
+                            (*plan.placements, (candidate, devices_in_plan[index])),
+                            plan.novelty + candidate.novelty,
+                        )
+                    )
+            plans = sorted(
+                expanded,
+                key=lambda plan: self._plan_score(plan, host_capacity, gpu_capacities),
+                reverse=True,
+            )[:PLAN_BEAM_WIDTH]
+        return max(
+            plans,
+            key=lambda plan: self._plan_score(plan, host_capacity, gpu_capacities),
+        ).placements
+
+    def _launch_available(self, memory, host):
+        """Launch the resource-aware packing plan chosen from this tick's snapshot."""
+        for candidate, device in self._launch_plan(memory, host):
+            self._launch(device, memory[device], host, candidate)
+
+    def _launch(self, device, memory, host, candidate):
         batch = self.batch
         with batch._state_lock:
-            run_id = self._next_stage()
-        if run_id is None:
-            return False
-        stage_index = batch._stage_progress[run_id]
-        host_estimate = self._stage_peak(
-            run_id, stage_index, "peak_kb", devices.HOST_PEAK_KB_DEFAULT
-        )
-        gpu_estimate = self._stage_peak(
-            run_id, stage_index, "gpu_peak_kb", devices.GPU_PEAK_KB_DEFAULT
-        )
-        host_contract = limits.cap_kb(host_estimate)
-        gpu_contract = gpu_estimate * devices.CAPACITY_FACTOR
-        duration_estimate = self._stage_duration(run_id, stage_index)
+            if candidate.run_id not in batch._queue:
+                return False
+            batch._queue.remove(candidate.run_id)
+        run_id = candidate.run_id
+        stage_index = candidate.stage_index
+        host_estimate = candidate.host_estimate_kb
+        host_contract = candidate.host_contract_kb
+        gpu_contract = candidate.gpu_contract_kb
+        duration_estimate = candidate.expected_seconds
         gpu_fits = self._admits_gpu(memory, device, gpu_contract)
         if not self._admits(host, host_contract) or not gpu_fits:
             # Put the selection back at the front. Dispatching updated the
