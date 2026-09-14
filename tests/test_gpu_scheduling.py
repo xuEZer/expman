@@ -144,6 +144,7 @@ class GpuSchedulingTests(unittest.TestCase):
         )
         self.assertTrue(all(item.output["cfg_devices"] == [0, 1] for item in results))
         self.assertTrue(any(item["concurrency"] > 1 for item in batch._gpu_history))
+        self.assertTrue(all(item["peak_kb"] > 0 for item in batch._stage_history))
         self.assertEqual(batch._host_memory["available_ratio"], 0.75)
         self.assertEqual(batch._host_memory["swap_free_kb"], 0.0)
         self.assertFalse(batch._host_memory["tight"])

@@ -44,16 +44,30 @@ def cap_kb(estimate_kb) -> float:
     return max(devices.CAPACITY_FLOOR_KB, estimate_kb * devices.CAPACITY_FACTOR)
 
 
+def _cgroup_directory(lines) -> Path | None:
+    """Resolve the unified-v2 entry from a ``/proc/*/cgroup`` file."""
+    for line in lines:
+        if line.startswith("0::"):
+            return CGROUP_ROOT / line.split("::", 1)[1].strip().lstrip("/")
+    return None
+
+
 def own_cgroup() -> Path | None:
     """This process's own cgroup directory, or None when it cannot be read."""
     try:
         lines = Path("/proc/self/cgroup").read_text().splitlines()
     except OSError:
         return None
-    for line in lines:
-        if line.startswith("0::"):
-            return CGROUP_ROOT / line.split("::", 1)[1].strip().lstrip("/")
-    return None
+    return _cgroup_directory(lines)
+
+
+def cgroup_for_pid(pid: int) -> Path | None:
+    """Return a live process's cgroup directory without guessing its hierarchy."""
+    try:
+        lines = (Path("/proc") / str(pid) / "cgroup").read_text().splitlines()
+    except OSError:
+        return None
+    return _cgroup_directory(lines)
 
 
 def _direct(unit: str, limit_kb: float) -> Path | None:
@@ -99,9 +113,11 @@ def _scope(unit: str, limit_kb: float) -> MemoryLimit | None:
         "--property=KillMode=control-group",
         "--",
     )
-    parent = own_cgroup()
-    cgroup = None if parent is None else parent.parent / f"{unit}.scope"
-    return MemoryLimit(prefix, cgroup, limit_kb, "systemd")
+    # A user manager owns the scope's hierarchy, which need not resemble the
+    # scheduler's own cgroup.  The worker discovers its actual cgroup after
+    # systemd has placed it there; guessing from this process produces a path
+    # that exists nowhere and silently turns its peak reports into zeroes.
+    return MemoryLimit(prefix, None, limit_kb, "systemd")
 
 
 def memory_limit(unit: str, estimate_kb: float) -> MemoryLimit:

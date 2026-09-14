@@ -364,6 +364,9 @@ class GpuScheduler:
         events = message.get("memory_events")
         if isinstance(events, dict):
             worker.memory_events = events
+        directory = message.get("cgroup")
+        if isinstance(directory, str) and worker.limit is not None:
+            worker.limit = replace(worker.limit, cgroup=Path(directory))
 
     def _observe(self):
         """Read device and host memory; a failed or timed-out query is not a reading."""
@@ -600,6 +603,11 @@ class GpuScheduler:
                 raise RuntimeError(
                     f"could not move worker {process.pid} into {limit.cgroup}"
                 )
+            if limit.mechanism == "systemd":
+                # ``systemd-run --scope`` has placed this process in a user
+                # hierarchy by now.  Discover it from proc rather than deriving
+                # a path from the scheduler's unrelated cgroup.
+                limit = replace(limit, cgroup=limits.cgroup_for_pid(process.pid))
             now = perf_counter()
             with experiment._timing_lock:
                 experiment._active_started = now

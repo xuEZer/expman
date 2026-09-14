@@ -36,15 +36,19 @@ def _resource_snapshot(directory):
         "host_peak_kb": None if host is None else host[1],
         "gpu": gpu_memory(),
         "memory_events": events(directory),
+        "cgroup": None if directory is None else str(directory),
     }
 
 
+def _resource_cgroup():
+    """Use a direct-cgroup path, or discover the systemd scope from within it."""
+    if "EXPMAN_CGROUP" in os.environ:
+        return Path(os.environ["EXPMAN_CGROUP"])
+    return own_cgroup()
+
+
 def _report_resources(channel, stop, interval):
-    directory = (
-        Path(os.environ["EXPMAN_CGROUP"])
-        if "EXPMAN_CGROUP" in os.environ
-        else own_cgroup()
-    )
+    directory = _resource_cgroup()
 
     def report():
         try:
@@ -145,11 +149,7 @@ def main():
                         "dependencies": None
                         if completed is None
                         else completed.get("config_dependencies"),
-                        "resources": _resource_snapshot(
-                            Path(os.environ["EXPMAN_CGROUP"])
-                            if "EXPMAN_CGROUP" in os.environ
-                            else own_cgroup()
-                        ),
+                        "resources": _resource_snapshot(_resource_cgroup()),
                     }
                 )
     finally:
