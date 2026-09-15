@@ -88,8 +88,11 @@ class RandomStateManager:
                 self.torch.Generator(device="cpu").set_state(self._tensor(cpu))
                 if self.torch.cuda.is_available():
                     count = self.torch.cuda.device_count()
-                    if len(cuda) != count or any(
-                        not isinstance(item, bytes) or not item for item in cuda
+                    # A CPU-only snapshot remains restorable if a retry later sees
+                    # CUDA. In that case _apply deliberately leaves CUDA RNG alone.
+                    if cuda and (
+                        len(cuda) != count
+                        or any(not isinstance(item, bytes) or not item for item in cuda)
                     ):
                         raise ValueError(
                             "saved CUDA random states do not match visible devices"
