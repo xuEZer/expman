@@ -1,6 +1,6 @@
 import unittest
 
-from expman._memory_model import LocalQuantileEstimator
+from expman._memory_model import LocalQuantileEstimator, PeakCeiling
 
 
 class LocalQuantileEstimatorTests(unittest.TestCase):
@@ -34,3 +34,16 @@ class LocalQuantileEstimatorTests(unittest.TestCase):
         estimator.record("completed", 0.0)
 
         self.assertEqual(estimator.estimate("pending"), 0.0)
+
+
+class PeakCeilingTests(unittest.TestCase):
+    def test_rebuild_preserves_capped_history_bump(self):
+        ceiling = PeakCeiling.from_history(
+            [
+                {"peak_kb": 500.0, "capped": False},
+                {"peak_kb": 800.0, "capped": True},
+                {"peak_kb": float("inf"), "capped": False},
+            ]
+        )
+
+        self.assertEqual(ceiling.ceiling_kb, 1200.0)

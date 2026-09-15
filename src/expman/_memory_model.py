@@ -77,49 +77,25 @@ class LocalQuantileEstimator:
 
 
 @dataclass
-class PeakEstimator:
-    """Per-run host-memory estimates for a Batch, in kilobytes.
+class PeakCeiling:
+    """Largest observed whole-attempt host peak for cold-start admission."""
 
-    This compatibility wrapper also supplies the Batch-wide ceiling used for
-    cold-start admission. Stage-level callers normally use
-    :class:`LocalQuantileEstimator` directly.
-    """
-
-    vectors: list
-    indices: dict
-    default_kb: float = devices.HOST_PEAK_KB_DEFAULT
-    quantile: float = devices.PEAK_QUANTILE
-    margin: float = devices.PEAK_BUMP_MARGIN
     ceiling_kb: float = 0.0
-    _local: LocalQuantileEstimator = field(init=False)
-
-    def __post_init__(self):
-        self._local = LocalQuantileEstimator(
-            self.vectors,
-            self.indices,
-            self.default_kb,
-            self.quantile,
-            self.margin,
-        )
 
     @classmethod
-    def from_batch(cls, batch):
-        estimator = cls(batch._time_estimator.vectors, batch._time_estimator.indices)
-        for entry in batch._gpu_history:
-            estimator.record(entry)
-        return estimator
+    def from_history(cls, history):
+        ceiling = cls()
+        for entry in history:
+            ceiling.record(entry)
+        return ceiling
 
     def record(self, entry):
-        """Fold one finished attempt's observed peak into the local samples."""
         peak = entry.get("peak_kb")
-        capped = bool(entry.get("capped"))
-        self._local.record(entry.get("run_id"), peak, capped=capped)
-        if isinstance(peak, (int, float)) and peak > 0:
-            self.ceiling_kb = max(
-                self.ceiling_kb,
-                float(peak) * self.margin if capped else float(peak),
-            )
-
-    def estimate_kb(self, run_id):
-        """Return the bounded local reservation, including any retry floor."""
-        return self._local.estimate(run_id)
+        if not isinstance(peak, (int, float)) or not isfinite(peak) or peak <= 0:
+            return
+        adjusted = (
+            float(peak) * devices.PEAK_BUMP_MARGIN
+            if entry.get("capped")
+            else float(peak)
+        )
+        self.ceiling_kb = max(self.ceiling_kb, adjusted)

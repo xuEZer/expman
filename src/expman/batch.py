@@ -13,7 +13,7 @@ from uuid import uuid4
 from .config import load_configs
 from .context import _nonnegative_integer
 from .devices import configured_devices
-from .estimation import TimeEstimate, TimeEstimator, validate_coverage
+from .estimation import TimeEstimate, validate_coverage
 from .events import Status
 from .experiment import AttemptResult, Experiment, ExperimentResult
 from .pipeline import Pipeline
@@ -95,7 +95,6 @@ class Batch:
         self._stage_elapsed = {
             experiment.run_id: 0.0 for experiment in self.experiments
         }
-        self._time_estimator = TimeEstimator(self.experiments)
         self._scheduler = None
         self.max_retries = max_retries
         self.recorder = InMemoryRecorder() if recorder is None else recorder
@@ -311,7 +310,6 @@ class Batch:
         ):
             raise StorageError("invalid persisted GPU observations")
         self._gpu_history = list(history)
-        self._time_estimator = TimeEstimator(self.experiments)
         self._scheduler = None
         ids = {experiment.run_id for experiment in self.experiments}
         self._queue = deque(manifest["queue"])

@@ -11,7 +11,6 @@ from unittest.mock import patch
 from expman import Batch, ConfigError, Experiment, Pipeline, Stage, Status, devices
 from expman.devices import (
     GPU_PEAK_KB_DEFAULT,
-    HOST_PEAK_KB_DEFAULT,
     HOST_RESERVE_KB,
     DeviceMemory,
     HostMemory,
@@ -501,7 +500,6 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(peaks, [])
         scheduler = GpuScheduler(batch)
         self.assertEqual(scheduler.peak_ceiling, 0)
-        self.assertEqual(scheduler._expected_peak("never-ran"), HOST_PEAK_KB_DEFAULT)
 
     def test_failed_host_query_sheds_newest_attempt_and_pauses_launches(self):
         batch = self.make_batch(count=2, devices=[0], delay=0.05)
@@ -590,13 +588,6 @@ class GpuSchedulingTests(unittest.TestCase):
         gaps = [later - earlier for earlier, later in pairwise(stamps)]
         self.assertGreaterEqual(len(stamps), 10)
         self.assertLess(max(gaps), 0.1)
-
-    def test_experiment_level_priority_refresh_is_not_used(self):
-        batch = self.make_batch(count=2, delay=0.1, devices=[0])
-        with patch.object(batch._time_estimator, "refresh_priorities") as refresh:
-            results = batch.run(progress=False)
-        refresh.assert_not_called()
-        self.assertTrue(all(result.status is Status.SUCCEEDED for result in results))
 
 
 class DeviceTests(unittest.TestCase):

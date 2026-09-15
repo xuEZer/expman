@@ -12,7 +12,7 @@ from pathlib import Path
 from time import perf_counter, sleep
 
 from . import devices, limits
-from ._memory_model import LocalQuantileEstimator, PeakEstimator
+from ._memory_model import LocalQuantileEstimator, PeakCeiling
 from ._time_model import features
 from .dependencies import observation as config_observation
 from .events import Status
@@ -105,7 +105,7 @@ class GpuScheduler:
         # Peak host memory per attempt: admission charges the configuration-based
         # estimate and the cgroup cap enforces it, so the scheduler keeps no
         # per-run table of its own here.
-        self.peaks = PeakEstimator.from_batch(batch)
+        self.peaks = PeakCeiling.from_history(batch._gpu_history)
         self._stage_peak_models = {}
         self._stage_duration_models = {}
         # Progress rendering and ETA calculation both ask for Stage groups often.
@@ -346,10 +346,6 @@ class GpuScheduler:
     def peak_ceiling(self):
         """Largest observed host peak, retained for scheduler introspection."""
         return self.peaks.ceiling_kb
-
-    def _expected_peak(self, run_id):
-        """Return the feature-based reservation for one pending run."""
-        return self.peaks.estimate_kb(run_id)
 
     def _stage_candidates(self, stage_index, gpu_capacity_kb):
         """Return diverse ready candidates for one Stage and its own history only."""
