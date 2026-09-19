@@ -9,11 +9,19 @@ from expman.scheduling import GpuScheduler
 
 
 class First(Stage):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {}
+
     def process(self, data, ctx):
         return data
 
 
 class Second(Stage):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {"item": True}
+
     def process(self, data, ctx):
         return ctx.cfg["item"]
 
@@ -48,7 +56,6 @@ class ParallelEstimationTests(unittest.TestCase):
                 ]
             )
             scheduler = GpuScheduler(batch)
-            scheduler._probe_pending = False
 
             estimate = batch.estimate()
 

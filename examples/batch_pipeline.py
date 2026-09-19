@@ -6,6 +6,10 @@ from expman import Batch, Pipeline, Stage
 
 
 class DescribeModels(Stage):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {"models": True, "seed": True}
+
     def process(self, data, ctx):
         models = ctx.cfg["models"]
         return {
@@ -17,6 +21,10 @@ class DescribeModels(Stage):
 
 
 class ReportSelection(Stage):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {}
+
     def process(self, data, ctx):
         ctx.report_metric("patch_len", data["patch_len"])
         return data

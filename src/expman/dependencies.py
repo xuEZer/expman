@@ -1,8 +1,23 @@
-"""Conservative configuration read dependencies for completed stages."""
+"""User-declared configuration dependencies for stages and snapshots."""
 
 import pickle
-from copy import deepcopy
+from collections.abc import Mapping, Sequence
 from hashlib import sha256
+
+
+def _plain(value):
+    """Canonicalize read-only configuration views for stable hashing.
+
+    The same configuration is hashed both as a plain mapping and as a frozen
+    view depending on the call site; collapsing both shapes keeps digests equal.
+    """
+    if isinstance(value, Mapping):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_plain(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_plain(item) for item in value)
+    return value
 
 
 def observation(config, path):
@@ -12,44 +27,48 @@ def observation(config, path):
             value = value[key]
     except (KeyError, IndexError, TypeError):
         return None
-    return sha256(pickle.dumps(value, protocol=4)).hexdigest()
+    return sha256(pickle.dumps(_plain(value), protocol=4)).hexdigest()
 
 
-class ConfigurationReads:
-    def __init__(self, config):
-        self.config = deepcopy(config)
-        self.active = False
-        self.paths = set()
+def declared_paths(declaration):
+    """Resolve a hierarchical declaration into a sorted tuple of paths.
 
-    def begin(self):
-        self.paths = set()
-        self.active = True
+    A declaration mirrors the configuration tree: ``True`` at a node means the
+    whole subtree at that position, a mapping recurses into its keys (strings
+    for mappings, integers for sequence indices), and ``False`` or ``None``
+    means no dependency. The root may itself be ``True`` for the whole
+    configuration.
+    """
+    paths = []
+    _collect(declaration, (), paths)
+    return tuple(sorted(set(paths), key=repr))
 
-    def end(self):
-        self.active = False
 
-    def record(self, path):
-        if self.active:
-            try:
-                self.paths.add(tuple(path))
-            except TypeError:
-                self.paths.add(())
+def _collect(node, path, paths):
+    if node is True:
+        paths.append(path)
+        return
+    if node is False or node is None:
+        return
+    if isinstance(node, Mapping):
+        for key, child in node.items():
+            if isinstance(key, bool) or not isinstance(key, (str, int)):
+                raise TypeError(
+                    "configuration dependency keys must be strings or integers"
+                )
+            _collect(child, (*path, key), paths)
+        return
+    raise TypeError(
+        "configuration dependency declaration must be True, False, None or a mapping"
+    )
 
-    def restore(self, dependencies):
-        if dependencies is None:
-            self.record(())
-            return
-        validate(dependencies)
-        if not matches(dependencies, self.config):
-            raise ValueError("checkpoint configuration dependencies changed")
-        for path, _ in dependencies:
-            self.record(path)
 
-    def export(self):
-        return [
-            (path, observation(self.config, path))
-            for path in sorted(self.paths, key=repr)
-        ]
+def stage_dependencies(stage, config):
+    """Return the declared ``(path, digest)`` dependencies of one Stage class."""
+    return [
+        (path, observation(config, path))
+        for path in declared_paths(stage.config_dependencies(config))
+    ]
 
 
 def matches(dependencies, config):

@@ -11,28 +11,16 @@ from typing import Any
 class FrozenDict(Mapping):
     _data: Mapping
 
-    def __init__(self, values, *, tracker=None, path=()):
-        object.__setattr__(self, "_tracker", tracker)
-        object.__setattr__(self, "_path", path)
+    def __init__(self, values):
         if any(not isinstance(key, str) for key in values):
             raise TypeError("configuration keys must be strings")
         object.__setattr__(
             self,
             "_data",
-            MappingProxyType(
-                {
-                    key: freeze(value, tracker=tracker, path=(*path, key))
-                    for key, value in values.items()
-                }
-            ),
+            MappingProxyType({key: freeze(value) for key, value in values.items()}),
         )
 
-    def _read(self, path=None):
-        if self._tracker is not None:
-            self._tracker.record(self._path if path is None else path)
-
     def __getitem__(self, key):
-        self._read((*self._path, key))
         return self._data[key]
 
     def get(self, *args, **kwargs):
@@ -45,36 +33,19 @@ class FrozenDict(Mapping):
             "membership checks on ctx.cfg are not allowed; use explicit configuration values"
         )
 
-    def keys(self):
-        self._read()
-        return super().keys()
-
-    def items(self):
-        self._read()
-        return super().items()
-
-    def values(self):
-        self._read()
-        return super().values()
-
     def __repr__(self):
-        self._read()
         return f"FrozenDict({self._data!r})"
 
     def __iter__(self):
-        self._read()
         return iter(self._data)
 
     def __len__(self):
-        self._read()
         return len(self._data)
 
     def __reduce__(self):
-        self._read()
         return FrozenDict, (dict(self._data),)
 
     def __deepcopy__(self, memo):
-        self._read()
         return self
 
 
@@ -82,57 +53,42 @@ class FrozenDict(Mapping):
 class FrozenList(Sequence):
     _values: tuple
 
-    def __init__(self, values, *, tracker=None, path=()):
-        object.__setattr__(self, "_tracker", tracker)
-        object.__setattr__(self, "_path", path)
+    def __init__(self, values):
         object.__setattr__(
             self,
             "_values",
-            tuple(
-                freeze(value, tracker=tracker, path=(*path, index))
-                for index, value in enumerate(values)
-            ),
+            tuple(freeze(value) for value in values),
         )
 
-    def _read(self, path=None):
-        if self._tracker is not None:
-            self._tracker.record(self._path if path is None else path)
-
     def __repr__(self):
-        self._read()
         return f"FrozenList({self._values!r})"
 
     def __getitem__(self, key):
-        self._read() if isinstance(key, slice) else self._read((*self._path, key))
         value = self._values[key]
         return FrozenList(value) if isinstance(key, slice) else value
 
     def __len__(self):
-        self._read()
         return len(self._values)
 
     def __eq__(self, other):
-        self._read()
         return isinstance(other, (list, tuple, FrozenList)) and self._values == tuple(
             other
         )
 
     def __reduce__(self):
-        self._read()
         return FrozenList, (self._values,)
 
     def __deepcopy__(self, memo):
-        self._read()
         return self
 
 
-def freeze(value: Any, *, tracker=None, path=()) -> Any:
+def freeze(value: Any) -> Any:
     if isinstance(value, (FrozenDict, FrozenList)):
         return value
     if isinstance(value, Mapping):
-        return FrozenDict(value, tracker=tracker, path=path)
+        return FrozenDict(value)
     if isinstance(value, (list, tuple)):
-        return FrozenList(value, tracker=tracker, path=path)
+        return FrozenList(value)
     if isinstance(value, (set, frozenset)):
         return frozenset(freeze(item) for item in value)
     if value is None or isinstance(

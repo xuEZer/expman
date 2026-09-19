@@ -14,6 +14,7 @@ from time import perf_counter, sleep
 from . import devices, limits
 from ._memory_model import LocalQuantileEstimator, PeakCeiling
 from ._time_model import features
+from .dependencies import declared_paths
 from .dependencies import observation as config_observation
 from .events import Status
 from .experiment import AttemptResult, SnapshotOutput, StageResult
@@ -58,9 +59,7 @@ class Worker:
     memory_events: dict = field(default_factory=dict)
     finished: StageResult | None = None
     dependencies: list | None = None
-    stage_reports: list | None = None
     reused: bool = False
-    probe: bool = False
     cap_hit: bool = False
 
 
@@ -108,80 +107,65 @@ class GpuScheduler:
         self.peaks = PeakCeiling.from_history(batch._gpu_history)
         self._stage_peak_models = {}
         self._stage_duration_models = {}
-        # Progress rendering and ETA calculation both ask for Stage groups often.
-        # A group is determined by the configuration plus the dependency paths
-        # discovered from completed Stages; recomputing those paths by scanning the
-        # complete history for every rendered row made the presentation threads
-        # contend with dispatch on large Batches.  Keep an incremental index instead.
-        self._stage_paths_cache = {}
+        # Progress rendering and ETA calculation ask for Stage groups often.
+        # Dependencies are declared by each Stage, so the identity of a run is
+        # known before it executes and never changes; cache it per run and Stage.
+        self._declared_paths_cache = {}
+        self._prefix_paths_cache = {}
         self._stage_group_cache = {}
-        self._stage_history_seen = 0
-        self._sync_stage_groups()
         batch._scheduler = self
-        self._probe_pending = not any(
-            experiment.result.attempts for experiment in batch.experiments
-        )
+
+    def _declared_paths(self, run_id, stage_index):
+        """Return the paths one Stage declares for one run."""
+        cached = self._declared_paths_cache.setdefault(run_id, {})
+        paths = cached.get(stage_index)
+        if paths is None:
+            experiment = next(
+                item for item in self.batch.experiments if item.run_id == run_id
+            )
+            stage_type = experiment.pipeline.stages[stage_index]
+            paths = declared_paths(stage_type.config_dependencies(experiment._frozen))
+            cached[stage_index] = paths
+        return paths
+
+    def _prefix_paths(self, run_id, stage_index):
+        """Return the rolling declared dependencies of one Stage's inputs.
+
+        A Stage receives the output of every preceding Stage, so their declared
+        dependencies are part of its input identity as well: when they match, the
+        upstream value is reusable.
+        """
+        cached = self._prefix_paths_cache.setdefault(run_id, {})
+        paths = cached.get(stage_index)
+        if paths is None:
+            collected = set()
+            for index in range(stage_index + 1):
+                collected.update(self._declared_paths(run_id, index))
+            paths = frozenset(collected)
+            cached[stage_index] = paths
+        return paths
 
     def _stage_paths(self, stage_index):
-        """Return the rolling configuration dependencies for one top-level Stage.
-
-        A Stage receives the output of every preceding Stage.  Their reads are
-        therefore part of its input identity as well: when those reads match,
-        the upstream value is reusable.  Current-Stage reads join that prefix as
-        soon as the first sample supplies them.
-        """
-        self._sync_stage_groups()
-        return set(self._stage_paths_cache.get(stage_index, ()))
-
-    def _sync_stage_groups(self):
-        """Incorporate newly recorded dependencies into the reusable-group index."""
-        history = self.batch._stage_history
-        if len(history) < self._stage_history_seen:
-            # Tests and recovery tooling may replace history wholesale.  Rebuild
-            # rather than retaining identities derived from a discarded record.
-            self._stage_paths_cache.clear()
-            self._stage_group_cache.clear()
-            self._stage_history_seen = 0
-        stage_count = len(self.batch.experiments[0].pipeline.stages)
-        for entry in history[self._stage_history_seen :]:
-            source_stage = entry.get("stage")
-            if not isinstance(source_stage, int):
-                continue
-            paths = {
-                path
-                for dependency in entry.get("dependencies") or ()
-                if isinstance(dependency, tuple)
-                and len(dependency) == 2
-                and isinstance((path := dependency[0]), tuple)
-            }
-            if not paths:
-                continue
-            # A Stage consumes every preceding output, so a new read at Stage S
-            # changes the identity of S and each later Stage, but never an earlier
-            # one.
-            for stage_index in range(max(0, source_stage), stage_count):
-                known = self._stage_paths_cache.setdefault(stage_index, set())
-                if not paths.issubset(known):
-                    known.update(paths)
-                    self._stage_group_cache.pop(stage_index, None)
-        self._stage_history_seen = len(history)
+        """Return the union of every run's declared prefix paths at one Stage."""
+        paths = set()
+        for experiment in self.batch.experiments:
+            paths.update(self._prefix_paths(experiment.run_id, stage_index))
+        return paths
 
     def _append_stage_history(self, entry):
-        """Record one Stage result and refresh only affected group identities."""
+        """Record one Stage result for diagnostics and resource sampling."""
         self.batch._stage_history.append(entry)
-        self._sync_stage_groups()
 
     def _stage_group(self, run_id, stage_index):
         """Return the reusable work identity of one top-level Stage."""
-        self._sync_stage_groups()
         cached = self._stage_group_cache.setdefault(stage_index, {})
         if run_id in cached:
             return cached[run_id]
         experiment = next(
             item for item in self.batch.experiments if item.run_id == run_id
         )
-        config = experiment._cfg
-        paths = sorted(self._stage_paths(stage_index), key=repr)
+        config = experiment._frozen
+        paths = sorted(self._prefix_paths(run_id, stage_index), key=repr)
         group = (
             stage_index,
             config_observation(config, ("seed",)),
@@ -204,7 +188,7 @@ class GpuScheduler:
         active = {}
         for run_id, details in running.items():
             stage_index = details.get("stage_index")
-            if details.get("probe") or not isinstance(stage_index, int):
+            if not isinstance(stage_index, int):
                 return None
             active[self._stage_group(run_id, stage_index)] = (run_id, stage_index)
         groups = dict(active)
@@ -221,8 +205,6 @@ class GpuScheduler:
 
     def stage_completion(self):
         """Return completed and total reusable parameter groups per Stage."""
-        if self._probe_pending:
-            return None
         totals = {}
         for experiment in self.batch.experiments:
             for stage_index in range(len(experiment.pipeline.stages)):
@@ -243,18 +225,12 @@ class GpuScheduler:
         )
 
     def _stage_vectors(self, stage_index):
-        """Encode only the rolling dependency prefix of a Stage's inputs."""
-        paths = self._stage_paths(stage_index)
+        """Encode each run's declared dependency prefix for a Stage input."""
         configs = []
         for experiment in self.batch.experiments:
-            cfg = experiment.cfg
-            if not paths:
-                # Before any dependency sample, use the whole configuration to
-                # choose informative cold-start probes.
-                configs.append(cfg)
-                continue
+            cfg = experiment._frozen
             projected = {}
-            for path in paths:
+            for path in self._prefix_paths(experiment.run_id, stage_index):
                 value = cfg
                 try:
                     for key in path:
@@ -355,20 +331,19 @@ class GpuScheduler:
             for run_id in batch._queue
             if batch._stage_progress[run_id] == stage_index
         ]
-        if not self._probe_pending:
-            # Dependency groups are known after the complete-pipeline probe.
-            # Keep exactly one representative runnable; cache materialization
-            # advances every other member once that representative finishes.
-            representatives = {}
-            for run_id in run_ids:
-                group = self._stage_group(run_id, stage_index)
-                previous = representatives.get(group)
-                if previous is None or (
-                    f"{run_id}:{stage_index}" in batch._stage_attempts
-                    and f"{previous}:{stage_index}" not in batch._stage_attempts
-                ):
-                    representatives[group] = run_id
-            run_ids = list(representatives.values())
+        # Declared dependency groups are known before execution. Keep exactly one
+        # representative runnable; cache materialization advances every other
+        # member once that representative finishes.
+        representatives = {}
+        for run_id in run_ids:
+            group = self._stage_group(run_id, stage_index)
+            previous = representatives.get(group)
+            if previous is None or (
+                f"{run_id}:{stage_index}" in batch._stage_attempts
+                and f"{previous}:{stage_index}" not in batch._stage_attempts
+            ):
+                representatives[group] = run_id
+        run_ids = list(representatives.values())
         if not run_ids:
             return []
         vectors, indices = self._stage_vectors(stage_index)
@@ -458,7 +433,6 @@ class GpuScheduler:
                     "duration": max(0.0, now - worker.started),
                     "expected_seconds": worker.expected_seconds,
                     "stage_index": worker.stage_index,
-                    "probe": worker.probe,
                     "resident_kb": worker.resident_kb,
                     "peak_kb": worker.peak_kb,
                     "gpu_allocated_kb": worker.gpu_allocated_kb,
@@ -490,8 +464,6 @@ class GpuScheduler:
                     dependencies if isinstance(dependencies, list) else None
                 )
                 worker.reused = message.get("reused") is True
-                reports = message.get("stage_reports")
-                worker.stage_reports = reports if isinstance(reports, list) else None
                 resources = message.get("resources")
                 if isinstance(resources, dict):
                     self._resources(worker, resources)
@@ -701,25 +673,6 @@ class GpuScheduler:
         for candidate, device in self._launch_plan(memory, host):
             self._launch(device, memory[device], host, candidate)
 
-    def _probe_candidate(self, memory, host):
-        """Give the dependency probe this tick's entire allocatable capacity."""
-        device, observation = max(memory.items(), key=lambda item: item[1].free)
-        host_estimate = host.headroom_kb / devices.CAPACITY_FACTOR
-        host_contract = limits.cap_kb(host_estimate)
-        # ``cap_kb`` has a startup floor.  Do not let that floor turn a tiny
-        # headroom into an overcommitted probe.
-        if host_contract > host.headroom_kb:
-            return None
-        return device, Candidate(
-            self.batch._queue[0],
-            0,
-            host_estimate,
-            host_contract,
-            observation.free * 1024,
-            None,
-            1.0,
-        )
-
     def _materialize_reuses(self):
         """Advance cache-equivalent Stage members without creating a worker."""
         changed = False
@@ -740,7 +693,7 @@ class GpuScheduler:
                     if parent_ref is None:
                         continue
                     parent = parent_ref[2]
-                candidate = shared.find(parent, (stage_index,), experiment._cfg)
+                candidate = shared.find(parent, (stage_index,), experiment._frozen)
                 if candidate is None:
                     continue
                 reference, completed = candidate
@@ -790,14 +743,14 @@ class GpuScheduler:
             self.batch._save()
         return changed
 
-    def _launch(self, device, memory, host, candidate, *, probe=False):
+    def _launch(self, device, memory, host, candidate):
         batch = self.batch
         with batch._state_lock:
             if candidate.run_id not in batch._queue:
                 return False
             batch._queue.remove(candidate.run_id)
         run_id = candidate.run_id
-        stage_index = None if probe else candidate.stage_index
+        stage_index = candidate.stage_index
         host_estimate = candidate.host_estimate_kb
         host_contract = candidate.host_contract_kb
         gpu_contract = candidate.gpu_contract_kb
@@ -813,16 +766,13 @@ class GpuScheduler:
         with batch._state_lock:
             batch._active_gpu[run_id] = device
         experiment = next(item for item in batch.experiments if item.run_id == run_id)
-        # A full-Pipeline probe is also the first execution attempt of Stage 0.
-        # If it is interrupted, Stage 0 must resume as attempt 2 so user
-        # checkpoint/retry logic does not mistake the recovery for a new run.
-        stage_key = f"{run_id}:{0 if probe else stage_index}"
+        stage_key = f"{run_id}:{stage_index}"
         previous_stage_attempt = batch._stage_attempts.get(stage_key)
         stage_attempt = (previous_stage_attempt or 0) + 1
         root = (
             experiment.output_dir
             / "attempts"
-            / ("probe" if probe else f"stage-{stage_index}")
+            / f"stage-{stage_index}"
             / str(stage_attempt)
         )
         process = None
@@ -880,7 +830,7 @@ class GpuScheduler:
             # The unit is unique per attempt: systemd unloads a finished scope
             # asynchronously, and a retry must not collide with the previous one.
             limit = limits.memory_limit(
-                f"expman-{run_id[:12]}-{'probe' if probe else stage_index}-{stage_attempt}",
+                f"expman-{run_id[:12]}-{stage_index}-{stage_attempt}",
                 host_estimate,
             )
             if limit.cgroup is not None:
@@ -933,7 +883,6 @@ class GpuScheduler:
                 gpu_contract_kb=gpu_contract,
                 expected_seconds=duration_estimate,
                 limit=limit,
-                probe=probe,
             )
             parent_socket = None
         except BaseException:
@@ -1014,63 +963,6 @@ class GpuScheduler:
                     f"{worker.gpu_contract_kb / 1024:.0f} MiB"
                 ),
             )
-        if worker.probe:
-            with self.batch._state_lock:
-                experiment._active_started = None
-                # The probe executes Stage 0 as part of the complete Pipeline.
-                # Preserve that attempt number even when the probe is interrupted:
-                # the first normal Stage-0 worker must resume as attempt 2.
-                self.batch._stage_attempts[f"{run_id}:0"] = worker.stage_attempt
-                self.batch._active_gpu.pop(run_id)
-                self.batch._gpu_running_info.pop(run_id, None)
-                del self.workers[run_id]
-                if worker.channel is not None:
-                    worker.channel.socket.close()
-                self._probe_pending = False
-                if result.status is Status.SUCCEEDED:
-                    for report in worker.stage_reports or ():
-                        if not isinstance(report, dict) or not isinstance(
-                            report.get("stage"), int
-                        ):
-                            continue
-                        self._append_stage_history(
-                            {
-                                "run_id": run_id,
-                                "stage": report["stage"],
-                                "status": Status.SUCCEEDED.value,
-                                "reused": True,
-                                "probe": True,
-                                "dependencies": report.get("dependencies"),
-                            }
-                        )
-                    experiment._attempts.append(
-                        AttemptResult(
-                            run_id,
-                            len(experiment.result.attempts) + 1,
-                            Status.SUCCEEDED,
-                            duration,
-                            output_source=SnapshotOutput(
-                                experiment._store,
-                                (len(experiment.pipeline.stages) - 1,),
-                            )
-                            if experiment.pipeline.stages
-                            else None,
-                        )
-                    )
-                else:
-                    experiment._attempts.append(
-                        AttemptResult(
-                            run_id,
-                            len(experiment.result.attempts) + 1,
-                            result.status,
-                            duration,
-                            error_type=result.error_type,
-                            error_message=result.error_message,
-                        )
-                    )
-                    self.batch._queue.appendleft(run_id)
-                self.batch._save()
-            return
         with self.batch._state_lock:
             experiment._active_started = None
             stage_key = f"{run_id}:{worker.stage_index}"
@@ -1173,16 +1065,8 @@ class GpuScheduler:
                 self._relieve(memory, host)
                 launching = self.host_gate.can_launch(host, list(self.workers))
                 if launching and memory is not None:
-                    if self._probe_pending and not self.workers and self.batch._queue:
-                        probe = self._probe_candidate(memory, host)
-                        if probe is not None:
-                            device, candidate = probe
-                            self._launch(
-                                device, memory[device], host, candidate, probe=True
-                            )
-                    elif not self._probe_pending:
-                        self._materialize_reuses()
-                        self._launch_available(memory, host)
+                    self._materialize_reuses()
+                    self._launch_available(memory, host)
                 sleep(devices.POLL_INTERVAL)
             return self.batch.results
         except BaseException:

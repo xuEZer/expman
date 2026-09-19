@@ -6,6 +6,10 @@ from expman import Batch, Pipeline, Stage
 
 
 class Sample(Stage):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {"count": True}
+
     def process(self, data, ctx):
         samples = ctx.state.setdefault("samples", [])
         while len(samples) < ctx.cfg["count"]:

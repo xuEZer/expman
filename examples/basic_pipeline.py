@@ -6,11 +6,19 @@ from expman import ExecutionEvent, InMemoryRecorder, Pipeline, RunContext, Stage
 
 
 class LoadNumbers(Stage[None, list[float]]):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {}
+
     def process(self, data: None, ctx: RunContext) -> list[float]:
         return [2.0, 4.0, 6.0]
 
 
 class Scale(Stage[list[float], list[float]]):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {"factor": True}
+
     def process(self, data: list[float], ctx: RunContext) -> list[float]:
         result = []
         for index, value in enumerate(data, start=1):
@@ -26,6 +34,10 @@ class Summary:
 
 
 class Summarize(Stage[list[float], Summary]):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {}
+
     def process(self, data: list[float], ctx: RunContext) -> Summary:
         mean = sum(data) / len(data)
         ctx.report_metric("mean", mean)

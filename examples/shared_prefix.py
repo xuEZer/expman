@@ -7,6 +7,10 @@ from expman import Batch, Pipeline, Stage
 
 
 class Prepare(Stage):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {"size": True}
+
     def process(self, data, ctx):
         print("Preparing data once")
         ctx.state["size"] = ctx.cfg["size"]
@@ -14,6 +18,10 @@ class Prepare(Stage):
 
 
 class Predict(Stage):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {"scale": True}
+
     def process(self, data, ctx):
         return [value * ctx.cfg["scale"] for value in data]
 

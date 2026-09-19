@@ -111,49 +111,26 @@ def main():
     recorder = IpcRecorder(channel)
     try:
         with RunLock(experiment.output_dir):
+            stage_index = payload["stage_index"]
             try:
-                stage_index = payload.get("stage_index")
-                result = (
-                    experiment.run(recorder=recorder)
-                    if stage_index is None
-                    else experiment.run_stage(
-                        stage_index, attempt=payload["stage_attempt"], recorder=recorder
-                    )
+                result = experiment.run_stage(
+                    stage_index, attempt=payload["stage_attempt"], recorder=recorder
                 )
             except BaseException as error:
-                if stage_index is None:
-                    result = experiment.result.attempts[-1]
-                else:
-                    result = StageResult(
-                        experiment.run_id,
-                        stage_index,
-                        payload["stage_attempt"],
-                        Status.FAILED
-                        if isinstance(error, Exception)
-                        else Status.CANCELLED,
-                        0.0,
-                        type(error).__qualname__,
-                        _error_message(error),
-                    )
+                result = StageResult(
+                    experiment.run_id,
+                    stage_index,
+                    payload["stage_attempt"],
+                    Status.FAILED if isinstance(error, Exception) else Status.CANCELLED,
+                    0.0,
+                    type(error).__qualname__,
+                    _error_message(error),
+                )
             completed = (
                 None
-                if stage_index is None or result.status.value != "succeeded"
+                if result.status.value != "succeeded"
                 else experiment._store.completed((stage_index,))
             )
-            stage_reports = None
-            if stage_index is None and result.status.value == "succeeded":
-                stage_reports = []
-                for index in range(len(experiment.pipeline.stages)):
-                    record = experiment._store.completed((index,))
-                    if record is None:
-                        continue
-                    stage_reports.append(
-                        {
-                            "stage": index,
-                            "dependencies": record.get("config_dependencies"),
-                            "reused": bool(record.get("_shared_reused", False)),
-                        }
-                    )
             with suppress(OSError):
                 channel.send(
                     {
@@ -167,7 +144,6 @@ def main():
                             completed is not None
                             and completed.get("_shared_reused", False)
                         ),
-                        "stage_reports": stage_reports,
                         "resources": _resource_snapshot(_resource_cgroup()),
                     }
                 )

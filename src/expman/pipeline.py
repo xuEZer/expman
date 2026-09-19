@@ -9,6 +9,7 @@ from time import perf_counter
 from typing import Any
 
 from .context import RunContext, _name
+from .dependencies import stage_dependencies
 from .events import Status
 from .stage import Stage
 from .storage import Checkpoint, RecoveryWarning
@@ -121,7 +122,7 @@ class Pipeline:
                     started = (store.stage_dir(position) / "status.pkl").exists()
                     if not started and not store.checkpoints(position):
                         restore_started = perf_counter()
-                        candidate = shared.find(parent, position, store.reads.config)
+                        candidate = shared.find(parent, position, scoped.cfg)
                         if candidate is not None:
                             reference, completed = candidate
                             store.restore_random(completed)
@@ -151,17 +152,14 @@ class Pipeline:
                             continue
                     lookup = False
                 checkpoint = None
-                if shared is not None:
-                    store.reads.begin()
                 try:
                     if store is not None:
+                        dependencies = stage_dependencies(stage_type, scoped.cfg)
                         store.status(position, Status.RUNNING.value, context.attempt)
-                        checkpoint = store.latest(position, restore_random=True)
+                        checkpoint = store.latest(
+                            position, config=scoped.cfg, restore_random=True
+                        )
                         if checkpoint is not None:
-                            if store.reads is not None:
-                                store.reads.restore(
-                                    checkpoint.get("config_dependencies")
-                                )
                             scoped.state.clear()
                             scoped.state.update(checkpoint["state"])
                             scoped._pipeline_calls.update(
@@ -175,6 +173,7 @@ class Pipeline:
                                 scoped.state,
                                 None if checkpoint is None else checkpoint.get("step"),
                                 scoped._pipeline_calls,
+                                dependencies,
                             ),
                         )
                     if store is not None:
@@ -217,7 +216,6 @@ class Pipeline:
                     if store is not None:
                         store.stop_timing(position)
                     if shared is not None:
-                        store.reads.end()
                         store.cache_position = None
                         store.cache_parent = None
             return data

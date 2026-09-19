@@ -58,11 +58,13 @@ tests/             对外契约和失败行为测试
 ```python
 class Stage(Generic[InputT, OutputT], ABC):
     def __init__(self, *, name: str | None = None): ...
+    @classmethod
+    def config_dependencies(cls, cfg) -> Mapping | bool: ...
     def run(self, data: InputT, ctx: RunContext | None = None) -> OutputT: ...
     def process(self, data: InputT, ctx: RunContext) -> OutputT: ...
 ```
 
-- 用户实现抽象方法 `process()`，接收输入并返回输出。
+- 用户实现抽象方法 `process()`，接收输入并返回输出；重写 `config_dependencies()` 声明该 Stage 结果依赖的配置位置（见 §7）。
 - `run()` 是基类提供的执行入口，通过 RunContext 统一包装生命周期监测。
 - `run()` 使用 `typing.final` 标记，供静态工具检查覆盖行为；Python 运行时不会阻止子类覆盖，因此扩展契约要求用户只覆盖 `process()`。
 - 名称默认使用子类名，可通过 `super().__init__(name="...")` 设置。自定义构造函数须调用基类构造函数。
@@ -319,9 +321,9 @@ YAML 顶层 `device` 是 Batch 级必填的非空、非负且不重复的 NVIDIA
 
 `GpuScheduler` 在主进程持有 Batch 锁并管理多个独立解释器；单个实验的每次尝试使用新的进程组。bootstrap 先安装父进程 EOF 监听，再导入用户模块和反序列化 Pipeline/Serializer。入口脚本的顶层 Stage 可复用，主入口必须有 main guard；局部类和闭包不满足默认进程传输契约。工作进程持有实验目录锁，避免同一实验快照被两个执行者写入。
 
-调度任务是一个顶层 Stage。调度器只派发尚未完成的目标 Stage；子进程在进入目标前恢复已有前缀快照，禁止隐式执行缺失的上游 Stage。完成消息携带 StageResult（状态、耗时）、该进程最终的 cgroup 内存当前值/峰值、PyTorch 分配器显存当前值/峰值和配置依赖；普通 Recorder 事件也通过同一私有 socket IPC 传输。调度器每个 tick 读取全局主机与整卡显存，并消费 IPC，但不逐个查询 worker 的 `/proc` 或 cgroup；仅在 worker 已退出而 IPC 来不及报告 cgroup OOM 时读取一次该 cgroup 的事件计数。
+调度任务是一个顶层 Stage。调度器只派发尚未完成的目标 Stage；子进程在进入目标前恢复已有前缀快照，禁止隐式执行缺失的上游 Stage。完成消息携带 StageResult（状态、耗时）、该进程最终的 cgroup 内存当前值/峰值、PyTorch 分配器显存当前值/峰值和 Stage 声明的配置依赖；普通 Recorder 事件也通过同一私有 socket IPC 传输。调度器每个 tick 读取全局主机与整卡显存，并消费 IPC，但不逐个查询 worker 的 `/proc` 或 cgroup；仅在 worker 已退出而 IPC 来不及报告 cgroup OOM 时读取一次该 cgroup 的事件计数。
 
-每个顶层 Stage 使用独立的耗时、主机峰值和显存峰值模型。特征为滚动累积配置读取路径：所有上游 Stage 的依赖与当前 Stage 已观测依赖共同组成输入身份；此前缀相同即上游输入相同。无样本时以完整配置选择异质冷启动组合；有样本时从资源可行候选中选择与同 Stage 样本距离最大的配置。估计取同 Stage 最近配置的保守经验分位数，样本不足时取整个 Stage 的分位数；因此不会因稀疏高维数据向未采样区域产生无界外推。模型缓存只在新的 Stage 完成时失效，tick 的瞬时资源报告不会训练模型。
+每个顶层 Stage 使用独立的耗时、主机峰值和显存峰值模型。特征为滚动累积的声明依赖路径：所有上游 Stage 声明的路径与当前 Stage 声明的路径共同组成输入身份；此前缀相同即上游输入相同。依赖在派发前由 `Stage.config_dependencies(cfg)` 计算，因此冷启动也直接按声明路径选择异质组合，不需要探查阶段；有样本时从资源可行候选中选择与同 Stage 样本距离最大的配置。估计取同 Stage 最近配置的保守经验分位数，样本不足时取整个 Stage 的分位数；因此不会因稀疏高维数据向未采样区域产生无界外推。模型缓存只在新的 Stage 完成时失效，tick 的瞬时资源报告不会训练模型。
 
 未知 Stage 的主机和显存峰值各为 1 GiB。主机准入要求 `MemAvailable - HOST_RESERVE_KB` 足以覆盖新 Stage 的 cgroup 合约和所有运行 worker 尚未使用的合约部分；每个 cgroup `memory.max` 是模型峰值的 110%。拒绝申请或接近上限时，样本只按固定倍率作为有限的下界并抬升同一组合的重试估计。GPU 准入按整卡空闲显存及同卡 PyTorch 尚未使用的分配器合约计算；PyTorch 可用时以 `set_per_process_memory_fraction` 应用该合约，合约不会超过物理卡容量。没有 PyTorch 遥测并不被当作 CPU 证据；显式报告零峰值的 Stage 不预留显存但仍分配一张可见 GPU。
 
@@ -344,9 +346,9 @@ Pipeline 复用已完成阶段时恢复其结束随机状态；选择 checkpoint
 
 Batch 为各 Experiment 和 GPU worker 提供同一个 cache 根目录。Pipeline 在阶段入口先检查本 run 完成记录，再查询共享节点；第一次未命中后关闭后续共享查询。已执行节点的本地引用记录 shared_reused=False，重试时沿用该边界。已有阶段状态或 checkpoint 表示本 run 已进入阶段，优先恢复自己的进度。
 
-ConfigurationReads 记录阶段执行及序列化期间对只读配置的访问路径，并对路径的完整值计算摘要。父容器读取覆盖完整子树，遍历覆盖当前节点；缺失索引也记录，防止用户捕获 KeyError 后遗漏依赖。禁止配置 get 和成员存在性查询。嵌套 Pipeline 共用外层追踪周期。checkpoint 在内存中通过配置的 Serializer 将状态序列化为字节，再导出读取依赖，将字节载荷与依赖封装到同一原子文件。这样能保留序列化期间的读取，并且用户对象只序列化一次。恢复时解码载荷、校验依赖格式及配置值，再将路径合并到当前追踪器；阶段结束时导出累计读取集合。旧 checkpoint 缺少依赖记录时保守标记根配置依赖。封装暂存序列化字节会增加保存时的内存占用。
+`Stage.config_dependencies(cfg)` 由用户显式声明依赖，声明与配置树同构：节点为 `True` 表示依赖该子树，为映射则递归到子键（序列用整数下标），缺省或 `False` 表示不依赖，返回 `True` 表示依赖完整配置。声明接收只读的 `cfg`，因此可以按取值选择分支；默认返回 `True`，读取 `ctx.cfg` 却未重写该方法的 Stage 因此保守地依赖完整配置。框架把声明解析为路径集合并对路径的完整值计算摘要（`dependencies.py`），不再在运行时追踪读取、也没有探查阶段。禁止配置 get 和成员存在性查询。前缀身份是所有上游 Stage 声明与当前 Stage 声明的并集；嵌套 Pipeline 的依赖由外层 Stage 的声明覆盖。checkpoint 与完成快照保存当前声明的依赖，恢复时校验格式及配置值。旧 checkpoint 若携带早期运行时追踪的依赖记录，仍按该记录匹配；由于摘要方案已规范化，这类记录通常不匹配并按损坏回退到重跑。
 
-PrefixCache 使用 Pipeline 签名与根 seed 隔离树；树边包含阶段位置、配置依赖与不可变 UUID 节点。snapshot.pkl 原子写入完成后才发布 metadata.pkl，读者只扫描已发布元数据。节点保存输出、state、随机状态及数值指标。本地完成记录引用节点，恢复时重新反序列化以隔离可变对象。候选损坏时 warning 并重新计算；本 run 已提交引用损坏则按恢复错误处理。
+PrefixCache 使用 Pipeline 签名与根 seed 隔离树；树边包含阶段位置、声明的配置依赖与不可变 UUID 节点。snapshot.pkl 原子写入完成后才发布 metadata.pkl，读者只扫描已发布元数据。节点保存输出、state、随机状态及数值指标。本地完成记录引用节点，恢复时重新反序列化以隔离可变对象。候选损坏时 warning 并重新计算；本 run 已提交引用损坏则按恢复错误处理。
 
 共享命中将指标复制到当前 run，再提交本地完成引用。指标 UPSERT 允许中途退出后重放。旧格式本地快照仍能恢复，但缺少共享父节点身份的后续阶段只保存本地快照。并发发布使用独立节点，允许重复计算，不等待其他生产者。
 

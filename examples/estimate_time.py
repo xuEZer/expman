@@ -7,6 +7,10 @@ from expman import Batch, Pipeline, Stage
 
 
 class Work(Stage):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {"size": True}
+
     def process(self, data, ctx):
         sleep(0.1 * ctx.cfg["size"])
         score = 1 / ctx.cfg["size"]

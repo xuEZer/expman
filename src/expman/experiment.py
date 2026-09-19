@@ -9,9 +9,8 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from .context import RunContext, _error_message, _name
-from .dependencies import ConfigurationReads
 from .events import Status
-from .frozen import FrozenDict, freeze
+from .frozen import freeze
 from .metrics import MetricStore
 from .pipeline import Pipeline
 from .prefix_cache import PrefixCache
@@ -138,7 +137,7 @@ class Experiment:
         if "seed" not in self._cfg:
             raise ValueError("seed is required")
         validate_seed(self._cfg["seed"])
-        freeze(self._cfg)
+        self._frozen = freeze(self._cfg)
         self._run_id = uuid4().hex if run_id is None else run_id
         _name(self._run_id, "run_id")
         self._attempts: list[AttemptResult] = []
@@ -154,7 +153,6 @@ class Experiment:
         )
         self._store = RunStore(self.output_dir, serializer)
         self._cache_root = _cache_root
-        self._reads = ConfigurationReads(self._cfg)
         if _cache_root is not None:
             self._store.shared = PrefixCache(
                 _cache_root,
@@ -162,7 +160,6 @@ class Experiment:
                 self._cfg["seed"],
                 self._store.serializer,
             )
-            self._store.reads = self._reads
             self._store.metrics = self._metrics
             self._store.run_id = self._run_id
         if not _resume:
@@ -235,7 +232,7 @@ class Experiment:
             ctx = RunContext(
                 run_id=self.run_id,
                 recorder=InMemoryRecorder() if recorder is None else recorder,
-                cfg=FrozenDict(self._cfg, tracker=self._reads),
+                cfg=self._frozen,
                 attempt=attempt,
                 _store=self._store,
                 _metrics=self._metrics,
@@ -289,7 +286,7 @@ class Experiment:
             ctx = RunContext(
                 run_id=self.run_id,
                 recorder=InMemoryRecorder() if recorder is None else recorder,
-                cfg=FrozenDict(self._cfg, tracker=self._reads),
+                cfg=self._frozen,
                 attempt=attempt,
                 _store=self._store,
                 _metrics=self._metrics,

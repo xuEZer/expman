@@ -96,7 +96,6 @@ class RunStore:
         self.serializer = PickleSerializer() if serializer is None else serializer
         self.rng = None
         self.shared = None
-        self.reads = None
         self.metrics = None
         self.run_id = None
         self.cache_parent = None
@@ -207,7 +206,7 @@ class RunStore:
             self.serializer,
         )
 
-    def complete(self, position, output, state, name) -> None:
+    def complete(self, position, output, state, name, dependencies=None) -> None:
         record = {
             "position": position,
             "name": name,
@@ -216,15 +215,15 @@ class RunStore:
             **self.random_snapshot(),
             "elapsed_seconds": self.elapsed(position),
         }
-        if self.reads is not None:
-            record["config_dependencies"] = self.reads.export()
+        if dependencies is not None:
+            record["config_dependencies"] = dependencies
         if (
             self.shared is not None
             and self.cache_position == position
             and self.cache_parent is not None
         ):
             record["metrics"] = self.metrics.snapshot(self.run_id, position)
-            reference = self.shared.publish(self.cache_parent, record, self.reads)
+            reference = self.shared.publish(self.cache_parent, record)
             self.reference(position, reference, reused=False)
         else:
             write_record(
@@ -237,7 +236,7 @@ class RunStore:
         directory = self.stage_dir(position) / "checkpoints"
         return sorted(directory.glob("[0-9]*.pkl"), reverse=True)
 
-    def latest(self, position, *, restore_random=False) -> dict | None:
+    def latest(self, position, *, config=None, restore_random=False) -> dict | None:
         for path in self.checkpoints(position):
             try:
                 record = read_record(path, self.serializer)
@@ -256,8 +255,8 @@ class RunStore:
                 if "config_dependencies" in record:
                     try:
                         validate(record["config_dependencies"])
-                        if self.reads is not None and not matches(
-                            record["config_dependencies"], self.reads.config
+                        if config is not None and not matches(
+                            record["config_dependencies"], config
                         ):
                             raise ValueError(
                                 "checkpoint configuration dependencies changed"
@@ -276,13 +275,20 @@ class Checkpoint:
     """Save current state synchronously; keep two successfully written files."""
 
     def __init__(
-        self, store: RunStore, position, state: dict, step=None, pipeline_calls=None
+        self,
+        store: RunStore,
+        position,
+        state: dict,
+        step=None,
+        pipeline_calls=None,
+        dependencies=None,
     ):
         self._store = store
         self._position = position
         self._state = state
         self.step = step
         self._pipeline_calls = {} if pipeline_calls is None else pipeline_calls
+        self.dependencies = dependencies
 
     def save(self, *, step: int | None = None) -> Path:
         if step is not None and (
@@ -304,20 +310,8 @@ class Checkpoint:
             **self._store.random_snapshot(),
             "elapsed_seconds": self._store.elapsed(self._position),
         }
-        if self._store.reads is not None:
-            # Serialize live user objects once, before freezing the dependency set.
-            # The outer envelope contains only bytes and dependency metadata.
-            try:
-                payload = io.BytesIO()
-                self._store.serializer.dump(record, payload)
-                record = _CheckpointEnvelope(
-                    payload=payload.getvalue(),
-                    dependencies=self._store.reads.export(),
-                )
-            except Exception as error:
-                raise StorageError(
-                    f"cannot serialize checkpoint {path}: {error}"
-                ) from error
+        if self.dependencies is not None:
+            record["config_dependencies"] = self.dependencies
         write_record(path, record, self._store.serializer)
         self.step = step
         for old in self._store.checkpoints(self._position)[2:]:

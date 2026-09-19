@@ -18,17 +18,19 @@
 
 - 命名默认配置统一从项目根目录的 configs 加载；示例默认参数迁移至项目 configs/models。
 
-- checkpoint 原子保存并恢复实际配置依赖，避免下游无关参数变化导致前缀重算；保留序列化读取及旧检查点的保守回退。
+- checkpoint 原子保存并按声明的配置依赖恢复，避免下游无关参数变化导致前缀重算。
 
 ### Added
 
-- GPU Batch 改为按顶层 Stage 派发：已完成前缀从快照恢复，Stage 通过 IPC 上报完成状态、耗时、cgroup 内存峰值、PyTorch 显存峰值、Recorder 事件和配置读取依赖。按滚动依赖特征分别估计每个 Stage 的耗时、主机内存和显存峰值，并优先尝试与既有样本距离更远的可行参数组合。
+- GPU Batch 改为按顶层 Stage 派发：已完成前缀从快照恢复，Stage 通过 IPC 上报完成状态、耗时、cgroup 内存峰值、PyTorch 显存峰值、Recorder 事件和声明的配置依赖。按滚动依赖特征分别估计每个 Stage 的耗时、主机内存和显存峰值，并优先尝试与既有样本距离更远的可行参数组合。
+
+- `Stage.config_dependencies(cfg)`：与配置树同构的分层依赖声明，`True` 表示整棵子树、映射递归到子键（序列用整数下标）、缺省或 `False` 表示不依赖；接收只读 `cfg`，可按取值选择分支。默认返回 `True`，未声明的 Stage 保守依赖完整配置。
 
 - GPU Stage 调度按同一 Stage 的近邻配置历史取有界经验分位数估计耗时、主机内存和显存峰值，避免稀疏特征回归产生无界外推；显存合约不超过物理卡容量。cgroup 或 CUDA 内存拒绝会把本次合约作为有限下界，提高后续尝试的资源分配并重试。显式零 PyTorch 显存样本不再预留显存，但 Stage 仍获得可见 GPU。
 
 - 阶段累计诊断耗时随 checkpoint 和完成快照原子保存、随恢复进度回退；共享复用保留源耗时并单独记录恢复用时。
 
-- 同 Batch 连续前缀自动复用，保守配置读取追踪、共享快照引用、state/RNG/数值指标恢复及 GPU worker 接入。配置 get 和成员存在性查询改为显式报错。
+- 同 Batch 连续前缀自动复用，显式分层配置依赖、共享快照引用、state/RNG/数值指标恢复及 GPU worker 接入。配置 get 和成员存在性查询改为显式报错。
 
 - 根部 seed（默认 0）初始化和 seed_everything()；Python、NumPy/PyTorch 的全局随机状态随阶段快照与 checkpoint 原子保存、重试及进程恢复。
 
@@ -57,6 +59,8 @@
 - 固定版本的 Ruff lint、格式检查、每次提交自动执行的 pre-commit hook 和 CI 检查。
 
 ### Changed
+
+- 配置依赖改为用户显式声明的分层结构 `Stage.config_dependencies(cfg)`；移除运行时的配置读取追踪，以及用于发现依赖的完整 Pipeline 探查阶段。冷启动分组与估计特征改为直接使用声明路径。
 
 - 项目统一使用 uv 和提交的 `uv.lock` 管理唯一环境；NumPy、PyTorch、Ruff 与 pre-commit 都是默认依赖，安装、开发、CI 和完整验证均通过 `uv sync`、`uv run` 执行。
 

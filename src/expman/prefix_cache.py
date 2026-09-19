@@ -92,11 +92,9 @@ class PrefixCache:
                 )
         return None
 
-    def publish(self, parent, record, tracker):
+    def publish(self, parent, record):
         reference = (self.key, parent, uuid4().hex)
         directory = self._directory(reference)
-        # Serializing user output/state can itself read configuration views.
-        # Publish dependency metadata only after those reads have been observed.
         write_record(directory / "snapshot.pkl", record, self.serializer)
         write_record(
             directory / "metadata.pkl",
@@ -104,7 +102,7 @@ class PrefixCache:
                 "version": 1,
                 "reference": reference,
                 "position": record["position"],
-                "dependencies": tracker.export(),
+                "dependencies": record.get("config_dependencies", []),
             },
             self.serializer,
         )

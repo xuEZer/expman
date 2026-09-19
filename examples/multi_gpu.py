@@ -12,6 +12,10 @@ from expman import Batch, Pipeline, Stage
 
 
 class Work(Stage):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {"epochs": True}
+
     def process(self, data, ctx):
         for epoch in range(ctx.state.get("epoch", 0), ctx.cfg["epochs"]):
             sleep(0.1)

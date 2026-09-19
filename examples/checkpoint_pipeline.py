@@ -6,12 +6,20 @@ from expman import Batch, Pipeline, Stage
 
 
 class LoadValues(Stage):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {"values": True}
+
     def process(self, data, ctx):
         ctx.state["total"] = 0
         return list(ctx.cfg["values"])
 
 
 class Accumulate(Stage):
+    @classmethod
+    def config_dependencies(cls, cfg):
+        return {"interrupt_once": True}
+
     def process(self, data, ctx):
         for index in range(ctx.state.get("next", 0), len(data)):
             ctx.state["total"] += data[index]
