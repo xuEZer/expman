@@ -17,8 +17,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --locked
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
+      # Ruff is a development tool, not a package dependency.
+      - run: uv run --with ruff==0.16.6 ruff check .
+      - run: uv run --with ruff==0.16.6 ruff format --check .
 
   test:
     runs-on: ubuntu-latest

@@ -6,7 +6,7 @@
 
 ## 安装与运行
 
-项目统一由 [uv](https://docs.astral.sh/uv/) 管理；运行、测试和开发使用同一个锁定环境，其中包括 NumPy、PyTorch、Ruff 和 pre-commit。先安装 uv，再在项目目录执行：
+项目统一由 [uv](https://docs.astral.sh/uv/) 管理；锁定环境只包含运行所需的东西（NumPy、PyTorch、PyYAML）。先安装 uv，再在项目目录执行：
 
 ```bash
 uv sync
@@ -184,10 +184,13 @@ results = batch.run()
 
 ```bash
 uv sync
-uv run pre-commit install --install-hooks
-uv run ruff check .
-uv run ruff format --check .
 uv run python -m unittest discover -s tests -v
+
+# Ruff 和 pre-commit 是开发工具，不在包的依赖里；按需装到环境外或临时加入：
+python -m pip install pre-commit ruff
+pre-commit install --install-hooks
+ruff check .
+ruff format --check .
 ```
 
 每次 Git 提交前必须通过 Ruff lint 和格式检查，提交 hook 会自动执行这两项检查。

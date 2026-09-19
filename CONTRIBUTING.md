@@ -9,11 +9,12 @@
 - **每次提交前必须通过 `ruff check .` 和 `ruff format --check .`，包括仅修改文档的提交。** 修复后重新检查，暂存确认过的改动，再提交。
 - 合并前检查变更、运行测试和示例，确认工作区没有实验数据、密钥、构建产物或本地环境文件。
 
-项目使用 uv 管理唯一的锁定环境，开发工具、NumPy 和 PyTorch 都是默认依赖。首次配置执行：
+项目使用 uv 管理唯一的锁定环境，其中只有运行依赖（NumPy、PyTorch、PyYAML）。Ruff 和 pre-commit 是开发工具，单独安装，不进入包依赖，也不设 dev extra：
 
 ```bash
 uv sync
-uv run pre-commit install --install-hooks
+python -m pip install pre-commit ruff
+pre-commit install --install-hooks
 ```
 
 每次新克隆仓库或重建环境后，都需要重新安装 hook。
@@ -21,8 +22,8 @@ uv run pre-commit install --install-hooks
 提交前检查：
 
 ```bash
-uv run ruff check .
-uv run ruff format --check .
+ruff check .
+ruff format --check .
 uv run python -m unittest discover -s tests -v
 uv run python examples/basic_pipeline.py
 git diff --check
@@ -33,7 +34,7 @@ git status --short
 
 `.pre-commit-config.yaml` 为每次提交运行全项目 Ruff lint 和格式检查，任一失败都会阻止提交。hook 只检查，不自动修改或暂存文件；pre-commit 会临时隐藏已跟踪文件的未暂存改动，以检查本次提交对应的内容。不要使用 `--no-verify` 或 `SKIP` 绕过检查。
 
-开发依赖和 hook 固定使用同一 Ruff 版本，升级时同时更新 `pyproject.toml` 和 `.pre-commit-config.yaml`。
+Ruff 版本固定在两处：`.pre-commit-config.yaml` 的 `additional_dependencies`（本地 hook）和 `.github/workflows/ci.yml`（CI）。升级时一起改。
 
 项目附带 GitHub Actions 配置，在推送或创建 PR 后执行 Ruff 检查，以及 Python 3.10–3.14 的安装、测试和示例检查。远端分支保护需要在托管平台另行配置。
 

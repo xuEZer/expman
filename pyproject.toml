@@ -11,8 +11,6 @@ requires-python = ">=3.10"
 dependencies = [
     "PyYAML>=6.0,<7",
     "numpy>=1.26",
-    "pre-commit==4.6.2",
-    "ruff==0.16.6",
     "torch>=2.0",
 ]
 
