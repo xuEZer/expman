@@ -371,11 +371,25 @@ class GpuScheduler:
     def _stage_candidates(self, stage_index, gpu_capacity_kb, only=None):
         """Return diverse ready candidates for one Stage and its own history only."""
         batch = self.batch
+        # A group with an attempt already running must not start another member.
+        # The running member has left the queue and has not published its result
+        # yet, so without this the next queued member becomes the group's
+        # representative on the following tick -- and the tick after that the one
+        # after it.  A Stage that runs for longer than a tick then launches its
+        # whole group before the first result exists, which is the duplicate work
+        # the grouping exists to avoid.  One member per group runs at a time; the
+        # rest reuse its result.
+        running = {
+            self._stage_group(run_id, stage_index)
+            for run_id, worker in self.workers.items()
+            if worker.stage_index == stage_index
+        }
         run_ids = [
             run_id
             for run_id in batch._queue
             if batch._stage_progress[run_id] == stage_index
             and (only is None or run_id == only)
+            and self._stage_group(run_id, stage_index) not in running
         ]
         # Declared dependency groups are known before execution. Keep exactly one
         # representative runnable; cache materialization advances every other
