@@ -43,7 +43,7 @@
 
 - `ctx.log_metrics()`：嵌套数值指标按完整路径事务写入 SQLite，同键覆盖、跨重试及恢复保留，每个 Batch 共用数据库。
 
-- 位置标识的阶段结果/state 原子快照、两份 checkpoint 和阶段状态自动更新。
+- 位置标识的阶段结果/state 原子快照、单份 checkpoint 和阶段状态自动更新。
 - `Batch.resume()`：跨进程恢复配置、运行身份、队列和尝试记录；中断不消耗失败重试机会。
 - `Serializer` / `PickleSerializer`、`StorageError`、`RecoveryWarning` 及运行目录互斥锁。
 - `Batch` 和 `Experiment`：配置驱动的顺序执行、每次尝试的状态隔离、默认一次队尾重试及结果汇总。

@@ -311,7 +311,7 @@ from expman import seed_everything
 seed_everything(42)
 ```
 
-每个 run 将初始化后的随机状态原子写入 `experiments/<run_id>/rng_initial.pkl`。重试和恢复读取此记录，不重复设种子；随后按已有阶段快照和 checkpoint 恢复到相应位置。阶段完成快照及 checkpoint 都包含独立的 `rng_state` 字段，与业务 state 在同一文件、同一事务中保存，不占用 `ctx.state`。框架仍只保留最近两份 checkpoint。
+每个 run 将初始化后的随机状态原子写入 `experiments/<run_id>/rng_initial.pkl`。重试和恢复读取此记录，不重复设种子；随后按已有阶段快照和 checkpoint 恢复到相应位置。阶段完成快照及 checkpoint 都包含独立的 `rng_state` 字段，与业务 state 在同一文件、同一事务中保存，不占用 `ctx.state`。框架只保留最新一份 checkpoint，阶段完成时把它删掉：完成快照已经是恢复的依据，留着中间 epoch 的模型只是在占盘。
 
 复用本 run 已完成阶段时恢复该阶段结束时的随机状态；失败阶段有 checkpoint 时恢复它，没有则从阶段入口的随机状态重跑。为避免 Stage 构造函数消耗随机数影响续跑，checkpoint 的随机状态在构造前验证恢复，并在构造后、执行阶段前再次恢复。用户在 `process()` 中重建模型、恢复数据迭代器等准备工作若消耗随机数，仍需自行管理这段恢复逻辑。
 

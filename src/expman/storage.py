@@ -266,6 +266,14 @@ class RunStore:
                 self.stage_dir(position) / "completed.pkl", record, self.serializer
             )
 
+        # The completed record supersedes this Stage's checkpoints: a resume
+        # restores the Stage from here, never from an intermediate epoch, so the
+        # saved models become unreachable.  A checkpoint carries the whole Stage
+        # state -- a trained model is tens to hundreds of megabytes -- and one
+        # Batch keeps two per Stage for every run.
+        for stale in self.checkpoints(position):
+            stale.unlink(missing_ok=True)
+
         self._saved_seconds[position] = record["elapsed_seconds"]
 
     def checkpoints(self, position) -> list[Path]:
@@ -350,7 +358,10 @@ class Checkpoint:
             record["config_dependencies"] = self.dependencies
         write_record(path, record, self._store.serializer)
         self.step = step
-        for old in self._store.checkpoints(self._position)[2:]:
+        # One checkpoint, not two: each one carries the whole Stage state, and a
+        # Batch has one Stage in flight per run.  A resume needs the newest one
+        # only, and a completed Stage keeps none at all.
+        for old in self._store.checkpoints(self._position)[1:]:
             old.unlink()
         return path
 

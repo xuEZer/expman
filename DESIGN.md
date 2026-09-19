@@ -42,7 +42,7 @@ src/expman/
     config.py       YAML 加载、候选组合展开与命名默认配置合并
     batch.py        实验集合、顺序队列和有界重试
     experiment.py   具体实验、隔离执行及尝试结果
-    storage.py      原子快照、两份 checkpoint、保存器协议与运行锁
+    storage.py      原子快照、单份 checkpoint、保存器协议与运行锁
     frozen.py       配置的只读映射和序列
     pipeline.py     阶段组合与顺序执行
     stage.py        业务扩展基类
@@ -109,7 +109,7 @@ RunContext 保存 `run_id`、尝试编号 `attempt`、只读完整配置 `cfg`�
 | `log_metrics(mapping, step=...)` | 将嵌套数值指标事务写入 SQLite |
 | `report_progress(completed, total=..., unit=...)` | 上报绝对完成量，可省略总量 |
 | `emit(event)` | 将事件发送给记录器并隔离普通记录故障 |
-| `checkpoint.save(step=...)` | 同步保存当前阶段 state，保留最近两份 checkpoint |
+| `checkpoint.save(step=...)` | 同步保存当前阶段 state，只保留最新一份 checkpoint；阶段完成时删除 |
 
 业务数据通过阶段输入输出传递，RunContext 承载配置和执行服务。`ctx.cfg` 是当前尝试的完整配置，用户自行读取其中需要的字段。
 
@@ -297,7 +297,7 @@ Batch 清单原子记录待执行队列、当前活动成员及尝试摘要。Ct
 
 配置测试覆盖候选组合、分支独立性、普通列表、模型切换、默认合并、文件路径解析、缺失警告、错误输入和 Run 数据隔离。
 
-批量与恢复测试覆盖队尾顺序、尝试预算、阶段复用、只读配置、state 恢复、两份 checkpoint、损坏回退、保存失败、进程锁、Pipeline 匹配，以及独立子进程的 SIGINT 和突然退出恢复。
+批量与恢复测试覆盖队尾顺序、尝试预算、阶段复用、只读配置、state 恢复、单份 checkpoint、阶段完成后不留 checkpoint、损坏回退、保存失败、进程锁、Pipeline 匹配，以及独立子进程的 SIGINT 和突然退出恢复。
 
 版本记录见 [CHANGELOG.md](CHANGELOG.md)，开发和 Git 约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
