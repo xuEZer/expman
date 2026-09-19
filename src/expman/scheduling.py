@@ -43,6 +43,9 @@ class Worker:
     stage_index: int | None = 0
     stage_attempt: int = 1
     channel: Channel | None = None
+    # The PyTorch allocator ceiling this attempt actually runs under, or zero when
+    # it was started without one. Admission charges only the growth above what it
+    # has already reserved, so an attempt with no ceiling charges its own usage.
     gpu_contract_kb: float = 0.0
     expected_seconds: float | None = None
     area: float = 0.0
@@ -323,24 +326,29 @@ class GpuScheduler:
         """Largest observed host peak, retained for scheduler introspection."""
         return self.peaks.ceiling_kb
 
-    def _stage_completed(self, stage_index):
-        """Whether any attempt of this Stage has finished in this Batch."""
+    def _stage_measured(self, stage_index):
+        """Whether this Stage has ever run here, so it has a peak to size from.
+
+        An attempt that failed still measured the Stage: the peak it reached is a
+        lower bound, and the estimator raises it again for the retry. Counting
+        only a success would leave a Stage that never fits its ceiling running
+        without one forever, because a limit-free attempt is retried outside the
+        failure budget.
+        """
         return any(
-            entry.get("stage") == stage_index
-            and entry.get("status") == Status.SUCCEEDED.value
-            for entry in self.batch._stage_history
+            entry.get("stage") == stage_index for entry in self.batch._stage_history
         )
 
     def _cold_start(self):
         """Whether some Stage still has nothing measured to size its attempts from.
 
-        Every Stage of the pipeline has to complete once before the scheduler
-        packs attempts concurrently: a peak observed while another attempt shared
-        the host describes that contention as much as the Stage, and it is the
-        sample later attempts are capped and admitted from.
+        Every Stage of the pipeline has to run once before the scheduler packs
+        attempts concurrently: a peak observed while another attempt shared the
+        host describes that contention as much as the Stage, and it is the sample
+        later attempts are capped and admitted from.
         """
         return any(
-            not self._stage_completed(stage_index)
+            not self._stage_measured(stage_index)
             for experiment in self.batch.experiments
             for stage_index in range(len(experiment.pipeline.stages))
         )
@@ -884,10 +892,11 @@ class GpuScheduler:
             )
             # The unit is unique per attempt: systemd unloads a finished scope
             # asynchronously, and a retry must not collide with the previous one.
+            cold_start = not self._stage_measured(stage_index)
             limit = limits.memory_limit(
                 f"expman-{run_id[:12]}-{stage_index}-{stage_attempt}",
                 host_estimate,
-                cold_start=not self._stage_completed(stage_index),
+                cold_start=cold_start,
             )
             if limit.cgroup is not None:
                 env["EXPMAN_CGROUP"] = str(limit.cgroup)
@@ -900,8 +909,14 @@ class GpuScheduler:
             parent_socket.setblocking(False)
             env["EXPMAN_IPC_FD"] = str(child_socket.fileno())
             env["EXPMAN_POLL_INTERVAL"] = str(devices.POLL_INTERVAL)
-            if gpu_contract > 0:
-                env["EXPMAN_GPU_LIMIT_KB"] = str(gpu_contract)
+            # A Stage with nothing measured yet runs without a ceiling on either
+            # resource and is measured by what it reaches, exactly as it does for
+            # host RAM; the estimate it would be capped from is the framework's own
+            # cold-start default rather than an observation. Admission still
+            # charges the estimate, and a cold Stage is the only attempt running.
+            applied_gpu_kb = 0.0 if cold_start else gpu_contract
+            if applied_gpu_kb > 0:
+                env["EXPMAN_GPU_LIMIT_KB"] = str(applied_gpu_kb)
             self._account()
             with (root / "output.log").open("ab", buffering=0) as log:
                 process = subprocess.Popen(
@@ -941,7 +956,7 @@ class GpuScheduler:
                 stage_index=stage_index,
                 stage_attempt=stage_attempt,
                 channel=Channel(parent_socket),
-                gpu_contract_kb=gpu_contract,
+                gpu_contract_kb=applied_gpu_kb,
                 expected_seconds=duration_estimate,
                 limit=limit,
             )
@@ -1022,6 +1037,8 @@ class GpuScheduler:
                 error_message=(
                     "attempt reached its PyTorch memory limit of "
                     f"{worker.gpu_contract_kb / 1024:.0f} MiB"
+                    if worker.gpu_contract_kb > 0
+                    else "attempt ran out of device memory without a limit"
                 ),
             )
         with self.batch._state_lock:
@@ -1041,12 +1058,14 @@ class GpuScheduler:
                 "status": result.status.value,
                 "peak_kb": peak_kb,
                 # An OOM proves the demand exceeded the attempted contract even
-                # when PyTorch could not report its final allocator counters.
+                # when PyTorch could not report its final allocator counters. An
+                # attempt that had no contract proves nothing beyond what it did
+                # report, so only that is recorded.
                 "gpu_peak_kb": max(
                     worker.gpu_peak_reserved_kb or 0.0,
                     (
                         max(worker.gpu_contract_kb, devices.GPU_PEAK_KB_DEFAULT)
-                        if gpu_capped
+                        if gpu_capped and worker.gpu_contract_kb > 0
                         else 0.0
                     ),
                 ),

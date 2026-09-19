@@ -133,6 +133,26 @@ class Host:
         return HostMemory(64 * 1024**2, 48 * 1024**2, 0, 0)
 
 
+def _captured_gpu_ceilings(batch):
+    """Run the Batch, returning what ceiling each attempt was started with.
+
+    ``subprocess.run`` reaches the same ``Popen`` this patches, so only the
+    worker launches are captured; every other call is forwarded untouched.
+    """
+    ceilings = []
+    original = subprocess.Popen
+
+    def captured(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args", ())
+        if "expman._worker" in argv:
+            ceilings.append(kwargs.get("env", {}).get("EXPMAN_GPU_LIMIT_KB"))
+        return original(*args, **kwargs)
+
+    with patch("expman.scheduling.subprocess.Popen", side_effect=captured):
+        batch.run(progress=False)
+    return ceilings
+
+
 @unittest.skipUnless(os.name == "posix", "POSIX worker process groups")
 class GpuSchedulingTests(unittest.TestCase):
     def setUp(self):
@@ -623,6 +643,38 @@ class GpuSchedulingTests(unittest.TestCase):
         ):
             scheduler._launch_available(Memory([0, 1]).sample(), Host().sample())
         self.assertEqual(launched, [])
+
+    def test_a_failed_first_attempt_still_measures_its_stage(self):
+        # A Stage that never fits its ceiling must not run without one forever:
+        # a limit-free attempt is retried outside the failure budget, so only the
+        # recorded attempt can end the uncapped phase.
+        batch = self.make_batch(count=1, devices=[0], delay=0)
+        scheduler = GpuScheduler(batch)
+        self.assertTrue(scheduler._cold_start())
+        batch._stage_history.append(
+            {
+                "run_id": batch.experiments[0].run_id,
+                "stage": 0,
+                "status": Status.CANCELLED.value,
+                "peak_kb": 0.0,
+            }
+        )
+        self.assertTrue(scheduler._stage_measured(0))
+        self.assertFalse(scheduler._cold_start())
+
+    def test_cold_start_leaves_device_memory_uncapped(self):
+        batch = self.make_batch(count=2, devices=[0], delay=0)
+        ceilings = _captured_gpu_ceilings(batch)
+        self.assertTrue(all(item.status is Status.SUCCEEDED for item in batch.results))
+        # The Stage's first attempt ran without a PyTorch allocator ceiling.
+        self.assertIsNone(ceilings[0])
+
+    def test_a_measured_stage_is_capped_on_device_memory(self):
+        batch = self.warm(self.make_batch(count=1, devices=[0], delay=0))
+        ceilings = _captured_gpu_ceilings(batch)
+        self.assertTrue(all(item.status is Status.SUCCEEDED for item in batch.results))
+        self.assertEqual(len(ceilings), 1)
+        self.assertGreater(float(ceilings[0]), 0)
 
     def test_every_stage_completing_releases_cold_start_serialisation(self):
         path = self.root / "warmup.yaml"
