@@ -169,6 +169,42 @@ class RunStore:
             self.serializer,
         )
 
+    def has_completed(self, position) -> bool:
+        """Whether this position has a completed record, without reading it.
+
+        The record holds the Stage output, which can be large; callers that only
+        need to know that the prefix exists must not pay for it.
+        """
+        return (self.stage_dir(position) / "completed.pkl").exists()
+
+    def summary(self, position) -> dict | None:
+        """A completed Stage's small fields, without materialising its output.
+
+        The dependencies are what a worker reports next to its own result.  A
+        published Stage keeps them in the shared node's metadata, so the snapshot
+        -- the payload -- stays on disk.
+        """
+        path = self.stage_dir(position) / "completed.pkl"
+        if not path.exists():
+            return None
+        record = read_record(path, self.serializer)
+        if isinstance(record, dict) and "cache_ref" in record:
+            if self.shared is None or record.get("position") != position:
+                raise StorageError(f"cannot resolve shared snapshot: {path}")
+            metadata = self.shared.metadata(record["cache_ref"], position)
+            return {
+                "config_dependencies": metadata.get("dependencies"),
+                "reused": metadata.get("reused", False),
+                "_shared_reused": record.get("shared_reused", False),
+            }
+        if not isinstance(record, dict):
+            raise StorageError(f"invalid stage snapshot: {path}")
+        return {
+            "config_dependencies": record.get("config_dependencies"),
+            "reused": False,
+            "_shared_reused": False,
+        }
+
     def completed(self, position) -> dict | None:
         path = self.stage_dir(position) / "completed.pkl"
         if not path.exists():

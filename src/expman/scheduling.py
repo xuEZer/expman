@@ -756,7 +756,13 @@ class GpuScheduler:
                     if parent_ref is None:
                         continue
                     parent = parent_ref[2]
-                candidate = shared.find(parent, (stage_index,), experiment._frozen)
+                # Metadata only: a reusable Stage's output can be large, and
+                # reading it here would cost that much memory in the scheduler
+                # for every member that reuses it.  The worker that consumes the
+                # output loads it once, when it needs it.
+                candidate = shared.find_metadata(
+                    parent, (stage_index,), experiment._frozen
+                )
                 if candidate is None:
                     continue
                 reference, completed = candidate

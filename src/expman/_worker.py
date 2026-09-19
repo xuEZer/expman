@@ -160,7 +160,7 @@ def main():
             completed = (
                 None
                 if result.status.value != "succeeded"
-                else experiment._store.completed((stage_index,))
+                else experiment._store.summary((stage_index,))
             )
             with suppress(OSError):
                 channel.send(

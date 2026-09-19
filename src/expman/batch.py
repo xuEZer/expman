@@ -255,7 +255,7 @@ class Batch:
                 output_source = None
                 if attempt["status"] == Status.SUCCEEDED.value and pipeline.stages:
                     position = (len(pipeline.stages) - 1,)
-                    if experiment._store.completed(position) is None:
+                    if not experiment._store.has_completed(position):
                         raise StorageError(
                             f"successful experiment has no final snapshot: {root}"
                         )

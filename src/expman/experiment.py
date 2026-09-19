@@ -267,7 +267,7 @@ class Experiment:
         if not 0 <= stage_index < len(self.pipeline.stages):
             raise ValueError("stage_index must identify a top-level Pipeline stage")
         for index in range(stage_index):
-            if self._store.completed((index,)) is None:
+            if not self._store.has_completed((index,)):
                 raise StorageError(
                     "a Stage worker may only execute its scheduled top-level Stage"
                 )

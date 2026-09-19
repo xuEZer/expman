@@ -47,14 +47,7 @@ class PrefixCache:
 
     def load(self, reference, position):
         directory = self._directory(reference)
-        metadata = read_record(directory / "metadata.pkl", self.serializer)
-        if (
-            not isinstance(metadata, dict)
-            or metadata.get("version") != 1
-            or metadata.get("position") != position
-            or metadata.get("reference") != reference
-        ):
-            raise StorageError("invalid shared-cache metadata")
+        self.metadata(reference, position)
         record = read_record(directory / "snapshot.pkl", self.serializer)
         if (
             not isinstance(record, dict)
@@ -68,16 +61,15 @@ class PrefixCache:
         stage_seconds(record)
         return record
 
-    def find(self, parent, position, config):
+    def _candidates(self, parent, position, config):
+        """Yield the usable ``(reference, metadata)`` nodes for one position."""
         directory = self.root / self.key / parent
         for path in sorted(directory.glob("*/metadata.pkl")):
             reference = (self.key, parent, path.parent.name)
             try:
-                metadata = read_record(path, self.serializer)
-                if metadata.get("position") != position:
-                    continue
+                metadata = self.metadata(reference, position)
                 if matches(metadata["dependencies"], config):
-                    return reference, self.load(reference, position)
+                    yield reference, metadata
             except (
                 StorageError,
                 ValueError,
@@ -88,8 +80,50 @@ class PrefixCache:
                 warnings.warn(
                     f"ignoring unusable shared cache {path}: {error}",
                     RecoveryWarning,
+                    stacklevel=3,
+                )
+
+    def metadata(self, reference, position):
+        """Read one node's metadata, which is small and always present.
+
+        A scheduler that only needs a Stage's dependencies, duration or metrics
+        decides with this instead of ``load``: a snapshot can carry the whole
+        Stage output, and reading it costs that much memory in the scheduler for
+        every run that reuses it.
+        """
+        directory = self._directory(reference)
+        metadata = read_record(directory / "metadata.pkl", self.serializer)
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("version") != 1
+            or metadata.get("position") != position
+            or metadata.get("reference") != reference
+        ):
+            raise StorageError("invalid shared-cache metadata")
+        return metadata
+
+    def find(self, parent, position, config):
+        for reference, _metadata in self._candidates(parent, position, config):
+            try:
+                return reference, self.load(reference, position)
+            except (
+                StorageError,
+                ValueError,
+                TypeError,
+                KeyError,
+                AttributeError,
+            ) as error:
+                warnings.warn(
+                    f"ignoring unusable shared cache {reference}: {error}",
+                    RecoveryWarning,
                     stacklevel=2,
                 )
+        return None
+
+    def find_metadata(self, parent, position, config):
+        """Like ``find``, but returns the metadata without the snapshot."""
+        for reference, metadata in self._candidates(parent, position, config):
+            return reference, metadata
         return None
 
     def publish(self, parent, record):
@@ -103,6 +137,10 @@ class PrefixCache:
                 "reference": reference,
                 "position": record["position"],
                 "dependencies": record.get("config_dependencies", []),
+                # Everything a reusing scheduler needs, so that it never has to
+                # read the snapshot itself.
+                "elapsed_seconds": record.get("elapsed_seconds"),
+                "metrics": record.get("metrics", []),
             },
             self.serializer,
         )
