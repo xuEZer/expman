@@ -19,6 +19,8 @@ from .ipc import worker_channel
 from .limits import events, own_cgroup, usage
 from .storage import PickleSerializer, RunLock, read_record
 
+PROC_STATUS = Path("/proc/self/status")
+
 
 class IpcRecorder:
     def __init__(self, channel):
@@ -28,8 +30,28 @@ class IpcRecorder:
         self.channel.send({"type": "event", "event": event})
 
 
+def _own_usage():
+    """This process's resident size and high-water mark, in kilobytes.
+
+    Used when the attempt has no cgroup of its own. The enclosing group also
+    holds the scheduler and every attempt it has ever started, so reading it
+    would charge this one attempt for all of them.
+    """
+    values = {}
+    try:
+        for line in PROC_STATUS.read_text().splitlines():
+            key, _, value = line.partition(":")
+            if key in ("VmRSS", "VmHWM"):
+                values[key] = float(value.split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    if "VmRSS" not in values or "VmHWM" not in values:
+        return None
+    return values["VmRSS"], values["VmHWM"]
+
+
 def _resource_snapshot(directory):
-    host = usage(directory)
+    host = _own_usage() if directory is None else usage(directory)
     return {
         "timestamp": monotonic(),
         "host_current_kb": None if host is None else host[0],
@@ -41,9 +63,18 @@ def _resource_snapshot(directory):
 
 
 def _resource_cgroup():
-    """Use a direct-cgroup path, or discover the systemd scope from within it."""
-    if "EXPMAN_CGROUP" in os.environ:
-        return Path(os.environ["EXPMAN_CGROUP"])
+    """The cgroup this attempt's own usage is accounted in, if it has one.
+
+    A path means the scheduler created or discovered one for this attempt. An
+    empty value means it deliberately started the attempt without one: the
+    attempt then shares the scheduler's group, whose counters describe the whole
+    session rather than this attempt, so its own high-water mark is reported
+    instead. An unset value means a systemd scope owns the hierarchy and the
+    worker discovers its own group from proc.
+    """
+    value = os.environ.get("EXPMAN_CGROUP")
+    if value is not None:
+        return Path(value) if value else None
     return own_cgroup()
 
 

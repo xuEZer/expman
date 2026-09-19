@@ -6,6 +6,10 @@ Direct cgroupfs is used when this process may write there; otherwise a transient
 systemd user scope carries the same limits, because systemd can create the cgroup
 even where the mount is read-only for us.
 
+A Stage whose first attempt has not run yet has no measured peak to cap against,
+so that attempt runs uncapped and the peak it reaches becomes the sample that
+later attempts are capped from.
+
 The worker reports its cgroup counters through the scheduler IPC channel on each
 tick.  If the kernel kills it before that final report, the parent reads only the
 worker's cgroup counters once during exit handling; no per-tick parent-side cgroup
@@ -120,8 +124,23 @@ def _scope(unit: str, limit_kb: float) -> MemoryLimit | None:
     return MemoryLimit(prefix, None, limit_kb, "systemd")
 
 
-def memory_limit(unit: str, estimate_kb: float) -> MemoryLimit:
-    """Cheapest mechanism that can cap one worker; uncapped when none is available."""
+def memory_limit(
+    unit: str, estimate_kb: float, *, cold_start: bool = False
+) -> MemoryLimit:
+    """Cheapest mechanism that can cap one worker; uncapped when none is available.
+
+    ``cold_start`` marks a Stage that has yet to complete an attempt in this
+    Batch. Nothing has measured what that Stage needs, so the only estimate
+    available is the framework's own default and capping from it would refuse an
+    attempt whose true peak is still unknown. The first attempt therefore runs
+    uncapped and teaches the estimator, which caps every attempt after it.
+
+    The short circuit must precede ``_direct``/``_scope``: a zero limit reaching
+    ``_direct`` would be written as ``memory.max = 0``, which in cgroup v2 forbids
+    the worker any memory at all.
+    """
+    if cold_start:
+        return MemoryLimit((), None, 0.0, "cold-start")
     limit = cap_kb(estimate_kb)
     directory = _direct(unit, limit)
     if directory is not None:

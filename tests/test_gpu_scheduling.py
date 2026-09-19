@@ -6,7 +6,7 @@ import unittest
 from itertools import pairwise
 from pathlib import Path
 from time import monotonic, sleep
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from expman import Batch, ConfigError, Experiment, Pipeline, Stage, Status, devices
 from expman.devices import (
@@ -165,8 +165,32 @@ class GpuSchedulingTests(unittest.TestCase):
         path.write_text(yaml.safe_dump(cfg) + f"item: !choice {list(range(count))}\n")
         return Batch(Pipeline([GpuWork]), path, output_dir=self.root / "batch")
 
+    def warm(self, batch, *, gpu_peak_kb=1024, peak_kb=4096):
+        """Give every Stage the completed sample a previous run would have left.
+
+        A Batch measures each Stage once before it starts packing attempts
+        concurrently, and a Stage that has never reported CUDA usage receives no
+        GPU contract afterwards. Tests about packing therefore start from a Batch
+        whose Stages have already been measured, with a CUDA peak on record.
+        """
+        for experiment in batch.experiments:
+            for stage_index in range(len(experiment.pipeline.stages)):
+                batch._stage_history.append(
+                    {
+                        "run_id": experiment.run_id,
+                        "stage": stage_index,
+                        "status": Status.SUCCEEDED.value,
+                        "peak_kb": float(peak_kb),
+                        "gpu_peak_kb": float(gpu_peak_kb),
+                        "gpu_capped": False,
+                        "capped": False,
+                        "reused": False,
+                    }
+                )
+        return batch
+
     def test_multiple_devices_and_metrics_results_are_collected(self):
-        batch = self.make_batch(count=4, delay=0.25)
+        batch = self.warm(self.make_batch(count=4, delay=0.25))
         results = batch.run(progress=False)
         self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
         self.assertEqual(
@@ -345,7 +369,7 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertNotEqual(groups[("B1", "p1")], groups[("B2", "p1")])
 
     def test_tick_greedily_fills_a_card(self):
-        batch = self.make_batch(count=4, devices=[0])
+        batch = self.warm(self.make_batch(count=4, devices=[0]))
         scheduler = GpuScheduler(batch)
         started = []
 
@@ -503,6 +527,129 @@ class GpuSchedulingTests(unittest.TestCase):
         scheduler._relieve(memory, host)
         self.assertTrue(scheduler.host_gate.can_launch(host, []))
 
+    def test_host_pressure_does_not_shed_the_only_running_attempt(self):
+        # Shedding distributes a shared host between attempts. With one attempt
+        # there is nothing to distribute, and ending it discards work no other
+        # attempt is competing with while the worker's cgroup is what bounds
+        # the host. A shortage with one worker pauses launches instead.
+        batch = self.make_batch(count=1, devices=[0], delay=0)
+        scheduler = GpuScheduler(batch)
+        short = HostMemory(1000, 5, 0, 0)
+        shed = []
+        with patch.object(GpuScheduler, "_shed", side_effect=shed.append):
+            scheduler.workers["only"] = Mock(started=0.0)
+            scheduler._relieve({}, short)
+            self.assertEqual(shed, [])
+            self.assertFalse(scheduler.host_gate.can_launch(short, []))
+
+            # A second attempt is over-commitment, so the newest one goes.
+            scheduler.workers["newer"] = Mock(started=1.0)
+            scheduler._relieve({}, short)
+            self.assertEqual(shed, ["newer"])
+
+            # An unreadable host is the same shortage, not a reason to stop the
+            # one attempt that is already running.
+            scheduler.workers.pop("newer")
+            scheduler._relieve({}, None)
+            self.assertEqual(shed, ["newer"])
+
+    def test_cold_start_launches_one_attempt_until_every_stage_has_completed(self):
+        batch = self.make_batch(count=4, devices=[0, 1], delay=0)
+        scheduler = GpuScheduler(batch)
+        memory = Memory([0, 1]).sample()
+        host = Host().sample()
+        self.assertTrue(scheduler._cold_start())
+        launched = []
+        with patch.object(
+            GpuScheduler, "_launch", side_effect=lambda *a: launched.append(a)
+        ):
+            scheduler._launch_available(memory, host)
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(launched[0][3].run_id, scheduler._warmup_run())
+
+        # One completed record per Stage is what releases concurrent packing.
+        for stage_index in range(len(batch.experiments[0].pipeline.stages)):
+            batch._stage_history.append(
+                {
+                    "run_id": batch.experiments[0].run_id,
+                    "stage": stage_index,
+                    "status": Status.SUCCEEDED.value,
+                }
+            )
+        self.assertFalse(scheduler._cold_start())
+        plan = scheduler._launch_plan(memory, host)
+        self.assertGreater(len(plan), 1)
+        launched.clear()
+        with patch.object(
+            GpuScheduler, "_launch", side_effect=lambda *a: launched.append(a)
+        ):
+            scheduler._launch_available(memory, host)
+        self.assertEqual(len(launched), len(plan))
+
+    def test_warmup_walks_one_pipeline_to_its_later_stages(self):
+        # The queue rotates as Stages finish. Following its head would measure
+        # every run's first Stage before any run reached a second one, which is
+        # why the warm-up run is the one furthest along instead.
+        path = self.root / "warmup-order.yaml"
+        path.write_text(
+            f"device: [0, 1]\nseed: 0\nmarkers: {self.root}\noffset: 10\n"
+            "item: !choice [1, 2, 3]\n"
+        )
+        batch = Batch(
+            Pipeline([Prepare, Consume]), path, output_dir=self.root / "warmup-order"
+        )
+        scheduler = GpuScheduler(batch)
+        first = batch._queue[0]
+        batch._queue.remove(first)
+        batch._queue.append(first)  # A finished Stage re-queues the run at the tail.
+        batch._stage_progress[first] = 1
+
+        self.assertEqual(scheduler._warmup_run(), first)
+        plan = scheduler._launch_plan(
+            Memory([0, 1]).sample(), Host().sample(), warmup_only=True
+        )
+        self.assertEqual([candidate.stage_index for candidate, _ in plan], [1])
+        self.assertEqual([candidate.run_id for candidate, _ in plan], [first])
+
+    def test_cold_start_holds_launches_while_an_attempt_is_alive(self):
+        batch = self.make_batch(count=4, devices=[0, 1], delay=0)
+        scheduler = GpuScheduler(batch)
+        scheduler.workers["running"] = Mock(
+            started=0.0, peak_kb=0.0, resident_kb=0.0, limit=None
+        )
+        launched = []
+        with patch.object(
+            GpuScheduler, "_launch", side_effect=lambda *a: launched.append(a)
+        ):
+            scheduler._launch_available(Memory([0, 1]).sample(), Host().sample())
+        self.assertEqual(launched, [])
+
+    def test_every_stage_completing_releases_cold_start_serialisation(self):
+        path = self.root / "warmup.yaml"
+        path.write_text(
+            f"device: [0, 1]\nseed: 0\nmarkers: {self.root}\noffset: 10\n"
+            "item: !choice [1, 2, 3]\n"
+        )
+        batch = Batch(
+            Pipeline([Prepare, Consume]), path, output_dir=self.root / "warmup"
+        )
+        started = []
+        original = GpuScheduler._launch
+
+        def watched(self, device, memory, host, candidate):
+            # Sampled at the launch itself: a launch is the only moment that can
+            # put a second attempt beside a live one.
+            started.append((len(self.workers), self._cold_start()))
+            return original(self, device, memory, host, candidate)
+
+        with patch.object(GpuScheduler, "_launch", watched):
+            results = batch.run(progress=False)
+
+        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
+        # Nothing started beside a live attempt while a Stage was unmeasured.
+        self.assertTrue(all(running == 0 for running, cold in started if cold))
+        self.assertFalse(GpuScheduler(batch)._cold_start())
+
     def test_host_memory_shortage_pauses_launches_until_it_recovers(self):
         batch = self.make_batch(count=1, devices=[0], delay=0.05)
         original = Host.sample
@@ -520,7 +667,9 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(results[0].status, Status.SUCCEEDED)
 
     def test_host_memory_pressure_sheds_newest_attempt_and_refills_on_recovery(self):
-        batch = self.make_batch(count=2, devices=[0, 1], delay=0, wait_for_release=True)
+        batch = self.warm(
+            self.make_batch(count=2, devices=[0, 1], delay=0, wait_for_release=True)
+        )
         dropped = []
         held = []
         cards = []
@@ -575,7 +724,7 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertGreater(scheduler.peak_ceiling, 0)
 
     def test_failed_host_query_sheds_newest_attempt_and_pauses_launches(self):
-        batch = self.make_batch(count=2, devices=[0], delay=0.05)
+        batch = self.warm(self.make_batch(count=2, devices=[0], delay=0.05))
         original = Host.sample
         original_launch = GpuScheduler._launch
         launches = []
@@ -718,24 +867,25 @@ class DeviceTests(unittest.TestCase):
         roomy = HostMemory(64 * 1024**2, HOST_RESERVE_KB + 1, 0, 0)
         self.assertTrue(gate.can_launch(roomy, []))
 
-    def test_host_gate_refuses_while_the_kernel_is_paging(self):
-        # Paging means the kernel is short of RAM, whatever MemAvailable reports.
+    def test_swap_occupancy_does_not_gate_launches(self):
+        # Swapped pages stay out until something touches them, so a host that
+        # swapped once keeps reporting a partly occupied swap long after the
+        # shortage. Only the memory available right now may refuse a launch.
         gate = HostGate()
         large = 64 * 1024**2
-        paging = HostMemory(large, large // 2, 4096, 2048, True)
-        self.assertFalse(gate.can_launch(paging, []))
-        # Occupancy that nothing is paging on any more admits launches again:
-        # swapped pages stay out, so occupancy is a latch rather than a reading.
-        settled = HostMemory(large, large // 2, 4096, 2048, False)
-        self.assertTrue(gate.can_launch(settled, []))
+        half_swapped = HostMemory(large, large // 2, 4096, 2048)
+        self.assertTrue(gate.can_launch(half_swapped, []))
+        # Swap fully occupied, memory perfectly available: still a launch.
+        self.assertTrue(gate.can_launch(HostMemory(large, large // 2, 4096, 0), []))
+        short = HostMemory(large, HOST_RESERVE_KB - 1, 4096, 0)
+        self.assertFalse(gate.can_launch(short, []))
 
-    def test_fits_reserve_needs_both_headroom_and_no_paging(self):
+    def test_fits_reserve_needs_headroom_above_the_reserve(self):
         available = HOST_RESERVE_KB + 2 * 1024**2
         roomy = HostMemory(64 * 1024**2, available, 0, 0)
-        paging = HostMemory(64 * 1024**2, available, 0, 0, True)
         self.assertTrue(fits_reserve(roomy, 2 * 1024**2))
         self.assertFalse(fits_reserve(roomy, 2 * 1024**2 + 1))
-        self.assertFalse(fits_reserve(paging, 1))
+        self.assertFalse(fits_reserve(HostMemory(64 * 1024**2, 0, 0, 0), 1))
         self.assertFalse(fits_reserve(None, 1))
 
     def test_query_timeout_is_an_observation_error_with_the_default_timeout(self):
@@ -809,32 +959,7 @@ class DeviceTests(unittest.TestCase):
             ):
                 MeminfoMonitor(path).sample()
 
-    def test_host_memory_reports_paging_rather_than_swap_occupancy(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            meminfo = Path(temporary) / "meminfo"
-            vmstat = Path(temporary) / "vmstat"
-            meminfo.write_text(
-                "MemTotal:       16777216 kB\n"
-                "MemAvailable:    8388608 kB\n"
-                "SwapTotal:       4194304 kB\n"
-                "SwapFree:        2097152 kB\n"
-            )
-            vmstat.write_text("pswpin 4\npswpout 443\n")
-            monitor = MeminfoMonitor(meminfo, vmstat)
-            self.assertFalse(monitor.sample().paging)
-            occupied = monitor.sample()
-            # Half of swap is occupied while nothing is paging on it any more.
-            self.assertEqual(occupied.swap_free_kb, 2097152.0)
-            self.assertFalse(occupied.paging)
-            self.assertFalse(occupied.tight)
-            vmstat.write_text("pswpin 4\npswpout 448\n")
-            paging = monitor.sample()
-            self.assertTrue(paging.paging)
-            self.assertTrue(paging.tight)
-            vmstat.write_text("pswpin 4\npswpout 448\n")
-            self.assertFalse(monitor.sample().paging)
-
-    def test_missing_vmstat_is_not_paging_pressure(self):
+    def test_host_memory_reports_availability_and_swap_occupancy(self):
         with tempfile.TemporaryDirectory() as temporary:
             meminfo = Path(temporary) / "meminfo"
             meminfo.write_text(
@@ -843,10 +968,28 @@ class DeviceTests(unittest.TestCase):
                 "SwapTotal:       4194304 kB\n"
                 "SwapFree:        2097152 kB\n"
             )
-            absent = Path(temporary) / "absent"
-            observation = MeminfoMonitor(meminfo, absent).sample()
-            self.assertFalse(observation.paging)
+            monitor = MeminfoMonitor(meminfo)
+            observation = monitor.sample()
+            self.assertEqual(observation.swap_free_kb, 2097152.0)
+            self.assertEqual(observation.headroom_kb, 8388608.0 - HOST_RESERVE_KB)
             self.assertFalse(observation.tight)
+            # Half the swap stays occupied, and it changes nothing: the occupied
+            # pages are not memory anything can be asked to give back.
+            self.assertEqual(monitor.sample().swap_free_kb, 2097152.0)
+            self.assertFalse(monitor.sample().tight)
+
+    def test_host_memory_reports_a_shortage_from_availability_alone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            meminfo = Path(temporary) / "meminfo"
+            meminfo.write_text(
+                "MemTotal:       16777216 kB\n"
+                "MemAvailable:       1024 kB\n"
+                "SwapTotal:       4194304 kB\n"
+                "SwapFree:        2097152 kB\n"
+            )
+            observation = MeminfoMonitor(meminfo).sample()
+            self.assertTrue(observation.tight)
+            self.assertFalse(HostGate().can_launch(observation, []))
 
     @unittest.skipUnless(Path("/proc/meminfo").exists(), "host meminfo is unavailable")
     def test_default_host_monitor_reads_the_running_host(self):

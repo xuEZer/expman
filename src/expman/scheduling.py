@@ -323,13 +323,51 @@ class GpuScheduler:
         """Largest observed host peak, retained for scheduler introspection."""
         return self.peaks.ceiling_kb
 
-    def _stage_candidates(self, stage_index, gpu_capacity_kb):
+    def _stage_completed(self, stage_index):
+        """Whether any attempt of this Stage has finished in this Batch."""
+        return any(
+            entry.get("stage") == stage_index
+            and entry.get("status") == Status.SUCCEEDED.value
+            for entry in self.batch._stage_history
+        )
+
+    def _cold_start(self):
+        """Whether some Stage still has nothing measured to size its attempts from.
+
+        Every Stage of the pipeline has to complete once before the scheduler
+        packs attempts concurrently: a peak observed while another attempt shared
+        the host describes that contention as much as the Stage, and it is the
+        sample later attempts are capped and admitted from.
+        """
+        return any(
+            not self._stage_completed(stage_index)
+            for experiment in self.batch.experiments
+            for stage_index in range(len(experiment.pipeline.stages))
+        )
+
+    def _warmup_run(self):
+        """The one run a cold Batch advances before any packing happens.
+
+        The queue rotates as Stages finish, so this is the run furthest along
+        rather than whatever sits at the head: one pipeline is measured end to
+        end, instead of every run's first Stage being measured before any run
+        reaches its second.
+        """
+        best = None
+        for run_id in self.batch._queue:
+            progress = self.batch._stage_progress[run_id]
+            if best is None or progress > self.batch._stage_progress[best]:
+                best = run_id
+        return best
+
+    def _stage_candidates(self, stage_index, gpu_capacity_kb, only=None):
         """Return diverse ready candidates for one Stage and its own history only."""
         batch = self.batch
         run_ids = [
             run_id
             for run_id in batch._queue
             if batch._stage_progress[run_id] == stage_index
+            and (only is None or run_id == only)
         ]
         # Declared dependency groups are known before execution. Keep exactly one
         # representative runnable; cache materialization advances every other
@@ -523,21 +561,23 @@ class GpuScheduler:
                 "headroom_kb": host.headroom_kb,
                 "swap_total_kb": host.swap_total_kb,
                 "swap_free_kb": host.swap_free_kb,
-                "paging": host.paging,
                 "tight": host.tight,
                 "admits_next": admits_next,
             }
         return memory, host
 
     def _relieve(self, memory, host):
-        """Shed one worker for this tick's host-memory pressure."""
-        if host is None:
-            # Without a reading the host cannot be assumed to have room. A later
-            # healthy reading immediately reopens admission.
-            if self.workers:
-                self._shed(self._newest())
+        """Shed one worker for this tick's host-memory pressure.
+
+        Shedding resolves over-commitment between attempts sharing the host. With
+        one attempt running there is nothing to distribute: ending it discards a
+        cold start that no other attempt is competing with, while the worker's own
+        cgroup limit is what actually bounds the host. A shortage with one worker
+        therefore pauses launches (see ``HostGate``) and keeps the attempt.
+        """
+        if host is not None and not host.tight:
             return
-        if host.tight and self.workers:
+        if len(self.workers) > 1:
             # Host RAM is shared by every worker process: drop the newest attempt
             # globally. One attempt per tick, not one decisive sweep: a healthy
             # reading on the next tick permits greedy refilling immediately.
@@ -623,8 +663,12 @@ class GpuScheduler:
         # Parameter diversity only breaks materially equivalent packing choices.
         return -unused + 1e-6 * plan.novelty
 
-    def _launch_plan(self, memory, host):
-        """Choose a bounded multi-resource packing plan for this scheduler tick."""
+    def _launch_plan(self, memory, host, warmup_only=False):
+        """Choose a bounded multi-resource packing plan for this scheduler tick.
+
+        ``warmup_only`` narrows the plan to the single run a cold Batch is
+        measuring, so that pipeline is walked end to end before any other starts.
+        """
         host_capacity, available_gpu = self._resource_left(memory, host)
         devices_in_plan = tuple(memory)
         if host_capacity <= 0 or not devices_in_plan:
@@ -632,12 +676,17 @@ class GpuScheduler:
         gpu_capacities = tuple(
             max(0.0, available_gpu[device]) for device in devices_in_plan
         )
+        only = self._warmup_run() if warmup_only else None
         stages = sorted(
-            {self.batch._stage_progress[run_id] for run_id in self.batch._queue}
+            {
+                self.batch._stage_progress[run_id]
+                for run_id in self.batch._queue
+                if only is None or run_id == only
+            }
         )
         gpu_capacity_kb = min(memory[device].total * 1024 for device in devices_in_plan)
         candidates = self._interleave(
-            [self._stage_candidates(stage, gpu_capacity_kb) for stage in stages]
+            [self._stage_candidates(stage, gpu_capacity_kb, only) for stage in stages]
         )
         plans = [Plan(host_capacity, gpu_capacities)]
         for candidate in candidates:
@@ -670,7 +719,13 @@ class GpuScheduler:
 
     def _launch_available(self, memory, host):
         """Launch the resource-aware packing plan chosen from this tick's snapshot."""
-        for candidate, device in self._launch_plan(memory, host):
+        cold = self._cold_start()
+        plan = self._launch_plan(memory, host, warmup_only=cold)
+        if cold and self.workers:
+            # One pipeline at a time: nothing starts beside the attempt that is
+            # measuring the Stage it is on.
+            plan = ()
+        for candidate, device in plan:
             self._launch(device, memory[device], host, candidate)
 
     def _materialize_reuses(self):
@@ -832,9 +887,15 @@ class GpuScheduler:
             limit = limits.memory_limit(
                 f"expman-{run_id[:12]}-{stage_index}-{stage_attempt}",
                 host_estimate,
+                cold_start=not self._stage_completed(stage_index),
             )
             if limit.cgroup is not None:
                 env["EXPMAN_CGROUP"] = str(limit.cgroup)
+            elif not limit.capped:
+                # No cgroup of its own: the attempt inherits this process's, whose
+                # counters cover the whole session. An empty value tells it to
+                # report its own high-water mark instead.
+                env["EXPMAN_CGROUP"] = ""
             parent_socket, child_socket = socket.socketpair()
             parent_socket.setblocking(False)
             env["EXPMAN_IPC_FD"] = str(child_socket.fileno())
@@ -941,8 +1002,8 @@ class GpuScheduler:
                 error_message=(
                     "attempt stopped by its memory limit of "
                     f"{worker.limit.cap_kb / 1024:.0f} MiB"
-                    if worker.limit is not None
-                    else "attempt stopped by its memory limit"
+                    if worker.limit is not None and worker.limit.capped
+                    else "attempt was killed while running without a memory limit"
                 ),
             )
         cuda_out_of_memory = devices.cuda_out_of_memory(
