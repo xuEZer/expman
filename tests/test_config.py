@@ -163,6 +163,74 @@ sweep:
             self.load("model: {name: a}\nx: 0")
         self.assertIn(str(path), str(raised.exception))
 
+    def test_root_choice_pairs_sibling_fields(self):
+        runs = self.load("""
+!choice
+- stage: B1
+  dataset: {name: A}
+  model: {name: a}
+- stage: B1
+  dataset: {name: B}
+  model: {name: b}
+""")
+        self.assertEqual(
+            [(run["dataset"]["name"], run["model"]["name"]) for run in runs],
+            [("A", "a"), ("B", "b")],
+        )
+
+    def test_root_choice_candidates_expand_inner_choices(self):
+        runs = self.load("""
+!choice
+- dataset: A
+  model: a
+  seed: !choice [0, 1]
+- dataset: B
+  model: b
+""")
+        self.assertEqual(
+            [(run["dataset"], run["model"], run.get("seed")) for run in runs],
+            [("A", "a", 0), ("A", "a", 1), ("B", "b", None)],
+        )
+
+    def test_root_choice_resolves_named_defaults(self):
+        self.write("configs/model/a.yaml", "width: 64")
+        self.write("configs/model/b.yaml", "width: 32")
+        runs = self.load("""
+!choice
+- dataset: A
+  model: {name: a}
+- dataset: B
+  model: {name: b}
+""")
+        self.assertEqual(
+            [(run["model"]["name"], run["model"]["width"]) for run in runs],
+            [("a", 64), ("b", 32)],
+        )
+
+    def test_root_choice_requires_mapping_candidates(self):
+        for content in ("!choice [1, 2]\n", "!choice [[a], [b]]\n"):
+            with self.subTest(content=content), self.assertRaises(ConfigError):
+                self.load(content)
+
+    def test_root_choice_rejects_sweep_inside_a_candidate(self):
+        with self.assertRaisesRegex(ConfigError, "sweep"):
+            self.load("""
+!choice
+- dataset: A
+  sweep: {axes: {dataset: [B]}}
+- dataset: B
+""")
+
+    def test_root_choice_rejects_device_choices(self):
+        with self.assertRaises(ConfigError):
+            self.load("""
+!choice
+- device: !choice [[0], [1]]
+  seed: 0
+- device: [0]
+  seed: 0
+""")
+
     def test_two_model_roles_load_after_selection_without_parameter_leaks(self):
         self.write(
             "configs/models/imputation/saits.yaml", "width: 64\nonly_saits: true"

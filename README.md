@@ -90,10 +90,32 @@ assert configs[0]["models"]["forecasting"]["d_model"] == 128
 
 - 独立候选按笛卡尔积展开，顺序遵循 YAML 字段和候选值的书写顺序。候选内部的选择只参与该分支的展开。
 - 先展开实验配置，再查找默认文件；参数与 `name` 并列。字典递归合并，实验配置优先；列表整体替换，显式 `null` 覆盖默认值。
-- 默认文件只允许固定参数，出现 `!choice` 会抛出 `ConfigError`。解析错误、重复键、非映射顶层也会报错，并包含来源文件。
+- 默认文件只允许固定参数，出现 `!choice` 会抛出 `ConfigError`。解析错误、重复键、顶层不是映射或映射候选的 `!choice` 也会报错，并包含来源文件。
 - 缺失默认文件发出 `MissingConfigWarning` 并保留显式参数继续；同一次加载对同一路径只警告一次。
 - `name` 在所有层次都是查找约定字段，默认参数中新增的嵌套 `name` 也会按最终层次解析。列表中的节点使用字段层次查找，列表索引不加入目录路径。
 - 各个 Run 的字典及嵌套对象互相独立。函数一次性生成全部配置，参数组合很多时需留意内存占用。
+
+### 配对组合（根级 `!choice`）
+
+独立字段的 `!choice` 做笛卡尔积；要让同级字段联动，把整个文档写成一组完整配置的 `!choice`，每个候选是一个映射：
+
+```yaml
+# experiment.yaml：每个数据集各自绑定一个模型，而不是 2×2×2 的全组合
+!choice
+- name: base
+  dataset: {name: azure2019_I_5T}
+  imputer: {name: SAITS}
+  predictor: {name: Toto2}
+- name: base
+  dataset: {name: EWELD_Load_15T}
+  imputer: {name: DeepMVI}
+  predictor: {name: Chronos}
+```
+
+- 上例生成 2 个 Run，`dataset`/`imputer`/`predictor` 按候选配对，而不是 2×2×2。
+- 每个候选是完整的配置映射，可以继续使用 `!choice`（只在该候选内部展开）和 `name` 默认；上例两个候选都用根 `name: base` 共享 `configs/base.yaml`，只覆盖差异字段。
+- 根 `!choice` 的候选必须是映射，返回标量或列表会报错；`device` 仍不允许是 `!choice`。
+- 根 `!choice` 与顶层 `sweep` 互斥：`sweep` 只能是单映射文档的顶层键。
 
 ### 参数敏感性扫描（`sweep`）
 

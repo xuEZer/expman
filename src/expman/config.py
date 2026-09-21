@@ -87,7 +87,7 @@ def _check_cycles(value: Any, active: set[int]) -> None:
     active.remove(identity)
 
 
-def _read_yaml(path: Path, *, allow_choices: bool) -> dict[str, Any]:
+def _read_yaml(path: Path, *, allow_choices: bool) -> dict[str, Any] | _Choice:
     try:
         with path.open(encoding="utf-8") as stream:
             loader = _Loader(stream, allow_choices=allow_choices)
@@ -95,9 +95,11 @@ def _read_yaml(path: Path, *, allow_choices: bool) -> dict[str, Any]:
                 data = loader.get_single_data()
             finally:
                 loader.dispose()
-        if not isinstance(data, dict):
-            raise ConfigError("the document must contain a mapping at its root")
-        if not allow_choices and "sweep" in data:
+        if not isinstance(data, (dict, _Choice)):
+            raise ConfigError(
+                "the document must be a mapping or a !choice of mappings at its root"
+            )
+        if isinstance(data, dict) and not allow_choices and "sweep" in data:
             raise ConfigError("sweep is only allowed in experiment files")
         _check_cycles(data, set())
         return data
@@ -219,6 +221,18 @@ def _sweep_variants(config: dict, spec: Any) -> list[dict]:
     return variants
 
 
+def _device_configs(value: Any) -> list[dict]:
+    """Collect the raw configs that declare ``device`` for early validation."""
+    if isinstance(value, _Choice):
+        configs = []
+        for candidate in value.values:
+            configs.extend(_device_configs(candidate))
+        return configs
+    if isinstance(value, dict) and "device" in value:
+        return [value]
+    return []
+
+
 def _safe_segment(value: Any) -> bool:
     return (
         isinstance(value, str)
@@ -323,6 +337,11 @@ def load_configs(path: str | Path) -> list[dict[str, Any]]:
     already exist in the experiment file. ``ofat`` varies one axis at a time, so
     b0/c0 stay pinned while a is scanned; ``grid`` takes the axis product.
 
+    The document root may also be a ``!choice`` of complete mappings, which pairs
+    sibling fields (dataset A with model a, dataset B with model b) instead of
+    taking the product of independent fields. Candidates may contain further
+    ``!choice`` nodes. A root ``!choice`` and ``sweep`` cannot be combined.
+
     The result is eager: callers should keep the number of combinations bounded.
     """
     experiment = Path(path).expanduser().resolve()
@@ -330,18 +349,33 @@ def load_configs(path: str | Path) -> list[dict[str, Any]]:
         data = _read_yaml(experiment, allow_choices=True)
     except FileNotFoundError as error:
         raise ConfigError(f"experiment file not found: {experiment}") from error
-    has_sweep = "sweep" in data
-    spec = data.pop("sweep", None)
-    variants = _sweep_variants(data, spec) if has_sweep else [data]
-    if any("device" in variant for variant in variants):
+    root_choice = isinstance(data, _Choice)
+    if root_choice:
+        variants = [data]
+    else:
+        has_sweep = "sweep" in data
+        spec = data.pop("sweep", None)
+        variants = _sweep_variants(data, spec) if has_sweep else [data]
+    device_configs = []
+    for variant in variants:
+        device_configs.extend(_device_configs(variant))
+    if device_configs:
         # A Batch resource list is never an experiment choice or a sweep axis.
         from .devices import configured_devices
 
-        for variant in variants:
-            if "device" in variant:
-                configured_devices([variant])
+        configured_devices(device_configs)
     defaults = _Defaults(experiment)
     runs = []
     for variant in variants:
-        runs.extend(defaults.resolve(run) for run in _expand(variant))
+        for run in _expand(variant):
+            if not isinstance(run, dict):
+                raise ConfigError(
+                    f"{experiment}: every root !choice candidate must be a mapping"
+                )
+            if root_choice and "sweep" in run:
+                raise ConfigError(
+                    f"{experiment}: sweep is a top-level section and cannot appear "
+                    "inside a root !choice candidate"
+                )
+            runs.append(defaults.resolve(run))
     return runs
