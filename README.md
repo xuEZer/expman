@@ -95,6 +95,37 @@ assert configs[0]["models"]["forecasting"]["d_model"] == 128
 - `name` 在所有层次都是查找约定字段，默认参数中新增的嵌套 `name` 也会按最终层次解析。列表中的节点使用字段层次查找，列表索引不加入目录路径。
 - 各个 Run 的字典及嵌套对象互相独立。函数一次性生成全部配置，参数组合很多时需留意内存占用。
 
+### 参数敏感性扫描（`sweep`）
+
+顶层 `sweep` 段把同一份文件变成 OFAT（一次只动一个因子）敏感性扫描：文件自身的字段就是主实验基线，`axes` 用点号路径声明要扫的轴，其余轴固定在基线值：
+
+```yaml
+# 主实验默认：subspace_rank=3、epsilon=0.0001、cone_delta=0.03
+stage: B2
+device: [0]
+seed: 42
+training: {optimizer: AdamW, lr: 0.001, max_epochs: 5}
+tip:
+  subspace_rank: 3
+  epsilon: 0.0001
+  cone_delta: 0.03
+
+sweep:
+  include_baseline: true            # 先跑基线作为对照
+  axes:
+    tip.subspace_rank: [2, 4]       # 固定 b0、c0，只扫 a
+    tip.epsilon: [0.00001, 0.001]   # 固定 a0、c0，只扫 b
+    tip.cone_delta: [0.01, 0.1]     # 固定 a0、b0，只扫 c
+```
+
+上例展开为 7 个 Run（1 个基线 + 2 + 2 + 2），而不是全网格的 3×3×3：
+
+- 轴路径必须已经显式出现在实验文件里（可以覆盖 `name` 默认文件给出的值）；路径经过 `!choice` 节点会报错，需要先把该选择钉死。
+- `mode: grid` 改为这些轴的笛卡尔积；`include_baseline: false` 去掉基线条目。
+- `sweep` 是框架保留的顶层键，不会进入 `ctx.cfg`；去掉 `sweep` 段，同一份文件就是普通的单 Run 配置。
+- 与 `!choice` 正交：`seed: !choice [...]` 之类的候选会在每个扫描变体上继续展开。
+- 默认文件里不允许出现 `sweep`。
+
 完整的双模型配置见 [examples/experiment.yaml](examples/experiment.yaml)，加载示例见 [examples/load_experiments.py](examples/load_experiments.py)。
 
 ## 执行实验集合

@@ -66,6 +66,103 @@ model: !choice
             [{"items": ["fixed", "a"]}, {"items": ["fixed", "b"]}],
         )
 
+    def test_sweep_ofat_varies_one_axis_at_a_time_from_the_baseline(self):
+        runs = self.load("""
+stage: B2
+tip:
+  rank: 3
+  epsilon: 0.0001
+  cone: 0.03
+sweep:
+  axes:
+    tip.rank: [2, 4]
+    tip.epsilon: [0.00001, 0.001]
+    tip.cone: [0.01]
+""")
+        self.assertEqual(
+            [
+                (run["tip"]["rank"], run["tip"]["epsilon"], run["tip"]["cone"])
+                for run in runs
+            ],
+            [
+                (3, 0.0001, 0.03),
+                (2, 0.0001, 0.03),
+                (4, 0.0001, 0.03),
+                (3, 0.00001, 0.03),
+                (3, 0.001, 0.03),
+                (3, 0.0001, 0.01),
+            ],
+        )
+        self.assertTrue(all("sweep" not in run for run in runs))
+
+    def test_sweep_can_omit_the_baseline(self):
+        runs = self.load(
+            "a: 0\nb: 0\nc: 0\n"
+            "sweep:\n  include_baseline: false\n  axes:\n    a: [1, 2]\n"
+        )
+        self.assertEqual(
+            [(run["a"], run["b"], run["c"]) for run in runs], [(1, 0, 0), (2, 0, 0)]
+        )
+
+    def test_sweep_grid_mode_takes_the_axis_product(self):
+        runs = self.load(
+            "a: 0\nb: 0\n"
+            "sweep:\n  mode: grid\n  include_baseline: false\n"
+            "  axes:\n    a: [1, 2]\n    b: [3, 4]\n"
+        )
+        self.assertEqual(
+            [(run["a"], run["b"]) for run in runs],
+            [(1, 3), (1, 4), (2, 3), (2, 4)],
+        )
+
+    def test_sweep_combines_with_choice_expansion(self):
+        runs = self.load("seed: !choice [0, 1]\na: 0\nsweep:\n  axes:\n    a: [1]\n")
+        self.assertEqual(
+            [(run["seed"], run["a"]) for run in runs],
+            [(0, 0), (1, 0), (0, 1), (1, 1)],
+        )
+
+    def test_sweep_axis_uses_dotted_paths(self):
+        runs = self.load("a:\n  b:\n    c: 0\nsweep:\n  axes:\n    a.b.c: [1, 2]\n")
+        self.assertEqual([run["a"]["b"]["c"] for run in runs], [0, 1, 2])
+
+    def test_sweep_axis_overrides_the_default_value(self):
+        self.write("configs/model/a.yaml", "width: 64\ndepth: 2")
+        runs = self.load(
+            "model: {name: a, width: 128}\nsweep:\n  axes:\n    model.width: [32]\n"
+        )
+        self.assertEqual([run["model"]["width"] for run in runs], [128, 32])
+        self.assertTrue(all(run["model"]["depth"] == 2 for run in runs))
+
+    def test_sweep_axis_must_exist_and_not_cross_a_choice(self):
+        with self.assertRaisesRegex(ConfigError, "not present"):
+            self.load("a: 0\nsweep:\n  axes:\n    missing: [1]\n")
+        with self.assertRaisesRegex(ConfigError, "!choice"):
+            self.load("a: !choice [0, 1]\nsweep:\n  axes:\n    a: [2]\n")
+        with self.assertRaisesRegex(ConfigError, "!choice"):
+            self.load("a: {b: !choice [0, 1]}\nsweep:\n  axes:\n    a.b: [2]\n")
+
+    def test_malformed_sweep_specs_are_rejected(self):
+        cases = [
+            "x: 1\nsweep: []\n",
+            "x: 1\nsweep: {}\n",
+            "x: 1\nsweep: {axes: {}}\n",
+            "x: 1\nsweep: {axes: {x: []}}\n",
+            "x: 1\nsweep: {axes: {x: !choice [1, 2]}}\n",
+            "x: 1\nsweep: {axes: {x: [2]}, mode: full}\n",
+            "x: 1\nsweep: {axes: {x: [2]}, extra: 1}\n",
+            "x: 1\nsweep: {axes: {x: [2]}, include_baseline: 1}\n",
+        ]
+        for content in cases:
+            with self.subTest(content=content), self.assertRaises(ConfigError):
+                self.load(content)
+
+    def test_sweep_is_rejected_in_defaults_files(self):
+        path = self.write("configs/model/a.yaml", "sweep: {axes: {x: [1]}}")
+        with self.assertRaises(ConfigError) as raised:
+            self.load("model: {name: a}\nx: 0")
+        self.assertIn(str(path), str(raised.exception))
+
     def test_two_model_roles_load_after_selection_without_parameter_leaks(self):
         self.write(
             "configs/models/imputation/saits.yaml", "width: 64\nonly_saits: true"

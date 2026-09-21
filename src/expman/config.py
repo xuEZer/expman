@@ -97,6 +97,8 @@ def _read_yaml(path: Path, *, allow_choices: bool) -> dict[str, Any]:
                 loader.dispose()
         if not isinstance(data, dict):
             raise ConfigError("the document must contain a mapping at its root")
+        if not allow_choices and "sweep" in data:
+            raise ConfigError("sweep is only allowed in experiment files")
         _check_cycles(data, set())
         return data
     except FileNotFoundError:
@@ -128,6 +130,93 @@ def _merge(defaults: Any, explicit: Any) -> Any:
             )
         return result
     return deepcopy(explicit)
+
+
+_SWEEP_KEYS = frozenset({"axes", "mode", "include_baseline"})
+
+
+def _axis_parts(text: str) -> tuple[str, ...]:
+    if not isinstance(text, str) or not text:
+        raise ConfigError("sweep axis names must be nonempty dotted paths")
+    parts = tuple(text.split("."))
+    if any(not part for part in parts):
+        raise ConfigError(f"invalid sweep axis {text!r}")
+    return parts
+
+
+def _axis_path(config: Any, text: str) -> tuple[str, ...]:
+    """Resolve an axis name, requiring the path to exist in the experiment file."""
+    parts = _axis_parts(text)
+    node = config
+    for component in parts:
+        if isinstance(node, _Choice):
+            raise ConfigError(
+                f"sweep axis {text!r} crosses a !choice; pin the choice first"
+            )
+        if not isinstance(node, dict) or component not in node:
+            raise ConfigError(
+                f"sweep axis {text!r} is not present in the experiment file"
+            )
+        node = node[component]
+    if isinstance(node, _Choice):
+        raise ConfigError(f"sweep axis {text!r} names a !choice; pin it first")
+    return parts
+
+
+def _set_axis(config: dict, parts: tuple[str, ...], value: Any) -> None:
+    node = config
+    for component in parts[:-1]:
+        node = node[component]
+    node[parts[-1]] = deepcopy(value)
+
+
+def _sweep_variants(config: dict, spec: Any) -> list[dict]:
+    """Expand a top-level ``sweep`` section into one mapping per run.
+
+    ``ofat`` (the default) varies one axis at a time from the file's own values,
+    so the run count is the sum of the axis sizes instead of their product;
+    ``grid`` takes the Cartesian product of the axes. ``include_baseline``
+    (default true) prepends the unmodified experiment file as the control run.
+    """
+    if not isinstance(spec, dict):
+        raise ConfigError("sweep must be a mapping")
+    unknown = sorted(set(spec) - _SWEEP_KEYS)
+    if unknown:
+        raise ConfigError(f"unknown sweep keys: {unknown}")
+    axes = spec.get("axes")
+    if not isinstance(axes, dict) or not axes:
+        raise ConfigError("sweep.axes must be a nonempty mapping")
+    mode = spec.get("mode", "ofat")
+    if mode not in ("ofat", "grid"):
+        raise ConfigError("sweep.mode must be 'ofat' or 'grid'")
+    include_baseline = spec.get("include_baseline", True)
+    if not isinstance(include_baseline, bool):
+        raise ConfigError("sweep.include_baseline must be a boolean")
+
+    resolved = []
+    for text, values in axes.items():
+        if (
+            isinstance(values, _Choice)
+            or not isinstance(values, (list, tuple))
+            or not values
+        ):
+            raise ConfigError(f"sweep axis {text!r} must be a nonempty list")
+        resolved.append((_axis_path(config, text), values))
+
+    variants = [deepcopy(config)] if include_baseline else []
+    if mode == "ofat":
+        for parts, values in resolved:
+            for value in values:
+                variant = deepcopy(config)
+                _set_axis(variant, parts, value)
+                variants.append(variant)
+    else:
+        for combination in product(*(values for _, values in resolved)):
+            variant = deepcopy(config)
+            for (parts, _), value in zip(resolved, combination, strict=True):
+                _set_axis(variant, parts, value)
+            variants.append(variant)
+    return variants
 
 
 def _safe_segment(value: Any) -> bool:
@@ -219,8 +308,20 @@ def load_configs(path: str | Path) -> list[dict[str, Any]]:
     defaults from <project root>/configs/<field path>/<name>.yaml. Project roots
     are located by pyproject.toml or .git above the YAML, then the working directory.
     Explicit values win, dictionaries merge recursively, and lists/null replace
-    defaults. Defaults cannot contain !choice. Missing defaults warn once per
-    resolved file per call. Parsing errors raise ConfigError.
+    defaults. Defaults cannot contain !choice or sweep. Missing defaults warn once
+    per resolved file per call. Parsing errors raise ConfigError.
+
+    A top-level ``sweep`` mapping turns the file into a sensitivity scan:
+
+        sweep:
+          mode: ofat            # or grid
+          include_baseline: true
+          axes:
+            tip.rank: [2, 4]
+
+    The file's own fields are the baseline; each axis is a dotted path that must
+    already exist in the experiment file. ``ofat`` varies one axis at a time, so
+    b0/c0 stay pinned while a is scanned; ``grid`` takes the axis product.
 
     The result is eager: callers should keep the number of combinations bounded.
     """
@@ -229,10 +330,18 @@ def load_configs(path: str | Path) -> list[dict[str, Any]]:
         data = _read_yaml(experiment, allow_choices=True)
     except FileNotFoundError as error:
         raise ConfigError(f"experiment file not found: {experiment}") from error
-    if "device" in data:
-        # A Batch resource list is never an experiment choice.
+    has_sweep = "sweep" in data
+    spec = data.pop("sweep", None)
+    variants = _sweep_variants(data, spec) if has_sweep else [data]
+    if any("device" in variant for variant in variants):
+        # A Batch resource list is never an experiment choice or a sweep axis.
         from .devices import configured_devices
 
-        configured_devices([data])
+        for variant in variants:
+            if "device" in variant:
+                configured_devices([variant])
     defaults = _Defaults(experiment)
-    return [defaults.resolve(run) for run in _expand(data)]
+    runs = []
+    for variant in variants:
+        runs.extend(defaults.resolve(run) for run in _expand(variant))
+    return runs
