@@ -1,2 +1,3 @@
+device: [0]
 size: !choice [1, 3, 5]
 seed: !choice [1, 2]

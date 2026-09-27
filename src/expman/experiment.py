@@ -1,9 +1,8 @@
 """One concrete configuration and the history of its isolated attempts."""
 
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
 from time import perf_counter
 from typing import Any, Protocol
 from uuid import uuid4
@@ -21,22 +20,6 @@ from .storage import RunStore, Serializer, StorageError, read_record, write_reco
 
 class OutputSource(Protocol):
     """Reads an attempt output that the parent process does not keep in memory."""
-
-    def load(self) -> Any: ...
-
-
-@dataclass(frozen=True, eq=False)
-class ResultOutput:
-    """Attempt output kept in the result record written by a worker process."""
-
-    path: Path
-    serializer: Serializer
-
-    def load(self) -> Any:
-        record = read_record(self.path, self.serializer)
-        if not isinstance(record, AttemptResult):
-            raise StorageError(f"invalid attempt record: {self.path}")
-        return record.output
 
 
 @dataclass(frozen=True, eq=False)
@@ -112,7 +95,9 @@ class ExperimentResult:
 class Experiment:
     """A stable run identity with durable positional stage snapshots.
 
-    run() restores prior progress and executes one attempt. Exceptions become summaries;
+    Experiment is an internal component: the scheduler executes exactly one
+    top-level Stage per worker attempt through run_stage(), which restores the
+    completed prefix and the latest checkpoint. Exceptions become summaries;
     BaseException interruptions are recorded and propagated to the caller.
     """
 
@@ -141,8 +126,6 @@ class Experiment:
         self._run_id = uuid4().hex if run_id is None else run_id
         _name(self._run_id, "run_id")
         self._attempts: list[AttemptResult] = []
-        self._timing_lock = RLock()
-        self._active_started: float | None = None
         self.output_dir = (
             Path("runs") / self.run_id if output_dir is None else Path(output_dir)
         )
@@ -188,77 +171,6 @@ class Experiment:
         if not (self._store.stage_dir(position) / "completed.pkl").exists():
             return None
         return SnapshotOutput(self._store, position)
-
-    def _release_output(self) -> None:
-        """Keep the newest attempt summary once its output can be read back."""
-        with self._timing_lock:
-            if not self._attempts:
-                return
-            result = self._attempts[-1]
-            if result.status is not Status.SUCCEEDED or result._output is None:
-                return
-            source = self._output_source()
-            if source is not None:
-                self._attempts[-1] = replace(result, _output=None, output_source=source)
-
-    def _timing_snapshot(self) -> tuple[tuple[AttemptResult, ...], float]:
-        with self._timing_lock:
-            elapsed = (
-                0.0
-                if self._active_started is None
-                else max(0.0, perf_counter() - self._active_started)
-            )
-            return tuple(self._attempts), elapsed
-
-    def run(self, *, recorder: Recorder | None = None) -> AttemptResult:
-        """Execute once, restoring completed stages and the latest checkpoint."""
-        attempt = len(self._attempts) + 1
-        started = perf_counter()
-        with self._timing_lock:
-            self._active_started = started
-        status = Status.SUCCEEDED
-        output = None
-        error_type = None
-        error_message = None
-        try:
-            rng = RandomStateManager(self._cfg["seed"])
-            initial = self.output_dir / "rng_initial.pkl"
-            if initial.exists():
-                rng.restore(read_record(initial, self._store.serializer))
-            else:
-                rng.seed()
-                write_record(initial, rng.capture(), self._store.serializer)
-            self._store.rng = rng
-            ctx = RunContext(
-                run_id=self.run_id,
-                recorder=InMemoryRecorder() if recorder is None else recorder,
-                cfg=self._frozen,
-                attempt=attempt,
-                _store=self._store,
-                _metrics=self._metrics,
-            )
-            with ctx.observe(self.pipeline.name, kind="experiment") as context:
-                output = self.pipeline.run(ctx=context)
-        except BaseException as error:
-            status = Status.FAILED if isinstance(error, Exception) else Status.CANCELLED
-            error_type = type(error).__qualname__
-            error_message = _error_message(error)
-            if not isinstance(error, Exception):
-                raise
-        finally:
-            result = AttemptResult(
-                run_id=self.run_id,
-                attempt=attempt,
-                status=status,
-                duration_seconds=perf_counter() - started,
-                _output=output,
-                error_type=error_type,
-                error_message=error_message,
-            )
-            with self._timing_lock:
-                self._attempts.append(result)
-                self._active_started = None
-        return result
 
     def run_stage(
         self, stage_index: int, *, attempt: int, recorder: Recorder | None = None

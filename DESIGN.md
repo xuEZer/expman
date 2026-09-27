@@ -6,13 +6,13 @@
 
 expman 用可组合的阶段组织实验流程，让用户专注于每个阶段的数据处理逻辑，并提供一致的执行观测。
 
-当前实现支持 YAML 配置展开与默认参数合并，以及 Pipeline 流程定义 → Batch 创建 Experiment → 顺序执行和队尾重试 → 获得业务结果和观测事件。
+当前实现支持 YAML 配置展开与默认参数合并，以及 Pipeline 流程定义 → Batch 创建 Experiment → GPU 调度执行和队尾重试 → 获得业务结果和观测事件。Batch 是唯一执行入口，Experiment 是内部组件。
 
 核心设计遵循以下原则：
 
 | 原则 | 具体落点 |
 |---|---|
-| 单一职责 | Stage 处理一个阶段；Pipeline 定义顺序；Experiment 管理具体配置和尝试；Batch 管理执行队列；Recorder 接收事件 |
+| 单一职责 | Stage 处理一个阶段；Pipeline 定义顺序；Experiment（内部组件）管理具体配置和尝试；Batch 是唯一执行入口，管理执行队列；Recorder 接收事件 |
 | 开闭原则 | 新增业务阶段继承 Stage；新增存储适配器实现 Recorder |
 | 依赖倒置 | 执行层依赖 Recorder 协议，不依赖具体数据库或监控平台 |
 | 组合与显式依赖 | Pipeline 组合阶段类型；业务对象通过输入输出传递；用户通过 ctx.cfg 读取完整实验配置 |
@@ -236,6 +236,8 @@ models.forecasting.name: patchtst
 `load_configs()` 一次性返回整个列表。加载失败时不返回部分结果；该接口负责解析配置，运行身份分配和执行队列由 Batch 与 Experiment 处理。
 
 ## 8. Experiment 与 Batch
+
+`Batch` 是唯一执行入口；`Experiment` 是内部组件，由 Batch 与调度 worker 使用，不对外导出。每个顶层 Stage 在独立工作进程中经 `Experiment.run_stage()` 执行。
 
 ```python
 pipeline = Pipeline([Impute, Forecast, Evaluate])

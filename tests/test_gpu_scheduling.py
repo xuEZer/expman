@@ -441,7 +441,9 @@ class GpuSchedulingTests(unittest.TestCase):
             {"seed": 0, "unused": 0},
             output_dir=self.root / "seed",
             _cache_root=output_dir / "cache",
-        ).run()
+        )
+        seeded.run_stage(0, attempt=1)
+        expected = seeded._store.completed((0,))["output"]
         launches = []
         original_launch = GpuScheduler._launch
 
@@ -454,7 +456,7 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
         self.assertLessEqual(len(launches), 1)
         self.assertEqual(
-            [item.output for item in results], [seeded.output, seeded.output]
+            [item.output for item in results], [expected, expected]
         )
         references = [
             experiment._store.completed_reference((0,))

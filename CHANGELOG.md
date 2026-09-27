@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- `Batch` 成为唯一执行入口：`Experiment` 转为内部组件，不再从 `expman` 导出；移除 `Experiment.run()` 及其附属的 `_release_output()`、`_timing_snapshot()` 与 `ResultOutput`，调度 worker 一律经 `run_stage()` 执行单个顶层阶段。全部示例统一经 `Batch` 执行并显式声明 `device` 与根部 `seed`。
+
 ### Fixed
 
 - `Batch` 统一使用 GPU Stage 调度；`device` 必填且必须是非空 GPU 编号列表，根部 `seed` 也必须显式提供，不再隐式使用 `0`。

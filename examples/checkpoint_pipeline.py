@@ -40,7 +40,13 @@ def main() -> None:
         Batch.resume(pipeline, args.resume)
         if args.resume
         else Batch(
-            pipeline, {"values": [1, 2, 3], "interrupt_once": args.interrupt_once}
+            pipeline,
+            {
+                "device": [0],
+                "seed": 0,
+                "values": [1, 2, 3],
+                "interrupt_once": args.interrupt_once,
+            },
         )
     )
     print(f"Batch directory: {batch.output_dir}", flush=True)

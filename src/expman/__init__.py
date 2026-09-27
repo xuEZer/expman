@@ -5,7 +5,7 @@ from .config import ConfigError, MissingConfigWarning, load_configs
 from .context import RunContext
 from .estimation import TimeEstimate
 from .events import Event, ExecutionEvent, MetricEvent, ProgressEvent, Status
-from .experiment import AttemptResult, Experiment, ExperimentResult, StageResult
+from .experiment import AttemptResult, ExperimentResult, StageResult
 from .pipeline import Pipeline
 from .randomness import seed_everything
 from .recorders import InMemoryRecorder, Recorder
@@ -25,7 +25,6 @@ __all__ = [
     "ConfigError",
     "Event",
     "ExecutionEvent",
-    "Experiment",
     "ExperimentResult",
     "InMemoryRecorder",
     "MetricEvent",

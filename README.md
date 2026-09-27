@@ -4,6 +4,10 @@
 
 开发版本：**0.1.0**（尚未发布）。Python ≥ 3.10；执行核心使用标准库，YAML 配置加载使用 PyYAML。
 
+## 执行模型
+
+`Batch` 是唯一的执行入口：它加载配置集合，把每个顶层 Stage 派发到独立的工作进程，并统一负责 GPU 装箱调度、资源合约、失败重试、断点恢复与前缀复用。运行环境要求 **Linux / WSL 与 NVIDIA GPU**（需要 `nvidia-smi`）；每份实验配置必须显式提供 `device`（GPU 编号列表）和根部 `seed`。不存在不声明 GPU 的执行路径。
+
 ## 安装与运行
 
 项目统一由 [uv](https://docs.astral.sh/uv/) 管理；锁定环境只包含运行所需的东西（NumPy、PyTorch、PyYAML）。先安装 uv，再在项目目录执行：
@@ -177,13 +181,13 @@ for result in results:
         print(attempt.attempt, attempt.status.value, attempt.error_message)
 ```
 
-- 首次执行初始数据为 `None`。通过 Batch 或 Experiment 执行时，每个阶段自动保存返回值和 `ctx.state`；重试跳过已完成阶段，恢复其输出和状态。
+- 首次执行初始数据为 `None`。由 Batch 执行时，每个阶段自动保存返回值和 `ctx.state`；重试跳过已完成阶段，恢复其输出和状态。
 - 任意普通异常（包括阶段构造异常）会记录失败并放到队尾，默认额外重试一次。设置 `max_retries=0` 可关闭重试。
 - 重试保留 `run_id`，`ctx.attempt` 从 1 递增。`ctx.cfg` 深层只读，运行过程中变化的数据放在可变字典 `ctx.state`。
 - `KeyboardInterrupt`、`SystemExit` 等中断会停止 Batch 并继续抛出。调用方捕获后可读取 `batch.results`：已执行实验保留结果，未执行实验状态为 `pending`。
 - 新 Stage 按参数异质性和资源装箱选择启动顺序；返回结果按配置顺序排列，每个结果保留全部尝试的状态、耗时和错误摘要；`output` 是最终成功尝试的返回值。事件可通过 `batch.recorder` 获取，支持传入自定义 Recorder。
 - 尝试输出不常驻内存：Batch 只保留状态、耗时、错误摘要和输出的存放位置，`result.output` 每次访问都从最终阶段快照读取，因此内存占用不随已完成实验数增长，中断后 `batch.results` 仍可读取全部输出。每次访问返回的是重新读到的副本，修改它不会写回记录；需要反复使用同一份数据时请自行保存引用。
-- Batch 对象执行一次；继续已有实验使用 `Batch.resume()`，重新开始使用新的 Batch。也可以传入一份具体配置字典，创建只有一个 Experiment 的集合。
+- Batch 对象执行一次；继续已有实验使用 `Batch.resume()`，重新开始使用新的 Batch。也可以传入一份具体配置字典，创建只有一个实验的集合。
 
 隔离覆盖框架持有的实例和配置；用户的类变量、全局变量及文件等外部副作用仍需自行管理。失败后不保存异常对象或 traceback，并触发垃圾回收。恢复不会回滚外部写入，用户代码需要合理处理重复执行。
 
@@ -252,7 +256,7 @@ ruff format --check .
 
 ### 持久化数值指标
 
-在由 `Batch` 或 `Experiment` 管理的阶段内，使用 `ctx.log_metrics()` 保存嵌套指标：
+在由 `Batch` 管理的阶段内，使用 `ctx.log_metrics()` 保存嵌套指标：
 
 ```python
 ctx.log_metrics(
@@ -262,7 +266,7 @@ ctx.log_metrics(
 ctx.log_metrics({"test": {"mse": 0.08}})  # 汇总指标
 ```
 
-Batch 内所有实验共用输出目录中的 `metrics.sqlite3`；独立 Experiment 使用自身输出目录。数据库在首次非空写入时创建。每次调用先校验整棵字典，再以一个事务写入，返回即已提交。写入失败会使阶段失败，并进入 Batch 的重试流程。
+Batch 内所有实验共用输出目录中的 `metrics.sqlite3`。数据库在首次非空写入时创建。每次调用先校验整棵字典，再以一个事务写入，返回即已提交。写入失败会使阶段失败，并进入 Batch 的重试流程。
 
 指标名为非空字符串，叶子为有限实数（不接受布尔值、NaN 和无穷值），统一保存为 SQLite REAL（双精度浮点数）。`step` 为非负的 64 位有符号整数或省略。空字典不产生记录。嵌套深度受 Python 递归限制。
 
@@ -346,7 +350,7 @@ python examples/multi_gpu.py --resume runs/<batch_id>
 
 ### 随机种子与随机状态恢复
 
-Experiment 启动时读取必填的根部 `seed`，并在构造和执行 Stage 前设置 Python `random`、环境中已安装的 NumPy 全局随机生成器，以及 PyTorch CPU/CUDA 随机种子。种子必须是 `0` 到 `2**32 - 1` 的整数，不接受布尔值。嵌套配置中的同名字段由用户代码解释。
+每个实验启动时读取必填的根部 `seed`，并在构造和执行 Stage 前设置 Python `random`、环境中已安装的 NumPy 全局随机生成器，以及 PyTorch CPU/CUDA 随机种子。种子必须是 `0` 到 `2**32 - 1` 的整数，不接受布尔值。嵌套配置中的同名字段由用户代码解释。
 
 ```yaml
 seed: 42
@@ -372,7 +376,7 @@ seed_everything(42)
 
 损坏的随机 checkpoint 会 warning 并尝试上一份，损坏的初始随机状态或已完成阶段随机状态会报错。旧版快照缺少随机状态时仍可恢复业务数据，但会发出 `RecoveryWarning`，不能保证随机序列连续。恢复所需的随机库缺失、CUDA 状态数量与可见设备不一致等不兼容情况会报错。
 
-独立的 `random.Random`、NumPy `Generator/default_rng`、`torch.Generator`、DataLoader 工作进程及第三方库的状态由用户保存。此功能不自动开启确定性 GPU 算法、不控制 Python hash 随机化，也不保证跨库版本或硬件逐位一致；参见 [PyTorch 可复现性说明](https://docs.pytorch.org/docs/stable/notes/randomness.html)。直接使用未受 Experiment 管理的 Pipeline/Stage，不会自动设置全局种子。
+独立的 `random.Random`、NumPy `Generator/default_rng`、`torch.Generator`、DataLoader 工作进程及第三方库的状态由用户保存。此功能不自动开启确定性 GPU 算法、不控制 Python hash 随机化，也不保证跨库版本或硬件逐位一致；参见 [PyTorch 可复现性说明](https://docs.pytorch.org/docs/stable/notes/randomness.html)。直接使用未受 Batch 管理的 Pipeline/Stage，不会自动设置全局种子。
 
 完整示例：`python examples/random_state.py`。
 
@@ -386,7 +390,7 @@ Batch 自动共享已完成的阶段结果。Pipeline 从 0 号阶段开始匹�
 
 共享快照位于 Batch 的 cache 目录，各 run 的 completed.pkl 保存引用；移动实验记录时应保留完整 Batch 目录。自身已有快照和 checkpoint 优先恢复。并发进程只读取已经发布完成的共享节点，同时启动的相同工作仍可能各自计算。嵌套 Pipeline 的依赖由外层 Stage 的声明覆盖。
 
-复用以相同上游、相关配置和随机状态产生一致结果为前提；文件内容变化等外部输入需通过配置中的版本字段表达。跳过阶段不会重新执行其中的外部副作用。独立 Experiment 保留自身恢复行为，共享范围限于同一个 Batch。
+复用以相同上游、相关配置和随机状态产生一致结果为前提；文件内容变化等外部输入需通过配置中的版本字段表达。跳过阶段不会重新执行其中的外部副作用。共享范围限于同一个 Batch。
 
 ## 可恢复的阶段诊断计时
 

@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from expman import ExecutionEvent, InMemoryRecorder, Pipeline, RunContext, Stage, Status
+from expman import Batch, Pipeline, RunContext, Stage
 
 
 class LoadNumbers(Stage[None, list[float]]):
@@ -45,13 +45,13 @@ class Summarize(Stage[list[float], Summary]):
 
 
 def main() -> None:
-    recorder = InMemoryRecorder()
-    context = RunContext(recorder=recorder, cfg={"factor": 0.5})
     pipeline = Pipeline([LoadNumbers, Scale, Summarize], name="numbers")
-    print(pipeline.run(ctx=context))
-    for event in recorder.events:
-        if isinstance(event, ExecutionEvent) and event.status is Status.SUCCEEDED:
-            print(f"{event.kind}: {event.name} {event.duration_seconds:.6f}s")
+    batch = Batch(pipeline, {"device": [0], "seed": 0, "factor": 0.5})
+    for result in batch.run():
+        print(
+            f"{result.run_id} {result.status.value} "
+            f"attempts={len(result.attempts)} output={result.output}"
+        )
 
 
 if __name__ == "__main__":

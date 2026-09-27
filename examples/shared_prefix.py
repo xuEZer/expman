@@ -30,7 +30,7 @@ def main():
     with TemporaryDirectory() as directory:
         root = Path(directory)
         config = root / "experiment.yaml"
-        config.write_text("size: 3\nscale: !choice [2, 3]\n")
+        config.write_text("device: [0]\nseed: 0\nsize: 3\nscale: !choice [2, 3]\n")
         results = Batch(
             Pipeline([Prepare, Predict]), config, output_dir=root / "batch"
         ).run(progress=False)

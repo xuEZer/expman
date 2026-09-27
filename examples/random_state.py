@@ -22,7 +22,7 @@ class Sample(Stage):
 
 
 def main():
-    batch = Batch(Pipeline([Sample]), {"seed": 42, "count": 4})
+    batch = Batch(Pipeline([Sample]), {"device": [0], "seed": 42, "count": 4})
     result = batch.run()[0]
     expected = random.Random(42)
     assert result.output == [expected.random() for _ in range(4)]
