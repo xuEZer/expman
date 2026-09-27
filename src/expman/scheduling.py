@@ -964,8 +964,6 @@ class GpuScheduler:
                 # a path from the scheduler's unrelated cgroup.
                 limit = replace(limit, cgroup=limits.cgroup_for_pid(process.pid))
             now = perf_counter()
-            with experiment._timing_lock:
-                experiment._active_started = now
             self.workers[run_id] = Worker(
                 process=process,
                 experiment=experiment,
@@ -991,8 +989,6 @@ class GpuScheduler:
                 process.wait()
                 process.stdin.close()
                 self.workers.pop(run_id, None)
-                with experiment._timing_lock:
-                    experiment._active_started = None
             with batch._state_lock:
                 batch._active_gpu.pop(run_id, None)
                 if previous_stage_attempt is None:
@@ -1062,7 +1058,6 @@ class GpuScheduler:
                 ),
             )
         with self.batch._state_lock:
-            experiment._active_started = None
             stage_key = f"{run_id}:{worker.stage_index}"
             self.batch._stage_attempts[stage_key] = worker.stage_attempt
             self.batch._stage_elapsed[run_id] += duration

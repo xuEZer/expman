@@ -8,7 +8,7 @@ from pathlib import Path
 from time import monotonic, sleep
 from unittest.mock import Mock, patch
 
-from expman import Batch, ConfigError, Experiment, Pipeline, Stage, Status, devices
+from expman import Batch, ConfigError, Pipeline, Stage, Status, devices
 from expman.devices import (
     GPU_PEAK_KB_DEFAULT,
     HOST_RESERVE_KB,
@@ -20,6 +20,7 @@ from expman.devices import (
     fits_reserve,
     nvidia_smi,
 )
+from expman.experiment import Experiment
 from expman.scheduling import GpuScheduler, HostGate
 
 IMPORT_DEVICE = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -455,9 +456,7 @@ class GpuSchedulingTests(unittest.TestCase):
             results = batch.run(progress=False)
         self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
         self.assertLessEqual(len(launches), 1)
-        self.assertEqual(
-            [item.output for item in results], [expected, expected]
-        )
+        self.assertEqual([item.output for item in results], [expected, expected])
         references = [
             experiment._store.completed_reference((0,))
             for experiment in batch.experiments
@@ -465,7 +464,7 @@ class GpuSchedulingTests(unittest.TestCase):
         self.assertEqual(references[0], references[1])
         self.assertEqual(
             batch.experiments[1]._store.completed((0,))["state"]["producer"],
-            seeded.output,
+            expected,
         )
 
     def test_failure_and_unexpected_process_exit_get_one_retry(self):
