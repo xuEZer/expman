@@ -1,7 +1,4 @@
 import io
-import tempfile
-import unittest
-from pathlib import Path
 
 from expman import Batch, Pipeline, Stage, Status
 from expman.progress import BatchProgress
@@ -26,52 +23,45 @@ class Second(Stage):
         return ctx.cfg["item"]
 
 
-class ParallelEstimationTests(unittest.TestCase):
-    def test_eta_counts_only_unmaterialized_stage_parameter_groups(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            cfg = root / "cfg.yaml"
-            cfg.write_text("device: [0]\nseed: 0\nitem: !choice [0, 1, 2]\n")
-            batch = Batch(Pipeline([First, Second]), cfg, output_dir=root / "batch")
-            first = batch.experiments[0]
-            batch._queue.remove(first.run_id)
-            batch._stage_history.extend(
-                [
-                    {
-                        "run_id": first.run_id,
-                        "stage": 0,
-                        "status": Status.SUCCEEDED.value,
-                        "reused": False,
-                        "stage_duration_seconds": 10.0,
-                        "dependencies": [],
-                    },
-                    {
-                        "run_id": first.run_id,
-                        "stage": 1,
-                        "status": Status.SUCCEEDED.value,
-                        "reused": False,
-                        "stage_duration_seconds": 20.0,
-                        "dependencies": [(("item",), "sample")],
-                    },
-                ]
-            )
-            scheduler = GpuScheduler(batch)
+def test_eta_counts_only_unmaterialized_stage_parameter_groups(tmp_path):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("device: [0]\nseed: 0\nitem: !choice [0, 1, 2]\n")
+    batch = Batch(Pipeline([First, Second]), cfg, output_dir=tmp_path / "batch")
+    first = batch.experiments[0]
+    batch._queue.remove(first.run_id)
+    batch._stage_history.extend(
+        [
+            {
+                "run_id": first.run_id,
+                "stage": 0,
+                "status": Status.SUCCEEDED.value,
+                "reused": False,
+                "stage_duration_seconds": 10.0,
+                "dependencies": [],
+            },
+            {
+                "run_id": first.run_id,
+                "stage": 1,
+                "status": Status.SUCCEEDED.value,
+                "reused": False,
+                "stage_duration_seconds": 20.0,
+                "dependencies": [(("item",), "sample")],
+            },
+        ]
+    )
+    scheduler = GpuScheduler(batch)
 
-            estimate = batch.estimate()
+    estimate = batch.estimate()
 
-            # Stage 0 has one config-independent cache group, already completed.
-            # Stage 1 still needs one representative for item=1 and item=2.
-            self.assertEqual(estimate.lower_seconds, 40.0)
-            self.assertEqual(estimate.upper_seconds, 40.0)
-            self.assertEqual(str(estimate), "00:00:01")
-            self.assertEqual(estimate.completed_samples, 2)
-            self.assertEqual(estimate.remaining_experiments, 2)
-            self.assertIs(batch._scheduler, scheduler)
-            progress = BatchProgress(batch, enabled=True, interval=1)
-            progress.stream = io.StringIO()
-            progress._render()
-            self.assertIn("Stage0:1/1 Stage1:1/3", progress.stream.getvalue())
-
-
-if __name__ == "__main__":
-    unittest.main()
+    # Stage 0 has one config-independent cache group, already completed.
+    # Stage 1 still needs one representative for item=1 and item=2.
+    assert estimate.lower_seconds == 40.0
+    assert estimate.upper_seconds == 40.0
+    assert str(estimate) == "00:00:01"
+    assert estimate.completed_samples == 2
+    assert estimate.remaining_experiments == 2
+    assert batch._scheduler is scheduler
+    progress = BatchProgress(batch, enabled=True, interval=1)
+    progress.stream = io.StringIO()
+    progress._render()
+    assert "Stage0:1/1 Stage1:1/3" in progress.stream.getvalue()

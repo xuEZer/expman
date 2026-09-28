@@ -2,15 +2,12 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Any, Generic, TypeVar, final
+from typing import Any, final
 
 from .context import RunContext, _name
 
-InputT = TypeVar("InputT")
-OutputT = TypeVar("OutputT")
 
-
-class Stage(ABC, Generic[InputT, OutputT]):
+class Stage[InputT, OutputT](ABC):
     """Override process and use run as the monitored execution entry point.
 
     Stage instances may hold state. Pipeline constructs them with no arguments

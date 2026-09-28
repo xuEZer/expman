@@ -3,6 +3,7 @@
 import importlib
 import random
 from copy import deepcopy
+from typing import Any
 
 from .storage import StorageError
 
@@ -14,7 +15,8 @@ def validate_seed(seed: int) -> int:
     return seed
 
 
-def _optional_import(name):
+def _optional_import(name: str) -> Any:
+    """Import an optional backend, or report that it is not installed."""
     try:
         return importlib.import_module(name)
     except ModuleNotFoundError as error:

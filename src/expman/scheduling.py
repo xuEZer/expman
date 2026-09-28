@@ -28,7 +28,7 @@ PLAN_BEAM_WIDTH = 128
 class HostGate:
     """Admission from the current host-memory observation only."""
 
-    def can_launch(self, host, running):
+    def can_launch(self, host):
         return not (host is None or host.tight)
 
 
@@ -49,7 +49,6 @@ class Worker:
     gpu_contract_kb: float = 0.0
     expected_seconds: float | None = None
     area: float = 0.0
-    offset: int = 0
     limit: object = None
     # Sampled every tick: resident is what the worker holds now, peak is the most
     # it has ever held. Admission reserves the gap between the two.
@@ -92,6 +91,12 @@ class Plan:
 def _kill_group(process):
     with suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGKILL)
+
+
+def _close_stdin(process):
+    """Close a worker's control pipe; workers always start with stdin=PIPE."""
+    if process.stdin is not None:
+        process.stdin.close()
 
 
 class GpuScheduler:
@@ -146,13 +151,6 @@ class GpuScheduler:
                 collected.update(self._declared_paths(run_id, index))
             paths = frozenset(collected)
             cached[stage_index] = paths
-        return paths
-
-    def _stage_paths(self, stage_index):
-        """Return the union of every run's declared prefix paths at one Stage."""
-        paths = set()
-        for experiment in self.batch.experiments:
-            paths.update(self._prefix_paths(experiment.run_id, stage_index))
         return paths
 
     def _append_stage_history(self, entry):
@@ -320,11 +318,6 @@ class GpuScheduler:
         if model is False:
             return None
         return model.estimate(run_id)
-
-    @property
-    def peak_ceiling(self):
-        """Largest observed host peak, retained for scheduler introspection."""
-        return self.peaks.ceiling_kb
 
     def _stage_measured(self, stage_index):
         """Whether this Stage has ever run here, so it has a peak to size from.
@@ -515,9 +508,7 @@ class GpuScheduler:
                 self.batch.recorder.record(message["event"])
             elif kind == "resource":
                 self._resources(worker, message)
-            elif kind == "finished" and isinstance(
-                message.get("result"), (StageResult, AttemptResult)
-            ):
+            elif kind == "finished" and isinstance(message.get("result"), StageResult):
                 worker.finished = message["result"]
                 dependencies = message.get("dependencies")
                 worker.dependencies = (
@@ -565,7 +556,6 @@ class GpuScheduler:
                 stacklevel=2,
             )
             with self.batch._state_lock:
-                self.batch._gpu_memory = {}
                 self.batch._host_memory = {}
             return None, None
         # One more attempt is charged at least the largest peak seen so far.
@@ -573,9 +563,6 @@ class GpuScheduler:
             host, max(self.peaks.ceiling_kb, devices.HOST_PEAK_KB_DEFAULT)
         )
         with self.batch._state_lock:
-            self.batch._gpu_memory = {
-                device: value.free_ratio for device, value in memory.items()
-            }
             self.batch._host_memory = {
                 "available_ratio": host.available_ratio,
                 "available_kb": host.available_kb,
@@ -588,7 +575,7 @@ class GpuScheduler:
             }
         return memory, host
 
-    def _relieve(self, memory, host):
+    def _relieve(self, host):
         """Shed one worker for this tick's host-memory pressure.
 
         Shedding resolves over-commitment between attempts sharing the host. With
@@ -894,7 +881,7 @@ class GpuScheduler:
                     "stage_index": stage_index,
                     "stage_attempt": stage_attempt,
                     "attempts": [
-                        replace(item, _output=None, output_source=None)
+                        replace(item, output_source=None)
                         for item in experiment.result.attempts
                     ],
                 },
@@ -968,7 +955,7 @@ class GpuScheduler:
                 process=process,
                 experiment=experiment,
                 device=device,
-                uuid=None if memory is None else memory.uuid,
+                uuid=memory.uuid,
                 root=root,
                 started=now,
                 stage_index=stage_index,
@@ -987,7 +974,7 @@ class GpuScheduler:
             if process is not None:
                 _kill_group(process)
                 process.wait()
-                process.stdin.close()
+                _close_stdin(process)
                 self.workers.pop(run_id, None)
             with batch._state_lock:
                 batch._active_gpu.pop(run_id, None)
@@ -1006,7 +993,7 @@ class GpuScheduler:
         finished = perf_counter()
         _kill_group(worker.process)  # Also reap experiment-owned helper processes.
         worker.process.wait()
-        worker.process.stdin.close()
+        _close_stdin(worker.process)
         self._messages(worker)
         experiment = worker.experiment
         duration = max(0.0, finished - worker.started)
@@ -1157,8 +1144,8 @@ class GpuScheduler:
                 # Both readings are rechecked every tick: a stale ratio never
                 # admits work, and an unreadable one keeps every card closed.
                 memory, host = self._observe()
-                self._relieve(memory, host)
-                launching = self.host_gate.can_launch(host, list(self.workers))
+                self._relieve(host)
+                launching = self.host_gate.can_launch(host)
                 if launching and memory is not None:
                     self._materialize_reuses()
                     self._launch_available(memory, host)

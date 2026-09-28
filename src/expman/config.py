@@ -258,7 +258,9 @@ class _Defaults:
     def __init__(self, experiment: Path) -> None:
         self.experiment = experiment
         self.root: Path | None = None
-        self.cache: dict[Path, dict[str, Any] | None] = {}
+        # A cached entry is what _read_yaml returned, or None when the defaults
+        # file is missing.
+        self.cache: dict[Path, dict[str, Any] | _Choice | None] = {}
 
     def resolve(
         self,

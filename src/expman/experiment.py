@@ -21,6 +21,8 @@ from .storage import RunStore, Serializer, StorageError, read_record, write_reco
 class OutputSource(Protocol):
     """Reads an attempt output that the parent process does not keep in memory."""
 
+    def load(self) -> Any: ...
+
 
 @dataclass(frozen=True, eq=False)
 class SnapshotOutput:
@@ -49,16 +51,13 @@ class AttemptResult:
     attempt: int
     status: Status
     duration_seconds: float
-    _output: Any = None
     error_type: str | None = None
     error_message: str | None = None
     output_source: OutputSource | None = None
 
     @property
     def output(self) -> Any:
-        if self._output is not None or self.output_source is None:
-            return self._output
-        return self.output_source.load()
+        return None if self.output_source is None else self.output_source.load()
 
 
 @dataclass(frozen=True)

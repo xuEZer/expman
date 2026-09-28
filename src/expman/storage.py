@@ -9,9 +9,14 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any, BinaryIO, Protocol
+from typing import TYPE_CHECKING, Any, BinaryIO, Protocol
 
 from .dependencies import matches, validate
+
+if TYPE_CHECKING:
+    from .metrics import MetricStore
+    from .prefix_cache import PrefixCache
+    from .randomness import RandomStateManager
 
 
 class StorageError(RuntimeError):
@@ -94,12 +99,12 @@ class RunStore:
     def __init__(self, root: Path, serializer: Serializer | None = None):
         self.root = root
         self.serializer = PickleSerializer() if serializer is None else serializer
-        self.rng = None
-        self.shared = None
-        self.metrics = None
-        self.run_id = None
-        self.cache_parent = None
-        self.cache_position = None
+        self.rng: RandomStateManager | None = None
+        self.shared: PrefixCache | None = None
+        self.metrics: MetricStore | None = None
+        self.run_id: str | None = None
+        self.cache_parent: str | None = None
+        self.cache_position: tuple[int, ...] | None = None
         self._timers = {}
         self._saved_seconds = {}
 
@@ -133,6 +138,12 @@ class RunStore:
             )
             return
         self.rng.restore(record["rng_state"])
+
+    def restore_metrics(self, attempt: int, rows: list) -> None:
+        """Restore shared-cache metrics when this run publishes to a cache."""
+        if self.metrics is None or self.run_id is None:
+            return
+        self.metrics.restore(self.run_id, attempt, rows)
 
     def stage_dir(self, position: tuple[int, ...]) -> Path:
         return self.root.joinpath("stages", *(str(index) for index in position))
@@ -177,6 +188,13 @@ class RunStore:
         """
         return (self.stage_dir(position) / "completed.pkl").exists()
 
+    def _require_shared(self, record, position, path) -> "PrefixCache":
+        """A cache-published record needs a live cache and the matching position."""
+        cache = self.shared
+        if cache is None or record.get("position") != position:
+            raise StorageError(f"cannot resolve shared snapshot: {path}")
+        return cache
+
     def summary(self, position) -> dict | None:
         """A completed Stage's small fields, without materialising its output.
 
@@ -189,9 +207,8 @@ class RunStore:
             return None
         record = read_record(path, self.serializer)
         if isinstance(record, dict) and "cache_ref" in record:
-            if self.shared is None or record.get("position") != position:
-                raise StorageError(f"cannot resolve shared snapshot: {path}")
-            metadata = self.shared.metadata(record["cache_ref"], position)
+            shared = self._require_shared(record, position, path)
+            metadata = shared.metadata(record["cache_ref"], position)
             return {
                 "config_dependencies": metadata.get("dependencies"),
                 "reused": metadata.get("reused", False),
@@ -211,10 +228,9 @@ class RunStore:
             return None
         record = read_record(path, self.serializer)
         if isinstance(record, dict) and "cache_ref" in record:
-            if self.shared is None or record.get("position") != position:
-                raise StorageError(f"cannot resolve shared snapshot: {path}")
+            shared = self._require_shared(record, position, path)
             reference = record["cache_ref"]
-            snapshot = self.shared.load(reference, position)
+            snapshot = shared.load(reference, position)
             snapshot["_cache_ref"] = reference
             snapshot["_shared_reused"] = record["shared_reused"]
             return snapshot
@@ -253,8 +269,12 @@ class RunStore:
         }
         if dependencies is not None:
             record["config_dependencies"] = dependencies
+        # shared, metrics and run_id are installed together when a Batch serves a
+        # shared cache root, so all three are present or none is.
         if (
             self.shared is not None
+            and self.metrics is not None
+            and self.run_id is not None
             and self.cache_position == position
             and self.cache_parent is not None
         ):
@@ -316,7 +336,7 @@ class RunStore:
 
 
 class Checkpoint:
-    """Save current state synchronously; keep two successfully written files."""
+    """Save current state synchronously; keep only the newest written file."""
 
     def __init__(
         self,
@@ -371,7 +391,7 @@ class RunLock:
 
     def __init__(self, root: Path):
         self.path = root / "run.lock"
-        self.stream = None
+        self.stream: BinaryIO | None = None
 
     def __enter__(self):
         self.stream = self.path.open("a+b")
@@ -395,4 +415,6 @@ class RunLock:
         return self
 
     def __exit__(self, *args):
-        self.stream.close()
+        if self.stream is not None:
+            self.stream.close()
+            self.stream = None

@@ -7,7 +7,6 @@ import sys
 import unicodedata
 from numbers import Real
 from threading import Event, Thread
-from time import monotonic
 
 _logger = logging.getLogger(__name__)
 _UNKNOWN = "??:??:??～??:??:??"
@@ -34,8 +33,6 @@ class BatchProgress:
         self.warned = False
         self.last_line = None
         self.inline = False
-        self.started_at = None
-        self.finished_at = None
         try:
             self.tty = bool(self.stream.isatty())
         except Exception:
@@ -44,7 +41,6 @@ class BatchProgress:
     def start(self) -> None:
         if not self.enabled:
             return
-        self.started_at = monotonic()
         self._render()
         if not self.disabled:
             self.thread = Thread(target=self._loop, name="expman-progress", daemon=True)
@@ -53,7 +49,6 @@ class BatchProgress:
     def stop(self, error: BaseException | None = None) -> None:
         if not self.enabled:
             return
-        self.finished_at = monotonic()
         self.stopped.set()
         if self.thread is not None and self.thread.is_alive():
             self.thread.join()

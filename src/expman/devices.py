@@ -57,7 +57,6 @@ POLL_INTERVAL = 1.0
 # attempt and blocks refills, so keep a few times the worst observation.
 QUERY_TIMEOUT = 3.0
 MEMINFO_PATH = Path("/proc/meminfo")
-PROC_ROOT = Path("/proc")
 # WSL2 installs the Linux nvidia-smi here without adding it to PATH.
 NVIDIA_SMI_FALLBACKS = (Path("/usr/lib/wsl/lib/nvidia-smi"),)
 

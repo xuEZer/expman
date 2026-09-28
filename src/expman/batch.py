@@ -7,7 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from threading import Event, RLock, Thread
 from time import monotonic
-from typing import Any
+from typing import Any, TypeGuard
 from uuid import uuid4
 
 from .config import load_configs
@@ -31,6 +31,16 @@ from .storage import (
 )
 
 TIMING_SAVE_INTERVAL = 5.0
+
+
+def _is_seconds(value: float | None) -> TypeGuard[float]:
+    """Whether a saved estimate bound is a finite, non-negative number."""
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value >= 0
+    )
 
 
 class Batch:
@@ -70,7 +80,6 @@ class Batch:
         self._stage_elapsed = {}
         self._stage_history = []
         self._gpu_history = []
-        self._gpu_memory = {}
         self._host_memory = {}
         self._gpu_running_info = {}
         self.output_dir = (
@@ -165,7 +174,6 @@ class Batch:
             "max_retries": self.max_retries,
             "experiments": experiments,
             "queue": list(self._queue),
-            "active": None,
             "active_gpu": dict(self._active_gpu),
             "stage_progress": dict(self._stage_progress),
             "stage_attempts": dict(self._stage_attempts),
@@ -200,7 +208,7 @@ class Batch:
         if (
             not isinstance(manifest, dict)
             or manifest.get("version") != 1
-            or not {"pipeline", "max_retries", "experiments", "queue", "active"}
+            or not {"pipeline", "max_retries", "experiments", "queue"}
             <= manifest.keys()
             or not isinstance(manifest.get("experiments"), list)
             or not isinstance(manifest.get("queue"), list)
@@ -283,7 +291,6 @@ class Batch:
         }
         self.devices = configured_devices([item.cfg for item in experiments])
         self._active_gpu = {}
-        self._gpu_memory = {}
         self._host_memory = {}
         self._gpu_running_info = {}
         history = manifest.get("gpu_history", [])
@@ -313,7 +320,10 @@ class Batch:
         self._scheduler = None
         ids = {experiment.run_id for experiment in self.experiments}
         self._queue = deque(manifest["queue"])
-        active = manifest["active"]
+        # "active" is a legacy field: manifests written before the queue became
+        # the single source of truth carry it, and a non-null value means the
+        # record was interrupted mid-write and must not be trusted.
+        active = manifest.get("active")
         if (
             len(ids) != len(experiments)
             or len(set(self._queue)) != len(self._queue)
@@ -369,15 +379,10 @@ class Batch:
                 try:
                     estimate = TimeEstimate(**saved)
                     validate_coverage(estimate.coverage)
-                    if any(
-                        isinstance(value, bool)
-                        or not isinstance(value, (int, float))
-                        or not math.isfinite(value)
-                        or value < 0
-                        for value in (estimate.lower_seconds, estimate.upper_seconds)
-                    ):
+                    lower, upper = estimate.lower_seconds, estimate.upper_seconds
+                    if not (_is_seconds(lower) and _is_seconds(upper)):
                         raise ValueError("invalid estimate bounds")
-                    if estimate.lower_seconds > estimate.upper_seconds:
+                    if lower > upper:
                         raise ValueError("reversed estimate bounds")
                     self._last_estimate = estimate
                 except (TypeError, ValueError) as error:

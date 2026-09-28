@@ -2,11 +2,11 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
-from typing import Literal, TypeAlias
+from enum import StrEnum
+from typing import Literal
 
 
-class Status(str, Enum):
+class Status(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
@@ -55,4 +55,4 @@ class ProgressEvent:
     stage_id: int | None = None
 
 
-Event: TypeAlias = ExecutionEvent | MetricEvent | ProgressEvent
+type Event = ExecutionEvent | MetricEvent | ProgressEvent

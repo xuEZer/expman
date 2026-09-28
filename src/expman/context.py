@@ -5,7 +5,7 @@ import math
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from numbers import Real
 from time import perf_counter
 from typing import Any, Literal
@@ -21,7 +21,7 @@ _logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _nonnegative_integer(value: int, name: str) -> None:

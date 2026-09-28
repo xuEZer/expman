@@ -45,7 +45,7 @@ class PrefixCache:
             raise StorageError("shared-cache reference escaped the Batch directory")
         return directory
 
-    def load(self, reference, position):
+    def load(self, reference, position) -> dict:
         directory = self._directory(reference)
         self.metadata(reference, position)
         record = read_record(directory / "snapshot.pkl", self.serializer)
@@ -83,7 +83,7 @@ class PrefixCache:
                     stacklevel=3,
                 )
 
-    def metadata(self, reference, position):
+    def metadata(self, reference, position) -> dict:
         """Read one node's metadata, which is small and always present.
 
         A scheduler that only needs a Stage's dependencies, duration or metrics
@@ -102,7 +102,9 @@ class PrefixCache:
             raise StorageError("invalid shared-cache metadata")
         return metadata
 
-    def find(self, parent, position, config):
+    def find(
+        self, parent, position, config
+    ) -> tuple[tuple[str, str, str], dict] | None:
         for reference, _metadata in self._candidates(parent, position, config):
             try:
                 return reference, self.load(reference, position)
@@ -120,13 +122,15 @@ class PrefixCache:
                 )
         return None
 
-    def find_metadata(self, parent, position, config):
+    def find_metadata(
+        self, parent, position, config
+    ) -> tuple[tuple[str, str, str], dict] | None:
         """Like ``find``, but returns the metadata without the snapshot."""
         for reference, metadata in self._candidates(parent, position, config):
             return reference, metadata
         return None
 
-    def publish(self, parent, record):
+    def publish(self, parent, record) -> tuple[str, str, str]:
         reference = (self.key, parent, uuid4().hex)
         directory = self._directory(reference)
         write_record(directory / "snapshot.pkl", record, self.serializer)

@@ -5,7 +5,7 @@ import math
 import sqlite3
 from collections.abc import Mapping
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from numbers import Real
 from pathlib import Path
 from typing import Any
@@ -64,7 +64,7 @@ class MetricStore:
     ) -> None:
         if not rows:
             return
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(UTC).isoformat()
         # A non-null sentinel makes summary metrics participate in uniqueness.
         parameters = [
             (
@@ -134,7 +134,7 @@ class MetricStore:
     def restore(self, run_id, attempt, rows):
         if not rows:
             return
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(UTC).isoformat()
         self._write(
             [
                 (run_id, stage_path, step, metric_path, value, attempt, timestamp)

@@ -15,6 +15,23 @@ from .stage import Stage
 from .storage import Checkpoint, RecoveryWarning
 
 
+def _reuse_completed(scoped, store, completed, position, restore_seconds):
+    """Restore one completed Stage's snapshot and record the reuse."""
+    with scoped.observe(completed["name"], kind="stage", reused=True):
+        scoped.state.clear()
+        scoped.state.update(completed["state"])
+        output = completed["output"]
+        store.status(
+            position,
+            Status.SUCCEEDED.value,
+            scoped.attempt,
+            reused=True,
+            elapsed_seconds=completed.get("elapsed_seconds"),
+            restore_seconds=restore_seconds,
+        )
+    return output
+
+
 class Pipeline:
     """A reusable sequence of Stage classes, executed synchronously and fail-fast.
 
@@ -88,36 +105,30 @@ class Pipeline:
                     _checkpoint=None,
                 )
                 store = scoped._store
-                if shared is not None:
+                if store is not None and shared is not None:
                     store.cache_position = position
                     store.cache_parent = parent
                 restore_started = perf_counter()
+                completed = None
                 if store is not None:
                     completed = store.completed(position)
-                    if completed is not None:
-                        with scoped.observe(
-                            completed["name"], kind="stage", reused=True
-                        ):
-                            scoped.state.clear()
-                            scoped.state.update(completed["state"])
-                            data = completed["output"]
-                            store.restore_random(completed)
-                            store.status(
-                                position,
-                                Status.SUCCEEDED.value,
-                                context.attempt,
-                                reused=True,
-                                elapsed_seconds=completed.get("elapsed_seconds"),
-                                restore_seconds=perf_counter() - restore_started,
-                            )
-                        if shared is not None:
-                            reference = completed.get("_cache_ref")
-                            parent = reference[2] if reference is not None else None
-                            lookup = lookup and completed.get("_shared_reused", False)
-                        if stop_after == index:
-                            return data
-                        continue
-                if shared is not None and lookup:
+                if store is not None and completed is not None:
+                    store.restore_random(completed)
+                    data = _reuse_completed(
+                        scoped,
+                        store,
+                        completed,
+                        position,
+                        perf_counter() - restore_started,
+                    )
+                    if shared is not None:
+                        reference = completed.get("_cache_ref")
+                        parent = reference[2] if reference is not None else None
+                        lookup = lookup and completed.get("_shared_reused", False)
+                    if stop_after == index:
+                        return data
+                    continue
+                if store is not None and shared is not None and lookup:
                     # Own in-progress work has priority over another run's result.
                     started = (store.stage_dir(position) / "status.pkl").exists()
                     if not started and not store.checkpoints(position):
@@ -126,26 +137,17 @@ class Pipeline:
                         if candidate is not None:
                             reference, completed = candidate
                             store.restore_random(completed)
-                            store.metrics.restore(
-                                store.run_id,
-                                context.attempt,
-                                completed.get("metrics", []),
+                            store.restore_metrics(
+                                context.attempt, completed.get("metrics", [])
                             )
                             store.reference(position, reference, reused=True)
-                            with scoped.observe(
-                                completed["name"], kind="stage", reused=True
-                            ):
-                                scoped.state.clear()
-                                scoped.state.update(completed["state"])
-                                data = completed["output"]
-                                store.status(
-                                    position,
-                                    Status.SUCCEEDED.value,
-                                    context.attempt,
-                                    reused=True,
-                                    elapsed_seconds=completed.get("elapsed_seconds"),
-                                    restore_seconds=perf_counter() - restore_started,
-                                )
+                            data = _reuse_completed(
+                                scoped,
+                                store,
+                                completed,
+                                position,
+                                perf_counter() - restore_started,
+                            )
                             parent = reference[2]
                             if stop_after == index:
                                 return data
@@ -179,7 +181,7 @@ class Pipeline:
                     if store is not None:
                         store.start_timing(position, checkpoint)
                     stage = stage_type()
-                    if checkpoint is not None:
+                    if store is not None and checkpoint is not None:
                         # Reconstruction may consume randomness; process resumes at
                         # the checkpoint's RNG position, not after reconstruction.
                         store.restore_random(checkpoint)
@@ -215,7 +217,7 @@ class Pipeline:
                 finally:
                     if store is not None:
                         store.stop_timing(position)
-                    if shared is not None:
-                        store.cache_position = None
-                        store.cache_parent = None
+                        if shared is not None:
+                            store.cache_position = None
+                            store.cache_parent = None
             return data

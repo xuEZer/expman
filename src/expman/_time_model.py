@@ -3,6 +3,7 @@
 import hashlib
 import math
 from collections.abc import Mapping
+from typing import Any
 
 
 def _flatten(value, path=()):
@@ -34,7 +35,7 @@ def features(configs):
     columns = []
     missing = object()
     for path in paths:
-        values = [row.get(path, missing) for row in flattened]
+        values: list[Any] = [row.get(path, missing) for row in flattened]
         tokens = [_token(v) if v is not missing else ("missing", "") for v in values]
         if len(set(tokens)) == 1:
             continue

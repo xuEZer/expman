@@ -1,12 +1,13 @@
 import os
 import sqlite3
 import subprocess
-import tempfile
-import unittest
 from itertools import pairwise
 from pathlib import Path
 from time import monotonic, sleep
 from unittest.mock import Mock, patch
+
+import pytest
+import yaml
 
 from expman import Batch, ConfigError, Pipeline, Stage, Status, devices
 from expman.devices import (
@@ -154,131 +155,119 @@ def _captured_gpu_ceilings(batch):
     return ceilings
 
 
-@unittest.skipUnless(os.name == "posix", "POSIX worker process groups")
-class GpuSchedulingTests(unittest.TestCase):
-    def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        for target, value in [
-            ("expman.devices.NvidiaMemory", Memory),
-            ("expman.devices.MeminfoMonitor", Host),
-            ("expman.devices.POLL_INTERVAL", 0.01),
-        ]:
-            mock = patch(target, value)
-            mock.start()
-            self.addCleanup(mock.stop)
+def make_batch(root, *, count=3, devices=None, **options):
+    cfg = {
+        "device": [0, 1] if devices is None else devices,
+        "seed": 0,
+        "markers": str(root),
+        "crash": False,
+        "fail_once": False,
+        "wait_for_release": False,
+        "delay": 0.1,
+        **options,
+    }
+    path = root / "experiments.yaml"
+    path.write_text(yaml.safe_dump(cfg) + f"item: !choice {list(range(count))}\n")
+    return Batch(Pipeline([GpuWork]), path, output_dir=root / "batch")
 
-    def make_batch(self, *, count=3, devices=None, **options):
-        import yaml
 
-        cfg = {
-            "device": [0, 1] if devices is None else devices,
-            "seed": 0,
-            "markers": str(self.root),
-            "crash": False,
-            "fail_once": False,
-            "wait_for_release": False,
-            "delay": 0.1,
-            **options,
-        }
-        path = self.root / "experiments.yaml"
-        path.write_text(yaml.safe_dump(cfg) + f"item: !choice {list(range(count))}\n")
-        return Batch(Pipeline([GpuWork]), path, output_dir=self.root / "batch")
+def warm(batch, *, gpu_peak_kb=1024, peak_kb=4096):
+    """Give every Stage the completed sample a previous run would have left.
 
-    def warm(self, batch, *, gpu_peak_kb=1024, peak_kb=4096):
-        """Give every Stage the completed sample a previous run would have left.
+    A Batch measures each Stage once before it starts packing attempts
+    concurrently, and a Stage that has never reported CUDA usage receives no
+    GPU contract afterwards. Tests about packing therefore start from a Batch
+    whose Stages have already been measured, with a CUDA peak on record.
+    """
+    for experiment in batch.experiments:
+        for stage_index in range(len(experiment.pipeline.stages)):
+            batch._stage_history.append(
+                {
+                    "run_id": experiment.run_id,
+                    "stage": stage_index,
+                    "status": Status.SUCCEEDED.value,
+                    "peak_kb": float(peak_kb),
+                    "gpu_peak_kb": float(gpu_peak_kb),
+                    "gpu_capped": False,
+                    "capped": False,
+                    "reused": False,
+                }
+            )
+    return batch
 
-        A Batch measures each Stage once before it starts packing attempts
-        concurrently, and a Stage that has never reported CUDA usage receives no
-        GPU contract afterwards. Tests about packing therefore start from a Batch
-        whose Stages have already been measured, with a CUDA peak on record.
-        """
-        for experiment in batch.experiments:
-            for stage_index in range(len(experiment.pipeline.stages)):
-                batch._stage_history.append(
-                    {
-                        "run_id": experiment.run_id,
-                        "stage": stage_index,
-                        "status": Status.SUCCEEDED.value,
-                        "peak_kb": float(peak_kb),
-                        "gpu_peak_kb": float(gpu_peak_kb),
-                        "gpu_capped": False,
-                        "capped": False,
-                        "reused": False,
-                    }
-                )
-        return batch
 
-    def test_multiple_devices_and_metrics_results_are_collected(self):
-        batch = self.warm(self.make_batch(count=4, delay=0.25))
+@pytest.mark.skipif(os.name != "posix", reason="POSIX worker process groups")
+class TestGpuScheduling:
+    @pytest.fixture(autouse=True)
+    def fake_devices(self, monkeypatch):
+        monkeypatch.setattr(devices, "NvidiaMemory", Memory)
+        monkeypatch.setattr(devices, "MeminfoMonitor", Host)
+        monkeypatch.setattr(devices, "POLL_INTERVAL", 0.01)
+
+    def test_multiple_devices_and_metrics_results_are_collected(self, tmp_path):
+        batch = warm(make_batch(tmp_path, count=4, delay=0.25))
         results = batch.run(progress=False)
-        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
-        self.assertEqual(
-            {item.output["device"] for item in results}, {"GPU-test-0", "GPU-test-1"}
+        assert all(item.status is Status.SUCCEEDED for item in results)
+        assert {item.output["device"] for item in results} == {
+            "GPU-test-0",
+            "GPU-test-1",
+        }
+        assert len({item.output["pid"] for item in results}) == 4
+        assert all(
+            item.output["import_device"] == item.output["device"] for item in results
         )
-        self.assertEqual(len({item.output["pid"] for item in results}), 4)
-        self.assertTrue(
-            all(
-                item.output["import_device"] == item.output["device"]
-                for item in results
-            )
-        )
-        self.assertTrue(all(item.output["cfg_devices"] == [0, 1] for item in results))
-        self.assertTrue(any(item["concurrency"] > 1 for item in batch._gpu_history))
+        assert all(item.output["cfg_devices"] == [0, 1] for item in results)
+        assert any(item["concurrency"] > 1 for item in batch._gpu_history)
         measured = [item for item in batch._stage_history if not item.get("reused")]
-        self.assertTrue(measured)
-        self.assertTrue(all(item["peak_kb"] > 0 for item in measured))
-        self.assertEqual(batch._host_memory["available_ratio"], 0.75)
-        self.assertEqual(batch._host_memory["swap_free_kb"], 0.0)
-        self.assertFalse(batch._host_memory["tight"])
+        assert measured
+        assert all(item["peak_kb"] > 0 for item in measured)
+        assert batch._host_memory["available_ratio"] == 0.75
+        assert batch._host_memory["swap_free_kb"] == 0.0
+        assert not batch._host_memory["tight"]
         with sqlite3.connect(batch.output_dir / "metrics.sqlite3") as db:
-            self.assertEqual(
-                db.execute("SELECT count(*) FROM metrics").fetchone()[0], 40
-            )
-        self.assertTrue(batch.recorder.events)
+            assert db.execute("SELECT count(*) FROM metrics").fetchone()[0] == 40
+        assert batch.recorder.events
         resumed = Batch.resume(Pipeline([GpuWork]), batch.output_dir)
-        self.assertEqual(
-            [item.output for item in resumed.run(progress=False)],
-            [item.output for item in results],
-        )
-        self.assertEqual(resumed.devices, (0, 1))
+        assert [item.output for item in resumed.run(progress=False)] == [
+            item.output for item in results
+        ]
+        assert resumed.devices == (0, 1)
 
-    def test_top_level_stages_run_independently_and_record_dependencies(self):
-        path = self.root / "two-stages.yaml"
+    def test_top_level_stages_run_independently_and_record_dependencies(self, tmp_path):
+        path = tmp_path / "two-stages.yaml"
         path.write_text(
-            f"device: [0]\nseed: 0\nmarkers: {self.root}\noffset: 10\nitem: !choice [1, 2]\n"
+            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\noffset: 10\nitem: !choice [1, 2]\n"
         )
         batch = Batch(
-            Pipeline([Prepare, Consume]), path, output_dir=self.root / "two-stages"
+            Pipeline([Prepare, Consume]), path, output_dir=tmp_path / "two-stages"
         )
 
         results = batch.run(progress=False)
 
-        self.assertEqual([result.output for result in results], [11, 12])
-        self.assertEqual(
-            sorted(entry["stage"] for entry in batch._stage_history), [0, 0, 1, 1]
+        assert [result.output for result in results] == [11, 12]
+        assert sorted(entry["stage"] for entry in batch._stage_history) == [0, 0, 1, 1]
+        assert all(
+            (tmp_path / f"{result.run_id}.prepare").exists() for result in results
         )
-        self.assertTrue(
-            all((self.root / f"{result.run_id}.prepare").exists() for result in results)
-        )
-        self.assertTrue(
-            all((self.root / f"{result.run_id}.consume").exists() for result in results)
+        assert all(
+            (tmp_path / f"{result.run_id}.consume").exists() for result in results
         )
         dependencies = {
             entry["stage"]: {path for path, _digest in entry["dependencies"]}
             for entry in batch._stage_history
         }
-        self.assertEqual(dependencies[0], {("item",), ("markers",)})
-        self.assertEqual(dependencies[1], {("markers",), ("offset",)})
+        assert dependencies[0] == {("item",), ("markers",)}
+        assert dependencies[1] == {("markers",), ("offset",)}
         scheduler = GpuScheduler(batch)
-        self.assertEqual(
-            scheduler._stage_paths(1), {("item",), ("markers",), ("offset",)}
-        )
-        self.assertGreater(scheduler._stage_duration(results[0].run_id, 1), 0)
+        assert {
+            path
+            for item in batch.experiments
+            for path in scheduler._prefix_paths(item.run_id, 1)
+        } == {("item",), ("markers",), ("offset",)}
+        assert scheduler._stage_duration(results[0].run_id, 1) > 0
 
-    def test_completed_zero_gpu_sample_needs_no_vram_reservation(self):
-        batch = self.make_batch(count=2, devices=[0])
+    def test_completed_zero_gpu_sample_needs_no_vram_reservation(self, tmp_path):
+        batch = make_batch(tmp_path, count=2, devices=[0])
         scheduler = GpuScheduler(batch)
         batch._stage_history.append(
             {
@@ -292,88 +281,85 @@ class GpuSchedulingTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(
+        assert (
             scheduler._stage_peak(
                 batch.experiments[1].run_id, 0, "gpu_peak_kb", GPU_PEAK_KB_DEFAULT
-            ),
-            0.0,
+            )
+            == 0.0
         )
 
-    def test_gpu_contract_never_exceeds_physical_card_capacity(self):
-        batch = self.make_batch(count=2, devices=[0])
+    def test_gpu_contract_never_exceeds_physical_card_capacity(self, tmp_path):
+        batch = make_batch(tmp_path, count=2, devices=[0])
         scheduler = GpuScheduler(batch)
         capacity_kb = 3 * 1024
 
         with patch.object(scheduler, "_stage_peak", return_value=100 * capacity_kb):
             candidates = scheduler._stage_candidates(0, capacity_kb)
 
-        self.assertTrue(candidates)
-        self.assertTrue(all(item.gpu_contract_kb == capacity_kb for item in candidates))
+        assert candidates
+        assert all(item.gpu_contract_kb == capacity_kb for item in candidates)
 
-    def test_known_stage_group_has_only_one_runnable_representative(self):
-        path = self.root / "groups.yaml"
+    def test_known_stage_group_has_only_one_runnable_representative(self, tmp_path):
+        path = tmp_path / "groups.yaml"
         path.write_text(
-            f"device: [0]\nseed: 0\nmarkers: {self.root}\nunused: !choice [1, 2, 3]\n"
+            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\nunused: !choice [1, 2, 3]\n"
         )
-        batch = Batch(Pipeline([SharedWork]), path, output_dir=self.root / "groups")
+        batch = Batch(Pipeline([SharedWork]), path, output_dir=tmp_path / "groups")
         scheduler = GpuScheduler(batch)
 
         candidates = scheduler._stage_candidates(0, 16 * 1024**2)
 
-        self.assertEqual(len(candidates), 1)
+        assert len(candidates) == 1
 
-    def test_stage_group_follows_declared_dependencies(self):
-        path = self.root / "declared.yaml"
+    def test_stage_group_follows_declared_dependencies(self, tmp_path):
+        path = tmp_path / "declared.yaml"
         path.write_text(
-            f"device: [0]\nseed: 0\nmarkers: {self.root}\nitem: !choice [1, 2]\n"
+            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\nitem: !choice [1, 2]\n"
             "crash: false\nfail_once: false\nwait_for_release: false\ndelay: 0\n"
         )
-        batch = Batch(Pipeline([GpuWork]), path, output_dir=self.root / "declared")
+        batch = Batch(Pipeline([GpuWork]), path, output_dir=tmp_path / "declared")
         scheduler = GpuScheduler(batch)
         first, second = (item.run_id for item in batch.experiments)
 
         # GpuWork declares item, so its two values are separate groups.
-        self.assertNotEqual(
-            scheduler._stage_group(first, 0), scheduler._stage_group(second, 0)
-        )
-        self.assertEqual(
-            scheduler._stage_paths(0),
-            {
-                ("markers",),
-                ("item",),
-                ("crash",),
-                ("fail_once",),
-                ("wait_for_release",),
-                ("delay",),
-                ("device",),
-            },
-        )
+        assert scheduler._stage_group(first, 0) != scheduler._stage_group(second, 0)
+        assert {
+            path
+            for item in batch.experiments
+            for path in scheduler._prefix_paths(item.run_id, 0)
+        } == {
+            ("markers",),
+            ("item",),
+            ("crash",),
+            ("fail_once",),
+            ("wait_for_release",),
+            ("delay",),
+            ("device",),
+        }
 
-    def test_undeclared_configuration_does_not_split_stage_groups(self):
-        path = self.root / "undeclared.yaml"
+    def test_undeclared_configuration_does_not_split_stage_groups(self, tmp_path):
+        path = tmp_path / "undeclared.yaml"
         path.write_text(
-            f"device: [0]\nseed: 0\nmarkers: {self.root}\nitem: 0\n"
+            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\nitem: 0\n"
             "crash: false\nfail_once: false\nwait_for_release: false\ndelay: 0\n"
             "unused: !choice [1, 2]\n"
         )
-        batch = Batch(Pipeline([GpuWork]), path, output_dir=self.root / "undeclared")
+        batch = Batch(Pipeline([GpuWork]), path, output_dir=tmp_path / "undeclared")
         scheduler = GpuScheduler(batch)
         first, second = (item.run_id for item in batch.experiments)
 
         # unused is not declared, so the two runs share one reusable group.
-        self.assertEqual(
-            scheduler._stage_group(first, 0), scheduler._stage_group(second, 0)
-        )
+        assert scheduler._stage_group(first, 0) == scheduler._stage_group(second, 0)
 
-    def test_conditional_dependencies_follow_the_config_value(self):
-        path = self.root / "conditional.yaml"
+    def test_conditional_dependencies_follow_the_config_value(self, tmp_path):
+        path = tmp_path / "conditional.yaml"
         path.write_text(
             "device: [0]\nseed: 0\n"
             "Baseline: !choice [B1, B2]\nimputer: i\n"
             "predictor: !choice [p1, p2]\n"
         )
         batch = Batch(
-            Pipeline([ConditionalWork]), path, output_dir=self.root / "conditional"
+            Pipeline([ConditionalWork]), path, output_dir=tmp_path / "conditional"
         )
         scheduler = GpuScheduler(batch)
         groups = {
@@ -385,12 +371,12 @@ class GpuSchedulingTests(unittest.TestCase):
 
         # B1 declares imputer only, so predictor must not split its groups;
         # B2 declares predictor, so its runs stay distinct.
-        self.assertEqual(groups[("B1", "p1")], groups[("B1", "p2")])
-        self.assertNotEqual(groups[("B2", "p1")], groups[("B2", "p2")])
-        self.assertNotEqual(groups[("B1", "p1")], groups[("B2", "p1")])
+        assert groups[("B1", "p1")] == groups[("B1", "p2")]
+        assert groups[("B2", "p1")] != groups[("B2", "p2")]
+        assert groups[("B1", "p1")] != groups[("B2", "p1")]
 
-    def test_tick_greedily_fills_a_card(self):
-        batch = self.warm(self.make_batch(count=4, devices=[0]))
+    def test_tick_greedily_fills_a_card(self, tmp_path):
+        batch = warm(make_batch(tmp_path, count=4, devices=[0]))
         scheduler = GpuScheduler(batch)
         started = []
 
@@ -402,16 +388,16 @@ class GpuSchedulingTests(unittest.TestCase):
         with patch.object(scheduler, "_launch", side_effect=launch):
             scheduler._launch_available(Memory([0]).sample(), Host().sample())
 
-        self.assertEqual(started, [0, 0, 0, 0])
+        assert started == [0, 0, 0, 0]
 
-    def test_tick_plan_combines_memory_and_gpu_stages(self):
-        path = self.root / "two-stage.yaml"
+    def test_tick_plan_combines_memory_and_gpu_stages(self, tmp_path):
+        path = tmp_path / "two-stage.yaml"
         path.write_text(
-            f"device: [0]\nseed: 0\nmarkers: {self.root}\n"
+            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\n"
             "crash: false\nfail_once: false\nwait_for_release: false\ndelay: 0\n"
             "item: !choice [0, 1, 2, 3, 4, 5, 6, 7]\n"
         )
-        batch = Batch(Pipeline([GpuWork, GpuWork]), path, output_dir=self.root / "plan")
+        batch = Batch(Pipeline([GpuWork, GpuWork]), path, output_dir=tmp_path / "plan")
         for experiment in batch.experiments[4:]:
             batch._stage_progress[experiment.run_id] = 1
         scheduler = GpuScheduler(batch)
@@ -427,20 +413,20 @@ class GpuSchedulingTests(unittest.TestCase):
             plan = scheduler._launch_plan(memory, host)
 
         stages = [candidate.stage_index for candidate, _device in plan]
-        self.assertEqual(stages.count(0), 4)
-        self.assertEqual(stages.count(1), 2)
+        assert stages.count(0) == 4
+        assert stages.count(1) == 2
 
-    def test_shared_prefix_is_materialized_without_worker_per_member(self):
+    def test_shared_prefix_is_materialized_without_worker_per_member(self, tmp_path):
         # SharedWork declares no dependencies, so every Batch member shares one
         # reusable group and receives a local cache reference without a worker.
-        output_dir = self.root / "shared-two"
-        path = self.root / "shared.yaml"
+        output_dir = tmp_path / "shared-two"
+        path = tmp_path / "shared.yaml"
         path.write_text("device: [0]\nseed: 0\nunused: !choice [1, 2]\n")
         batch = Batch(Pipeline([SharedWork]), path, output_dir=output_dir)
         seeded = Experiment(
             Pipeline([SharedWork]),
             {"seed": 0, "unused": 0},
-            output_dir=self.root / "seed",
+            output_dir=tmp_path / "seed",
             _cache_root=output_dir / "cache",
         )
         seeded.run_stage(0, attempt=1)
@@ -454,139 +440,136 @@ class GpuSchedulingTests(unittest.TestCase):
 
         with patch.object(GpuScheduler, "_launch", counted):
             results = batch.run(progress=False)
-        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
-        self.assertLessEqual(len(launches), 1)
-        self.assertEqual([item.output for item in results], [expected, expected])
+        assert all(item.status is Status.SUCCEEDED for item in results)
+        assert len(launches) <= 1
+        assert [item.output for item in results] == [expected, expected]
         references = [
             experiment._store.completed_reference((0,))
             for experiment in batch.experiments
         ]
-        self.assertEqual(references[0], references[1])
-        self.assertEqual(
-            batch.experiments[1]._store.completed((0,))["state"]["producer"],
-            expected,
+        assert references[0] == references[1]
+        assert (
+            batch.experiments[1]._store.completed((0,))["state"]["producer"] == expected
         )
 
-    def test_failure_and_unexpected_process_exit_get_one_retry(self):
-        for crash in (False, True):
-            with self.subTest(crash=crash), tempfile.TemporaryDirectory() as temporary:
-                batch = Batch(
-                    Pipeline([GpuWork]),
-                    {
-                        "device": [0],
-                        "seed": 0,
-                        "markers": temporary,
-                        "item": 0,
-                        "wait_for_release": False,
-                        "delay": 0.1,
-                        "crash": crash,
-                        "fail_once": not crash,
-                    },
-                    output_dir=Path(temporary) / "batch",
-                )
-                result = batch.run(progress=False)[0]
-                self.assertEqual(len(result.attempts), 2)
-                self.assertEqual(
-                    result.status, Status.FAILED if crash else Status.SUCCEEDED
-                )
-                self.assertEqual(
-                    result.attempts[0].error_type,
-                    "WorkerExit" if crash else "ValueError",
-                )
+    @pytest.mark.parametrize("crash", [False, True], ids=["fail-once", "crash"])
+    def test_failure_and_unexpected_process_exit_get_one_retry(self, tmp_path, crash):
+        batch = Batch(
+            Pipeline([GpuWork]),
+            {
+                "device": [0],
+                "seed": 0,
+                "markers": str(tmp_path),
+                "item": 0,
+                "wait_for_release": False,
+                "delay": 0.1,
+                "crash": crash,
+                "fail_once": not crash,
+            },
+            output_dir=tmp_path / "batch",
+        )
+        result = batch.run(progress=False)[0]
+        assert len(result.attempts) == 2
+        assert result.status is (Status.FAILED if crash else Status.SUCCEEDED)
+        assert result.attempts[0].error_type == (
+            "WorkerExit" if crash else "ValueError"
+        )
 
-    def test_interrupt_kills_all_without_finally_and_restores_checkpoint(self):
-        batch = self.make_batch(count=2, delay=1)
+    def test_interrupt_kills_all_without_finally_and_restores_checkpoint(
+        self, tmp_path
+    ):
+        batch = make_batch(tmp_path, count=2, delay=1)
         original = Memory.sample
 
         def interrupt(monitor):
-            if list(self.root.glob("*.checkpoint")):
+            if list(tmp_path.glob("*.checkpoint")):
                 raise KeyboardInterrupt
             return original(monitor)
 
         with (
             patch.object(Memory, "sample", interrupt),
-            self.assertRaises(KeyboardInterrupt),
+            pytest.raises(KeyboardInterrupt),
         ):
             batch.run(progress=False)
-        self.assertEqual(len(list(self.root.glob("*.finally"))), 0)
+        assert len(list(tmp_path.glob("*.finally"))) == 0
         started = [
             result
             for result in batch.results
-            if (self.root / f"{result.run_id}.started").exists()
+            if (tmp_path / f"{result.run_id}.started").exists()
         ]
-        self.assertTrue(started)
-        self.assertTrue(all(result.status is Status.CANCELLED for result in started))
+        assert started
+        assert all(result.status is Status.CANCELLED for result in started)
         for result in started:
-            pid = int((self.root / f"{result.run_id}.started").read_text())
-            with self.assertRaises(ProcessLookupError):
+            pid = int((tmp_path / f"{result.run_id}.started").read_text())
+            with pytest.raises(ProcessLookupError):
                 os.kill(pid, 0)
         resumed = Batch.resume(Pipeline([GpuWork]), batch.output_dir)
         results = resumed.run(progress=False)
-        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
+        assert all(item.status is Status.SUCCEEDED for item in results)
         saved = [item.output["saved"] for item in results]
-        self.assertEqual(len(saved), 2)
-        self.assertTrue(all(value in (1, 2) for value in saved))
-        self.assertIn(2, saved)
-        self.assertTrue(all(len(item.attempts) in (1, 2) for item in results))
-        self.assertEqual(max(len(item.attempts) for item in results), 2)
-        self.assertEqual(max(resumed._stage_attempts.values()), 2)
+        assert len(saved) == 2
+        assert all(value in (1, 2) for value in saved)
+        assert 2 in saved
+        assert all(len(item.attempts) in (1, 2) for item in results)
+        assert max(len(item.attempts) for item in results) == 2
+        assert max(resumed._stage_attempts.values()) == 2
 
-    def test_worker_results_are_read_back_instead_of_retained(self):
-        batch = self.make_batch(count=1, devices=[0], delay=0.05)
+    def test_worker_results_are_read_back_instead_of_retained(self, tmp_path):
+        batch = make_batch(tmp_path, count=1, devices=[0], delay=0.05)
         result = batch.run(progress=False)[0]
         attempt = result.attempts[-1]
-        self.assertIsNone(attempt._output)
-        self.assertIsNotNone(attempt.output_source)
-        self.assertEqual(attempt.output["device"], "GPU-test-0")
-        self.assertEqual(result.output["device"], "GPU-test-0")
+        assert attempt.output_source is not None
+        assert attempt.output["device"] == "GPU-test-0"
+        assert result.output["device"] == "GPU-test-0"
 
-    def test_low_vram_ratio_alone_does_not_shed_attempts(self):
-        batch = self.make_batch(count=1, devices=[0], delay=0)
+    def test_low_vram_ratio_alone_does_not_shed_attempts(self, tmp_path):
+        batch = make_batch(tmp_path, count=1, devices=[0], delay=0)
         scheduler = GpuScheduler(batch)
-        memory = {0: DeviceMemory("GPU-test-0", 1000, 5)}
         host = HostMemory(64 * 1024**2, 48 * 1024**2, 0, 0)
-        scheduler._relieve(memory, host)
-        self.assertTrue(scheduler.host_gate.can_launch(host, []))
+        scheduler._relieve(host)
+        assert scheduler.host_gate.can_launch(host)
 
-    def test_host_pressure_does_not_shed_the_only_running_attempt(self):
+    def test_host_pressure_does_not_shed_the_only_running_attempt(self, tmp_path):
         # Shedding distributes a shared host between attempts. With one attempt
         # there is nothing to distribute, and ending it discards work no other
         # attempt is competing with while the worker's cgroup is what bounds
         # the host. A shortage with one worker pauses launches instead.
-        batch = self.make_batch(count=1, devices=[0], delay=0)
+        batch = make_batch(tmp_path, count=1, devices=[0], delay=0)
         scheduler = GpuScheduler(batch)
         short = HostMemory(1000, 5, 0, 0)
         shed = []
         with patch.object(GpuScheduler, "_shed", side_effect=shed.append):
             scheduler.workers["only"] = Mock(started=0.0)
-            scheduler._relieve({}, short)
-            self.assertEqual(shed, [])
-            self.assertFalse(scheduler.host_gate.can_launch(short, []))
+            scheduler._relieve(short)
+            assert shed == []
+            assert not scheduler.host_gate.can_launch(short)
 
             # A second attempt is over-commitment, so the newest one goes.
             scheduler.workers["newer"] = Mock(started=1.0)
-            scheduler._relieve({}, short)
-            self.assertEqual(shed, ["newer"])
+            scheduler._relieve(short)
+            assert shed == ["newer"]
 
             # An unreadable host is the same shortage, not a reason to stop the
             # one attempt that is already running.
             scheduler.workers.pop("newer")
-            scheduler._relieve({}, None)
-            self.assertEqual(shed, ["newer"])
+            scheduler._relieve(None)
+            assert shed == ["newer"]
 
-    def test_cold_start_launches_one_attempt_until_every_stage_has_completed(self):
-        batch = self.make_batch(count=4, devices=[0, 1], delay=0)
+    def test_cold_start_launches_one_attempt_until_every_stage_has_completed(
+        self, tmp_path
+    ):
+        batch = make_batch(tmp_path, count=4, devices=[0, 1], delay=0)
         scheduler = GpuScheduler(batch)
         memory = Memory([0, 1]).sample()
         host = Host().sample()
-        self.assertTrue(scheduler._cold_start())
+        assert scheduler._cold_start()
         launched = []
         with patch.object(
             GpuScheduler, "_launch", side_effect=lambda *a: launched.append(a)
         ):
             scheduler._launch_available(memory, host)
-        self.assertEqual(len(launched), 1)
-        self.assertEqual(launched[0][3].run_id, scheduler._warmup_run())
+        assert len(launched) == 1
+        assert launched[0][3].run_id == scheduler._warmup_run()
 
         # One completed record per Stage is what releases concurrent packing.
         for stage_index in range(len(batch.experiments[0].pipeline.stages)):
@@ -597,27 +580,27 @@ class GpuSchedulingTests(unittest.TestCase):
                     "status": Status.SUCCEEDED.value,
                 }
             )
-        self.assertFalse(scheduler._cold_start())
+        assert not scheduler._cold_start()
         plan = scheduler._launch_plan(memory, host)
-        self.assertGreater(len(plan), 1)
+        assert len(plan) > 1
         launched.clear()
         with patch.object(
             GpuScheduler, "_launch", side_effect=lambda *a: launched.append(a)
         ):
             scheduler._launch_available(memory, host)
-        self.assertEqual(len(launched), len(plan))
+        assert len(launched) == len(plan)
 
-    def test_warmup_walks_one_pipeline_to_its_later_stages(self):
+    def test_warmup_walks_one_pipeline_to_its_later_stages(self, tmp_path):
         # The queue rotates as Stages finish. Following its head would measure
         # every run's first Stage before any run reached a second one, which is
         # why the warm-up run is the one furthest along instead.
-        path = self.root / "warmup-order.yaml"
+        path = tmp_path / "warmup-order.yaml"
         path.write_text(
-            f"device: [0, 1]\nseed: 0\nmarkers: {self.root}\noffset: 10\n"
+            f"device: [0, 1]\nseed: 0\nmarkers: {tmp_path}\noffset: 10\n"
             "item: !choice [1, 2, 3]\n"
         )
         batch = Batch(
-            Pipeline([Prepare, Consume]), path, output_dir=self.root / "warmup-order"
+            Pipeline([Prepare, Consume]), path, output_dir=tmp_path / "warmup-order"
         )
         scheduler = GpuScheduler(batch)
         first = batch._queue[0]
@@ -625,15 +608,15 @@ class GpuSchedulingTests(unittest.TestCase):
         batch._queue.append(first)  # A finished Stage re-queues the run at the tail.
         batch._stage_progress[first] = 1
 
-        self.assertEqual(scheduler._warmup_run(), first)
+        assert scheduler._warmup_run() == first
         plan = scheduler._launch_plan(
             Memory([0, 1]).sample(), Host().sample(), warmup_only=True
         )
-        self.assertEqual([candidate.stage_index for candidate, _ in plan], [1])
-        self.assertEqual([candidate.run_id for candidate, _ in plan], [first])
+        assert [candidate.stage_index for candidate, _ in plan] == [1]
+        assert [candidate.run_id for candidate, _ in plan] == [first]
 
-    def test_cold_start_holds_launches_while_an_attempt_is_alive(self):
-        batch = self.make_batch(count=4, devices=[0, 1], delay=0)
+    def test_cold_start_holds_launches_while_an_attempt_is_alive(self, tmp_path):
+        batch = make_batch(tmp_path, count=4, devices=[0, 1], delay=0)
         scheduler = GpuScheduler(batch)
         scheduler.workers["running"] = Mock(
             started=0.0, peak_kb=0.0, resident_kb=0.0, limit=None
@@ -643,15 +626,15 @@ class GpuSchedulingTests(unittest.TestCase):
             GpuScheduler, "_launch", side_effect=lambda *a: launched.append(a)
         ):
             scheduler._launch_available(Memory([0, 1]).sample(), Host().sample())
-        self.assertEqual(launched, [])
+        assert launched == []
 
-    def test_a_failed_first_attempt_still_measures_its_stage(self):
+    def test_a_failed_first_attempt_still_measures_its_stage(self, tmp_path):
         # A Stage that never fits its ceiling must not run without one forever:
         # a limit-free attempt is retried outside the failure budget, so only the
         # recorded attempt can end the uncapped phase.
-        batch = self.make_batch(count=1, devices=[0], delay=0)
+        batch = make_batch(tmp_path, count=1, devices=[0], delay=0)
         scheduler = GpuScheduler(batch)
-        self.assertTrue(scheduler._cold_start())
+        assert scheduler._cold_start()
         batch._stage_history.append(
             {
                 "run_id": batch.experiments[0].run_id,
@@ -660,51 +643,51 @@ class GpuSchedulingTests(unittest.TestCase):
                 "peak_kb": 0.0,
             }
         )
-        self.assertTrue(scheduler._stage_measured(0))
-        self.assertFalse(scheduler._cold_start())
+        assert scheduler._stage_measured(0)
+        assert not scheduler._cold_start()
 
-    def test_cold_start_leaves_device_memory_uncapped(self):
-        batch = self.make_batch(count=2, devices=[0], delay=0)
+    def test_cold_start_leaves_device_memory_uncapped(self, tmp_path):
+        batch = make_batch(tmp_path, count=2, devices=[0], delay=0)
         ceilings = _captured_gpu_ceilings(batch)
-        self.assertTrue(all(item.status is Status.SUCCEEDED for item in batch.results))
+        assert all(item.status is Status.SUCCEEDED for item in batch.results)
         # The Stage's first attempt ran without a PyTorch allocator ceiling.
-        self.assertIsNone(ceilings[0])
+        assert ceilings[0] is None
 
-    def test_a_measured_stage_is_capped_on_device_memory(self):
-        batch = self.warm(self.make_batch(count=1, devices=[0], delay=0))
+    def test_a_measured_stage_is_capped_on_device_memory(self, tmp_path):
+        batch = warm(make_batch(tmp_path, count=1, devices=[0], delay=0))
         ceilings = _captured_gpu_ceilings(batch)
-        self.assertTrue(all(item.status is Status.SUCCEEDED for item in batch.results))
-        self.assertEqual(len(ceilings), 1)
-        self.assertGreater(float(ceilings[0]), 0)
+        assert all(item.status is Status.SUCCEEDED for item in batch.results)
+        assert len(ceilings) == 1
+        assert float(ceilings[0]) > 0
 
-    def test_every_stage_completing_releases_cold_start_serialisation(self):
-        path = self.root / "warmup.yaml"
+    def test_every_stage_completing_releases_cold_start_serialisation(self, tmp_path):
+        path = tmp_path / "warmup.yaml"
         path.write_text(
-            f"device: [0, 1]\nseed: 0\nmarkers: {self.root}\noffset: 10\n"
+            f"device: [0, 1]\nseed: 0\nmarkers: {tmp_path}\noffset: 10\n"
             "item: !choice [1, 2, 3]\n"
         )
         batch = Batch(
-            Pipeline([Prepare, Consume]), path, output_dir=self.root / "warmup"
+            Pipeline([Prepare, Consume]), path, output_dir=tmp_path / "warmup"
         )
         started = []
-        original = GpuScheduler._launch
+        original_launch = GpuScheduler._launch
 
-        def watched(self, device, memory, host, candidate):
+        def watched(scheduler, device, memory, host, candidate):
             # Sampled at the launch itself: a launch is the only moment that can
             # put a second attempt beside a live one.
-            started.append((len(self.workers), self._cold_start()))
-            return original(self, device, memory, host, candidate)
+            started.append((len(scheduler.workers), scheduler._cold_start()))
+            return original_launch(scheduler, device, memory, host, candidate)
 
         with patch.object(GpuScheduler, "_launch", watched):
             results = batch.run(progress=False)
 
-        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
+        assert all(item.status is Status.SUCCEEDED for item in results)
         # Nothing started beside a live attempt while a Stage was unmeasured.
-        self.assertTrue(all(running == 0 for running, cold in started if cold))
-        self.assertFalse(GpuScheduler(batch)._cold_start())
+        assert all(running == 0 for running, cold in started if cold)
+        assert not GpuScheduler(batch)._cold_start()
 
-    def test_host_memory_shortage_pauses_launches_until_it_recovers(self):
-        batch = self.make_batch(count=1, devices=[0], delay=0.05)
+    def test_host_memory_shortage_pauses_launches_until_it_recovers(self, tmp_path):
+        batch = make_batch(tmp_path, count=1, devices=[0], delay=0.05)
         original = Host.sample
         pressured = []
 
@@ -716,12 +699,16 @@ class GpuSchedulingTests(unittest.TestCase):
 
         with patch.object(Host, "sample", shortage):
             results = batch.run(progress=False)
-        self.assertEqual(pressured, [0] * 5)
-        self.assertEqual(results[0].status, Status.SUCCEEDED)
+        assert pressured == [0] * 5
+        assert results[0].status is Status.SUCCEEDED
 
-    def test_host_memory_pressure_sheds_newest_attempt_and_refills_on_recovery(self):
-        batch = self.warm(
-            self.make_batch(count=2, devices=[0, 1], delay=0, wait_for_release=True)
+    def test_host_memory_pressure_sheds_newest_attempt_and_refills_on_recovery(
+        self, tmp_path
+    ):
+        batch = warm(
+            make_batch(
+                tmp_path, count=2, devices=[0, 1], delay=0, wait_for_release=True
+            )
         )
         dropped = []
         held = []
@@ -733,15 +720,15 @@ class GpuSchedulingTests(unittest.TestCase):
             if (
                 not dropped
                 and len(active) == 2
-                and all((self.root / f"{key}.checkpoint").exists() for key in active)
+                and all((tmp_path / f"{key}.checkpoint").exists() for key in active)
             ):
                 dropped.append(active[-1])
                 cards.extend(batch._active_gpu.values())
                 return HostMemory(1000, 5, 0, 0)
-            if dropped and not (self.root / "release").exists():
+            if dropped and not (tmp_path / "release").exists():
                 held.append(len(batch._active_gpu))
                 if len(held) >= 5:
-                    (self.root / "release").touch()
+                    (tmp_path / "release").touch()
             return original(monitor)
 
         with (
@@ -749,46 +736,46 @@ class GpuSchedulingTests(unittest.TestCase):
             patch.object(Host, "sample", pressure),
         ):
             results = batch.run(progress=False)
-        self.assertTrue(dropped)
+        assert dropped
         # Two workers were active, so the shed worker could otherwise have been
         # replaced immediately; host pressure must hold every refill globally.
-        self.assertEqual(len(cards), 2)
+        assert len(cards) == 2
         # The next healthy reading refills without waiting for the survivor.
-        self.assertGreater(max(held), min(held))
+        assert max(held) > min(held)
         shed = [
             result
             for result in results
             if result.attempts[0].error_type == "MemoryPressure"
         ]
-        self.assertTrue(shed)
+        assert shed
         for result in shed:
-            self.assertEqual(result.attempts[0].status, Status.CANCELLED)
-            self.assertEqual(result.status, Status.SUCCEEDED)
-            self.assertEqual(len(result.attempts), 2)
-        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
+            assert result.attempts[0].status is Status.CANCELLED
+            assert result.status is Status.SUCCEEDED
+            assert len(result.attempts) == 2
+        assert all(item.status is Status.SUCCEEDED for item in results)
 
-    def test_observed_peak_is_recorded_and_changes_later_admission(self):
-        batch = self.make_batch(count=1, devices=[0], delay=0.05)
+    def test_observed_peak_is_recorded_and_changes_later_admission(self, tmp_path):
+        batch = make_batch(tmp_path, count=1, devices=[0], delay=0.05)
         batch.run(progress=False)
         peaks = [item["peak_kb"] for item in batch._gpu_history]
-        self.assertTrue(peaks)
-        self.assertTrue(all(value > 0 for value in peaks))
+        assert peaks
+        assert all(value > 0 for value in peaks)
         scheduler = GpuScheduler(batch)
-        self.assertGreater(scheduler.peak_ceiling, 0)
+        assert scheduler.peaks.ceiling_kb > 0
 
-    def test_failed_host_query_sheds_newest_attempt_and_pauses_launches(self):
-        batch = self.warm(self.make_batch(count=2, devices=[0], delay=0.05))
+    def test_failed_host_query_sheds_newest_attempt_and_pauses_launches(self, tmp_path):
+        batch = warm(make_batch(tmp_path, count=2, devices=[0], delay=0.05))
         original = Host.sample
         original_launch = GpuScheduler._launch
         launches = []
         failures = 0
         failed_tick = False
 
-        def counted(self, device, memory, host, candidate):
+        def counted(scheduler, device, memory, host, candidate):
             if failed_tick:
-                self.fail("a failed query launched work in the same tick")
+                pytest.fail("a failed query launched work in the same tick")
             launches.append(device)
-            return original_launch(self, device, memory, host, candidate)
+            return original_launch(scheduler, device, memory, host, candidate)
 
         def failing(monitor):
             nonlocal failed_tick, failures
@@ -802,53 +789,54 @@ class GpuSchedulingTests(unittest.TestCase):
         with (
             patch.object(Host, "sample", failing),
             patch.object(GpuScheduler, "_launch", counted),
-            self.assertWarns(RuntimeWarning),
+            pytest.warns(RuntimeWarning),
         ):
             results = batch.run(progress=False)
-        self.assertEqual(failures, 2)
+        assert failures == 2
         shed = [
             attempt
             for result in results
             for attempt in result.attempts
             if attempt.error_type == "MemoryPressure"
         ]
-        self.assertGreaterEqual(len(shed), 1)
-        self.assertLessEqual(len(shed), 2)
-        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
+        assert 1 <= len(shed) <= 2
+        assert all(item.status is Status.SUCCEEDED for item in results)
 
-    def test_failed_memory_query_pauses_launches_without_stopping_the_batch(self):
-        batch = self.make_batch(count=2, devices=[0, 1], delay=0.05)
+    def test_failed_memory_query_pauses_launches_without_stopping_the_batch(
+        self, tmp_path
+    ):
+        batch = make_batch(tmp_path, count=2, devices=[0, 1], delay=0.05)
         original = Memory.sample
         original_launch = GpuScheduler._launch
         launches = []
         failures = 0
 
-        def counted(self, device, memory, host, candidate):
+        def counted(scheduler, device, memory, host, candidate):
             launches.append(device)
-            return original_launch(self, device, memory, host, candidate)
+            return original_launch(scheduler, device, memory, host, candidate)
 
         def failing(monitor):
             nonlocal failures
             if failures < 3:
                 failures += 1
-                self.assertEqual(launches, [])
+                assert launches == []
                 raise MemoryObservationError("nvidia-smi unavailable")
             return original(monitor)
 
         with (
             patch.object(Memory, "sample", failing),
             patch.object(GpuScheduler, "_launch", counted),
-            self.assertWarns(RuntimeWarning),
+            pytest.warns(RuntimeWarning),
         ):
             results = batch.run(progress=False)
-        self.assertEqual(failures, 3)
-        self.assertTrue(launches)
-        self.assertTrue(all(item.status is Status.SUCCEEDED for item in results))
-        self.assertTrue(all(len(item.attempts) == 1 for item in results))
-        self.assertFalse(batch._active_gpu)
+        assert failures == 3
+        assert launches
+        assert all(item.status is Status.SUCCEEDED for item in results)
+        assert all(len(item.attempts) == 1 for item in results)
+        assert not batch._active_gpu
 
-    def test_memory_is_rechecked_on_every_tick(self):
-        batch = self.make_batch(count=1, devices=[0], delay=0.3)
+    def test_memory_is_rechecked_on_every_tick(self, tmp_path):
+        batch = make_batch(tmp_path, count=1, devices=[0], delay=0.3)
         original = Memory.sample
         stamps = []
 
@@ -859,66 +847,67 @@ class GpuSchedulingTests(unittest.TestCase):
         with patch.object(Memory, "sample", recorded):
             batch.run(progress=False)
         gaps = [later - earlier for earlier, later in pairwise(stamps)]
-        self.assertGreaterEqual(len(stamps), 10)
-        self.assertLess(max(gaps), 0.1)
+        assert len(stamps) >= 10
+        assert max(gaps) < 0.1
 
 
-class DeviceTests(unittest.TestCase):
-    def test_device_and_seed_are_required_before_creating_output(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            with self.assertRaisesRegex(ConfigError, "device is required"):
-                Batch(Pipeline([]), {"seed": 0}, output_dir=root / "no-device")
-            with self.assertRaisesRegex(ValueError, "seed is required"):
-                Batch(Pipeline([]), {"device": [0]}, output_dir=root / "no-seed")
-            with self.assertRaisesRegex(ValueError, "seed is required"):
-                Experiment(Pipeline([]), {}, output_dir=root / "experiment-no-seed")
-            with self.assertRaisesRegex(ConfigError, "nonempty"):
-                Batch(
-                    Pipeline([]),
-                    {"device": [], "seed": 0},
-                    output_dir=root / "empty-device",
-                )
-            self.assertFalse((root / "no-device").exists())
-            self.assertFalse((root / "no-seed").exists())
-            self.assertFalse((root / "experiment-no-seed").exists())
-            self.assertFalse((root / "empty-device").exists())
+class TestDevice:
+    def test_device_and_seed_are_required_before_creating_output(self, tmp_path):
+        root = tmp_path
+        with pytest.raises(ConfigError, match="device is required"):
+            Batch(Pipeline([]), {"seed": 0}, output_dir=root / "no-device")
+        with pytest.raises(ValueError, match="seed is required"):
+            Batch(Pipeline([]), {"device": [0]}, output_dir=root / "no-seed")
+        with pytest.raises(ValueError, match="seed is required"):
+            Experiment(Pipeline([]), {}, output_dir=root / "experiment-no-seed")
+        with pytest.raises(ConfigError, match="nonempty"):
+            Batch(
+                Pipeline([]),
+                {"device": [], "seed": 0},
+                output_dir=root / "empty-device",
+            )
+        assert not (root / "no-device").exists()
+        assert not (root / "no-seed").exists()
+        assert not (root / "experiment-no-seed").exists()
+        assert not (root / "empty-device").exists()
 
-    def test_device_is_a_batch_wide_plain_list(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            for value in (None, 0, [True], [-1], [0, 0], ["0"]):
-                with self.subTest(value=value), self.assertRaises(ConfigError):
-                    Batch(
-                        Pipeline([]),
-                        {"device": value, "seed": 0},
-                        output_dir=root / "unused",
-                    )
-            cfg = root / "experiment.yaml"
-            cfg.write_text("device: !choice [[0], [1]]\nseed: 0\n")
-            with self.assertRaises(ConfigError):
-                Batch(Pipeline([]), cfg, output_dir=root / "unused")
-            cfg.write_text("device: [0, 1]\nseed: 0\nx: !choice [1, 2]\n")
-            batch = Batch(Pipeline([]), cfg, output_dir=root / "batch")
-            self.assertEqual(len(batch.experiments), 2)
-            self.assertEqual(batch.devices, (0, 1))
+    @pytest.mark.parametrize("value", [None, 0, [True], [-1], [0, 0], ["0"]])
+    def test_invalid_device_values_are_rejected(self, tmp_path, value):
+        with pytest.raises(ConfigError):
+            Batch(
+                Pipeline([]),
+                {"device": value, "seed": 0},
+                output_dir=tmp_path / "unused",
+            )
+
+    def test_device_cannot_be_a_choice(self, tmp_path):
+        cfg = tmp_path / "experiment.yaml"
+        cfg.write_text("device: !choice [[0], [1]]\nseed: 0\n")
+        with pytest.raises(ConfigError):
+            Batch(Pipeline([]), cfg, output_dir=tmp_path / "unused")
+
+    def test_device_is_a_batch_wide_plain_list(self, tmp_path):
+        cfg = tmp_path / "experiment.yaml"
+        cfg.write_text("device: [0, 1]\nseed: 0\nx: !choice [1, 2]\n")
+        batch = Batch(Pipeline([]), cfg, output_dir=tmp_path / "batch")
+        assert len(batch.experiments) == 2
+        assert batch.devices == (0, 1)
 
     def test_host_gate_uses_only_the_current_observation(self):
         gate = HostGate()
         roomy = HostMemory(64 * 1024**2, 48 * 1024**2, 0, 0)
-        self.assertTrue(gate.can_launch(roomy, ["a"]))
-        self.assertTrue(gate.can_launch(roomy, []))
-        self.assertFalse(gate.can_launch(None, []))
+        assert gate.can_launch(roomy)
+        assert not gate.can_launch(None)
 
     def test_host_gate_refuses_room_below_the_byte_reserve(self):
         # The default reserve is 1 GiB, so the host gate refuses a reading below
         # it and admits a positive amount above it.
         gate = HostGate()
         nearly_full = HostMemory(HOST_RESERVE_KB, HOST_RESERVE_KB - 1, 0, 0)
-        self.assertGreater(nearly_full.available_ratio, 0.9)
-        self.assertFalse(gate.can_launch(nearly_full, []))
+        assert nearly_full.available_ratio > 0.9
+        assert not gate.can_launch(nearly_full)
         roomy = HostMemory(64 * 1024**2, HOST_RESERVE_KB + 1, 0, 0)
-        self.assertTrue(gate.can_launch(roomy, []))
+        assert gate.can_launch(roomy)
 
     def test_swap_occupancy_does_not_gate_launches(self):
         # Swapped pages stay out until something touches them, so a host that
@@ -927,19 +916,19 @@ class DeviceTests(unittest.TestCase):
         gate = HostGate()
         large = 64 * 1024**2
         half_swapped = HostMemory(large, large // 2, 4096, 2048)
-        self.assertTrue(gate.can_launch(half_swapped, []))
+        assert gate.can_launch(half_swapped)
         # Swap fully occupied, memory perfectly available: still a launch.
-        self.assertTrue(gate.can_launch(HostMemory(large, large // 2, 4096, 0), []))
+        assert gate.can_launch(HostMemory(large, large // 2, 4096, 0))
         short = HostMemory(large, HOST_RESERVE_KB - 1, 4096, 0)
-        self.assertFalse(gate.can_launch(short, []))
+        assert not gate.can_launch(short)
 
     def test_fits_reserve_needs_headroom_above_the_reserve(self):
         available = HOST_RESERVE_KB + 2 * 1024**2
         roomy = HostMemory(64 * 1024**2, available, 0, 0)
-        self.assertTrue(fits_reserve(roomy, 2 * 1024**2))
-        self.assertFalse(fits_reserve(roomy, 2 * 1024**2 + 1))
-        self.assertFalse(fits_reserve(HostMemory(64 * 1024**2, 0, 0, 0), 1))
-        self.assertFalse(fits_reserve(None, 1))
+        assert fits_reserve(roomy, 2 * 1024**2)
+        assert not fits_reserve(roomy, 2 * 1024**2 + 1)
+        assert not fits_reserve(HostMemory(64 * 1024**2, 0, 0, 0), 1)
+        assert not fits_reserve(None, 1)
 
     def test_query_timeout_is_an_observation_error_with_the_default_timeout(self):
         with (
@@ -947,25 +936,24 @@ class DeviceTests(unittest.TestCase):
                 "expman.devices.subprocess.run",
                 side_effect=subprocess.TimeoutExpired("nvidia-smi", 3),
             ) as query,
-            self.assertRaises(MemoryObservationError),
+            pytest.raises(MemoryObservationError),
         ):
             NvidiaMemory((0,)).sample()
-        self.assertEqual(query.call_args.kwargs["timeout"], 3.0)
+        assert query.call_args.kwargs["timeout"] == 3.0
 
-    def test_nvidia_smi_is_found_outside_path(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            fallback = Path(temporary) / "nvidia-smi"
-            fallback.write_text("#!/bin/sh\n")
-            with (
-                patch("expman.devices.shutil.which", return_value=None),
-                patch("expman.devices.NVIDIA_SMI_FALLBACKS", (fallback,)),
-                patch("expman.devices.subprocess.run") as query,
-            ):
-                query.return_value.stdout = "0, GPU-first, 100, 10\n"
-                NvidiaMemory((0,)).sample()
-            self.assertEqual(query.call_args.args[0][0], str(fallback))
+    def test_nvidia_smi_is_found_outside_path(self, tmp_path):
+        fallback = tmp_path / "nvidia-smi"
+        fallback.write_text("#!/bin/sh\n")
+        with (
+            patch("expman.devices.shutil.which", return_value=None),
+            patch("expman.devices.NVIDIA_SMI_FALLBACKS", (fallback,)),
+            patch("expman.devices.subprocess.run") as query,
+        ):
+            query.return_value.stdout = "0, GPU-first, 100, 10\n"
+            NvidiaMemory((0,)).sample()
+        assert query.call_args.args[0][0] == str(fallback)
         with patch("expman.devices.shutil.which", return_value="/usr/bin/nvidia-smi"):
-            self.assertEqual(nvidia_smi(), "/usr/bin/nvidia-smi")
+            assert nvidia_smi() == "/usr/bin/nvidia-smi"
 
     def test_nvidia_memory_validates_observations_and_identities(self):
         with patch("expman.devices.subprocess.run") as query:
@@ -973,83 +961,78 @@ class DeviceTests(unittest.TestCase):
                 "0, GPU-first, 100, 10\n1, GPU-second, 200, 150\n"
             )
             monitor = NvidiaMemory((0, 1))
-            self.assertEqual(monitor.sample()[0].free_ratio, 0.1)
-            self.assertIn("--id=0,1", query.call_args.args[0])
+            assert monitor.sample()[0].free_ratio == 0.1
+            assert "--id=0,1" in query.call_args.args[0]
             query.return_value.stdout = (
                 "0, GPU-replaced, 100, 10\n1, GPU-second, 200, 150\n"
             )
-            with self.assertRaisesRegex(RuntimeError, "identities changed"):
+            with pytest.raises(RuntimeError, match="identities changed"):
                 monitor.sample()
             query.return_value.stdout = "0, GPU-first, N/A, N/A\n"
-            with self.assertRaises(RuntimeError):
+            with pytest.raises(RuntimeError):
                 NvidiaMemory((0,)).sample()
 
-    def test_host_memory_reads_meminfo_and_rejects_invalid_values(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "meminfo"
-            path.write_text(
-                "MemTotal:       1000 kB\n"
-                "MemFree:         100 kB\n"
-                "MemAvailable:    250 kB\n"
-                "SwapTotal:       400 kB\n"
-                "SwapFree:        300 kB\n"
-            )
-            observation = MeminfoMonitor(path).sample()
-            self.assertEqual(observation.available_ratio, 0.25)
-            self.assertEqual(observation.swap_total_kb, 400.0)
-            self.assertEqual(observation.swap_free_kb, 300.0)
-            path.write_text("MemTotal: 1000 kB\nMemAvailable: 2000 kB\n")
-            with self.assertRaisesRegex(MemoryObservationError, "invalid host memory"):
-                MeminfoMonitor(path).sample()
-            path.write_text("MemTotal: 1000 kB\nMemAvailable: N/A\n")
-            with self.assertRaisesRegex(
-                MemoryObservationError, "could not observe host memory"
-            ):
-                MeminfoMonitor(path).sample()
-            path.write_text("MemFree: 100 kB\n")
-            with self.assertRaisesRegex(
-                MemoryObservationError, "could not observe host memory"
-            ):
-                MeminfoMonitor(path).sample()
+    def test_host_memory_reads_meminfo_and_rejects_invalid_values(self, tmp_path):
+        path = tmp_path / "meminfo"
+        path.write_text(
+            "MemTotal:       1000 kB\n"
+            "MemFree:         100 kB\n"
+            "MemAvailable:    250 kB\n"
+            "SwapTotal:       400 kB\n"
+            "SwapFree:        300 kB\n"
+        )
+        observation = MeminfoMonitor(path).sample()
+        assert observation.available_ratio == 0.25
+        assert observation.swap_total_kb == 400.0
+        assert observation.swap_free_kb == 300.0
+        path.write_text("MemTotal: 1000 kB\nMemAvailable: 2000 kB\n")
+        with pytest.raises(MemoryObservationError, match="invalid host memory"):
+            MeminfoMonitor(path).sample()
+        path.write_text("MemTotal: 1000 kB\nMemAvailable: N/A\n")
+        with pytest.raises(
+            MemoryObservationError, match="could not observe host memory"
+        ):
+            MeminfoMonitor(path).sample()
+        path.write_text("MemFree: 100 kB\n")
+        with pytest.raises(
+            MemoryObservationError, match="could not observe host memory"
+        ):
+            MeminfoMonitor(path).sample()
 
-    def test_host_memory_reports_availability_and_swap_occupancy(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            meminfo = Path(temporary) / "meminfo"
-            meminfo.write_text(
-                "MemTotal:       16777216 kB\n"
-                "MemAvailable:    8388608 kB\n"
-                "SwapTotal:       4194304 kB\n"
-                "SwapFree:        2097152 kB\n"
-            )
-            monitor = MeminfoMonitor(meminfo)
-            observation = monitor.sample()
-            self.assertEqual(observation.swap_free_kb, 2097152.0)
-            self.assertEqual(observation.headroom_kb, 8388608.0 - HOST_RESERVE_KB)
-            self.assertFalse(observation.tight)
-            # Half the swap stays occupied, and it changes nothing: the occupied
-            # pages are not memory anything can be asked to give back.
-            self.assertEqual(monitor.sample().swap_free_kb, 2097152.0)
-            self.assertFalse(monitor.sample().tight)
+    def test_host_memory_reports_availability_and_swap_occupancy(self, tmp_path):
+        meminfo = tmp_path / "meminfo"
+        meminfo.write_text(
+            "MemTotal:       16777216 kB\n"
+            "MemAvailable:    8388608 kB\n"
+            "SwapTotal:       4194304 kB\n"
+            "SwapFree:        2097152 kB\n"
+        )
+        monitor = MeminfoMonitor(meminfo)
+        observation = monitor.sample()
+        assert observation.swap_free_kb == 2097152.0
+        assert observation.headroom_kb == 8388608.0 - HOST_RESERVE_KB
+        assert not observation.tight
+        # Half the swap stays occupied, and it changes nothing: the occupied
+        # pages are not memory anything can be asked to give back.
+        assert monitor.sample().swap_free_kb == 2097152.0
+        assert not monitor.sample().tight
 
-    def test_host_memory_reports_a_shortage_from_availability_alone(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            meminfo = Path(temporary) / "meminfo"
-            meminfo.write_text(
-                "MemTotal:       16777216 kB\n"
-                "MemAvailable:       1024 kB\n"
-                "SwapTotal:       4194304 kB\n"
-                "SwapFree:        2097152 kB\n"
-            )
-            observation = MeminfoMonitor(meminfo).sample()
-            self.assertTrue(observation.tight)
-            self.assertFalse(HostGate().can_launch(observation, []))
+    def test_host_memory_reports_a_shortage_from_availability_alone(self, tmp_path):
+        meminfo = tmp_path / "meminfo"
+        meminfo.write_text(
+            "MemTotal:       16777216 kB\n"
+            "MemAvailable:       1024 kB\n"
+            "SwapTotal:       4194304 kB\n"
+            "SwapFree:        2097152 kB\n"
+        )
+        observation = MeminfoMonitor(meminfo).sample()
+        assert observation.tight
+        assert not HostGate().can_launch(observation)
 
-    @unittest.skipUnless(Path("/proc/meminfo").exists(), "host meminfo is unavailable")
+    @pytest.mark.skipif(
+        not Path("/proc/meminfo").exists(), reason="host meminfo is unavailable"
+    )
     def test_default_host_monitor_reads_the_running_host(self):
         observation = MeminfoMonitor().sample()
-        self.assertGreater(observation.total_kb, 0)
-        self.assertTrue(0 <= observation.available_ratio <= 1)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert observation.total_kb > 0
+        assert 0 <= observation.available_ratio <= 1

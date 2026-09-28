@@ -9,12 +9,11 @@
 - **每次提交前必须通过 `ruff check .` 和 `ruff format --check .`，包括仅修改文档的提交。** 修复后重新检查，暂存确认过的改动，再提交。
 - 合并前检查变更、运行测试和示例，确认工作区没有实验数据、密钥、构建产物或本地环境文件。
 
-项目使用 uv 管理唯一的锁定环境，其中只有运行依赖（NumPy、PyTorch、PyYAML）。Ruff 和 pre-commit 是开发工具，单独安装，不进入包依赖，也不设 dev extra：
+项目使用 uv 管理唯一的锁定环境，其中只有运行依赖（NumPy、PyTorch、PyYAML）。pytest、Pyright 和 pre-commit 位于 `pyproject.toml` 的 dev 依赖组（不进入包依赖），`uv sync` 一并安装；Ruff 仍是独立工具，由 pre-commit 的 `additional_dependencies` 和 CI 的 `uv run --with ruff==...` 各自固定版本：
 
 ```bash
 uv sync
-python -m pip install pre-commit ruff
-pre-commit install --install-hooks
+uv run pre-commit install --install-hooks
 ```
 
 每次新克隆仓库或重建环境后，都需要重新安装 hook。
@@ -24,7 +23,7 @@ pre-commit install --install-hooks
 ```bash
 ruff check .
 ruff format --check .
-uv run python -m unittest discover -s tests -v
+uv run pytest -v
 uv run python examples/basic_pipeline.py
 git diff --check
 git status --short
@@ -32,11 +31,19 @@ git status --short
 
 需要自动修复时，执行 `ruff check --fix .` 和 `ruff format .`，然后检查差异并重新运行上述检查。
 
-`.pre-commit-config.yaml` 为每次提交运行全项目 Ruff lint 和格式检查，任一失败都会阻止提交。hook 只检查，不自动修改或暂存文件；pre-commit 会临时隐藏已跟踪文件的未暂存改动，以检查本次提交对应的内容。不要使用 `--no-verify` 或 `SKIP` 绕过检查。
+类型检查由 Pyright 负责，配置在 `pyproject.toml` 的 `[tool.pyright]`：
+
+```bash
+uv run pyright
+```
+
+`pyright[nodejs]` 让 Node 运行时作为 `nodejs-wheel-binaries` 从 PyPI 安装，不需要单独装 Node，也不访问 nodejs.org。
+
+`.pre-commit-config.yaml` 为每次提交运行全项目 Ruff lint、格式检查、Pyright 类型检查和 pytest 测试套件，任一失败都会阻止提交。hook 只检查，不自动修改或暂存文件；pre-commit 会临时隐藏已跟踪文件的未暂存改动，以检查本次提交对应的内容。不要使用 `--no-verify` 或 `SKIP` 绕过检查。
 
 Ruff 版本固定在两处：`.pre-commit-config.yaml` 的 `additional_dependencies`（本地 hook）和 `.github/workflows/ci.yml`（CI）。升级时一起改。
 
-项目附带 GitHub Actions 配置，在推送或创建 PR 后执行 Ruff 检查，以及 Python 3.10–3.14 的安装、测试和示例检查。远端分支保护需要在托管平台另行配置。
+项目附带 GitHub Actions 配置，在推送或创建 PR 后执行 Ruff 检查、Pyright 类型检查，以及 Python 3.12–3.14 的安装、pytest 测试和示例检查。远端分支保护需要在托管平台另行配置。
 
 ## 版本
 
@@ -69,7 +76,7 @@ Ruff 版本固定在两处：`.pre-commit-config.yaml` 的 `additional_dependenc
 uv run python scripts/test_full.py
 ```
 
-该入口执行全部测试，并将任何 skip 视为验证未完成（非零退出码）。缺少依赖、GPU 不可访问或显存不足时，修复环境后重跑；不要删除测试或取消跳过条件来获得通过。普通 unittest 命令仍可用于最小依赖环境的兼容性测试，其结果不能替代完整后端验证。
+该入口执行全部测试，并将任何 skip 视为验证未完成（非零退出码）。缺少依赖、GPU 不可访问或显存不足时，修复环境后重跑；不要删除测试或取消跳过条件来获得通过。普通 pytest 命令仍可用于最小依赖环境的兼容性测试，其结果不能替代完整后端验证。
 
 当前开发机运行时也保持项目源码优先：
 

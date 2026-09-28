@@ -2,7 +2,7 @@
 
 用可组合的 `Pipeline` 和 `Stage` 组织实验流程，并统一记录阶段耗时、执行状态、指标和进度。
 
-开发版本：**0.1.0**（尚未发布）。Python ≥ 3.10；执行核心使用标准库，YAML 配置加载使用 PyYAML。
+开发版本：**0.1.0**（尚未发布）。Python ≥ 3.12；执行核心使用标准库，YAML 配置加载使用 PyYAML。
 
 ## 执行模型
 
@@ -241,7 +241,8 @@ results = batch.run()
 
 ```bash
 uv sync
-uv run python -m unittest discover -s tests -v
+uv run pytest -v
+uv run pyright
 
 # Ruff 和 pre-commit 是开发工具，不在包的依赖里；按需装到环境外或临时加入：
 python -m pip install pre-commit ruff
@@ -250,7 +251,7 @@ ruff check .
 ruff format --check .
 ```
 
-每次 Git 提交前必须通过 Ruff lint 和格式检查，提交 hook 会自动执行这两项检查。
+每次 Git 提交前必须通过 Ruff lint、格式检查、Pyright 类型检查和 pytest 测试套件，提交 hook 会自动执行这四项检查。
 
 源码布局、接口契约和扩展方向见 [架构设计](DESIGN.md)；分支、提交和版本发布约定见 [贡献指南](CONTRIBUTING.md)；版本变更见 [CHANGELOG](CHANGELOG.md)。
 
@@ -316,7 +317,7 @@ python examples/estimate_time.py
 
 新 Stage 候选优先处理重试，之后选择与同 Stage 已采样参数距离较远的组合。联合装箱以主机内存和各卡显存利用情况为主要评分，异质性用于资源效果接近时的排序。返回结果仍按 YAML 展开顺序排列。
 
-`Batch.resume()` 从持久化 Stage 历史重建估计，并保留覆盖设置。`TimeEstimate` 提供秒数上下界、样本数、剩余 Stage 组数及覆盖设置；`calibrated=False` 表示预测尚未经过实际工作负载校准。外部 GPU 竞争和未来失败次数会影响准确度。
+`Batch.resume()` 从持久化 Stage 历史重建估计，并保留覆盖设置。`TimeEstimate` 提供秒数上下界、样本数、剩余 Stage 组数及覆盖设置。外部 GPU 竞争和未来失败次数会影响准确度。
 
 `device` 是整个 Batch 必填的设备列表，不展开为实验组合，也不允许使用 `!choice` 或空列表。框架不改写用户的模型构建逻辑。`ctx.cfg` 保留完整的原始设备列表。每个顶层 Stage 都在独立解释器中运行，并分配一张可见的 GPU，业务代码可统一使用 `cuda:0`；不使用 CUDA 的 Stage 不会因此产生显存占用。绑定通过启动环境中的 GPU UUID 设置，在导入用户 Stage 模块前生效。
 
@@ -336,7 +337,7 @@ Batch 清单只由主进程更新。指标仍同步写入同一个 SQLite 数据
 
 GPU 执行目前支持 Linux/WSL，需要可查询选定设备显存的 NVIDIA 驱动、`nvidia-smi` 和可读的 `/proc/meminfo`；`nvidia-smi` 先从 `PATH` 查找，找不到时回退到 WSL2 的 `/usr/lib/wsl/lib/nvidia-smi`（WSL2 默认不把它加入 `PATH`）。任一路径查询失败都按资源紧张处理，暂停派发并减载，不会中断本批次。Stage 应定义为可导入模块或入口脚本的顶层类，入口使用 `if __name__ == "__main__":`；Pipeline 和自定义 Serializer 需要可通过标准 pickle 传入新解释器。子进程 stdin 用于检测主进程退出，不支持交互式输入。保存器的对象/设备恢复语义保持原约定；建议把需要在主进程汇总的结果转换为 CPU 对象，避免反序列化结果时在主进程占用 GPU。
 
-并发 ETA 使用真实实验耗时，并增加运行设备和同卡并发观测；联合抽样后模拟各卡当前并发槽位的完成时间，取整批最晚完成时间的区间。它是以当前并发规模为条件的预测，不用总时间除以 GPU 数，也不承诺进程公平分享算力。主机内存低于门槛时，空闲卡不再获得预测槽位，显示的是不再扩大并发的剩余时间；没有实验在运行且主机内存不足时剩余时间未知。未来显存变化引起的启停、外部竞争及硬件差异仍会影响准确度，`calibrated=False`；没有成功样本或无可用卡且无运行实验时显示问号。设备和并发历史保存在 Batch 清单中以供恢复。
+并发 ETA 使用真实实验耗时，并增加运行设备和同卡并发观测；联合抽样后模拟各卡当前并发槽位的完成时间，取整批最晚完成时间的区间。它是以当前并发规模为条件的预测，不用总时间除以 GPU 数，也不承诺进程公平分享算力。主机内存低于门槛时，空闲卡不再获得预测槽位，显示的是不再扩大并发的剩余时间；没有实验在运行且主机内存不足时剩余时间未知。未来显存变化引起的启停、外部竞争及硬件差异仍会影响准确度；没有成功样本或无可用卡且无运行实验时显示问号。设备和并发历史保存在 Batch 清单中以供恢复。
 
 示例包含 checkpoint 和数值指标；默认 YAML 使用 CPU，可将 `device` 改成实际 GPU 列表再运行：
 

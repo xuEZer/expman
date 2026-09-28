@@ -194,10 +194,7 @@ def refused(counts: dict[str, float]) -> bool:
     reports a peak that came close to its own limit (see ``near_cap``), which
     catches a kill path before the parent can receive a final IPC report.
     """
-    return any(
-        counts.get(key, 0.0) > 0
-        for key in ("high", "max", "oom", "oom_kill", "oom_group_kill")
-    )
+    return any(counts.get(key, 0.0) > 0 for key in EVENT_KEYS)
 
 
 def near_cap(peak_kb: float, limit_kb: float) -> bool:

@@ -5,10 +5,14 @@ from dataclasses import dataclass
 from numbers import Real
 
 
-def validate_coverage(value: float) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real) or not 0 < value < 1:
+def validate_coverage(value: object) -> float:
+    """A coverage setting is a finite number strictly between 0 and 1."""
+    if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError("estimate coverage must be a finite number between 0 and 1")
-    return float(value)
+    coverage = float(value)
+    if not 0 < coverage < 1:
+        raise ValueError("estimate coverage must be a finite number between 0 and 1")
+    return coverage
 
 
 def _clock(seconds: float | None, *, upper: bool) -> str:
@@ -29,7 +33,6 @@ class TimeEstimate:
     coverage: float
     completed_samples: int
     remaining_experiments: int
-    calibrated: bool = False
 
     def __str__(self) -> str:
         return _clock(self.upper_seconds, upper=True)
