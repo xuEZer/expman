@@ -11,23 +11,22 @@ class LoadValues(Stage):
         return {"values": True}
 
     def process(self, data, ctx):
-        ctx.state["total"] = 0
         return list(ctx.cfg["values"])
 
 
 class Accumulate(Stage):
     @classmethod
     def config_dependencies(cls, cfg):
-        return {"interrupt_once": True}
+        return {"interrupt_once": True, "max_iter": True}
 
-    def process(self, data, ctx):
-        for index in range(ctx.state.get("next", 0), len(data)):
-            ctx.state["total"] += data[index]
-            ctx.state["next"] = index + 1
-            ctx.checkpoint.save(step=index + 1)
-            if ctx.cfg["interrupt_once"] and ctx.attempt == 1:
-                raise KeyboardInterrupt()
-        return ctx.state["total"]
+    def init(self, ctx):
+        self.total = 0
+
+    def loop(self, data, ctx, index, max_iter=Stage.cfg("max_iter")):
+        self.total += data[index]
+        if ctx.cfg["interrupt_once"] and ctx.attempt == 1 and index == 1:
+            raise KeyboardInterrupt()
+        return self.total
 
 
 def main() -> None:
@@ -45,6 +44,7 @@ def main() -> None:
                 "device": [0],
                 "seed": 0,
                 "values": [1, 2, 3],
+                "max_iter": 3,
                 "interrupt_once": args.interrupt_once,
             },
         )

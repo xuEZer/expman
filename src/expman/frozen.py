@@ -96,5 +96,5 @@ def freeze(value: Any) -> Any:
     ):
         return value
     raise TypeError(
-        f"mutable configuration object {type(value).__name__}; put runtime objects in ctx.state"
+        f"mutable configuration object {type(value).__name__}; declare runtime objects as Stage state variables in init"
     )

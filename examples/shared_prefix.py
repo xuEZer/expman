@@ -13,8 +13,7 @@ class Prepare(Stage):
 
     def process(self, data, ctx):
         print("Preparing data once")
-        ctx.state["size"] = ctx.cfg["size"]
-        return list(range(ctx.state["size"]))
+        return list(range(ctx.cfg["size"]))
 
 
 class Predict(Stage):

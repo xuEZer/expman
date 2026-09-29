@@ -181,9 +181,9 @@ for result in results:
         print(attempt.attempt, attempt.status.value, attempt.error_message)
 ```
 
-- 首次执行初始数据为 `None`。由 Batch 执行时，每个阶段自动保存返回值和 `ctx.state`；重试跳过已完成阶段，恢复其输出和状态。
+- 首次执行初始数据为 `None`。由 Batch 执行时，每个阶段自动保存返回值和 `init()` 中声明的状态量；重试跳过已完成阶段，恢复其输出和状态。
 - 任意普通异常（包括阶段构造异常）会记录失败并放到队尾，默认额外重试一次。设置 `max_retries=0` 可关闭重试。
-- 重试保留 `run_id`，`ctx.attempt` 从 1 递增。`ctx.cfg` 深层只读，运行过程中变化的数据放在可变字典 `ctx.state`。
+- 重试保留 `run_id`，`ctx.attempt` 从 1 递增。`ctx.cfg` 深层只读，随迭代变化的数据定义为 `init()` 中的状态量。
 - `KeyboardInterrupt`、`SystemExit` 等中断会停止 Batch 并继续抛出。调用方捕获后可读取 `batch.results`：已执行实验保留结果，未执行实验状态为 `pending`。
 - 新 Stage 按参数异质性和资源装箱选择启动顺序；返回结果按配置顺序排列，每个结果保留全部尝试的状态、耗时和错误摘要；`output` 是最终成功尝试的返回值。事件可通过 `batch.recorder` 获取，支持传入自定义 Recorder。
 - 尝试输出不常驻内存：Batch 只保留状态、耗时、错误摘要和输出的存放位置，`result.output` 每次访问都从最终阶段快照读取，因此内存占用不随已完成实验数增长，中断后 `batch.results` 仍可读取全部输出。每次访问返回的是重新读到的副本，修改它不会写回记录；需要反复使用同一份数据时请自行保存引用。
@@ -195,31 +195,33 @@ for result in results:
 
 ## 阶段快照与 checkpoint
 
-Stage ID 是 Pipeline 中从 0 开始的位置，通过 `ctx.stage_id` 读取。返回值和 `ctx.state` 一起原子保存，保存成功才标记阶段完成；不可序列化的返回值或 state 会使该阶段失败并进入重试流程。
+Stage ID 是 Pipeline 中从 0 开始的位置，通过 `ctx.stage_id` 读取。返回值和状态量一起原子保存，保存成功才标记阶段完成；不可序列化的返回值或状态量会使该阶段失败并进入重试流程。
 
-阶段内部可随时保存当前 state；进入 `process()` 前会自动恢复最近可用的 checkpoint：
+### 状态量与循环
+
+定义了 `loop()` 的 Stage 由框架构建执行，用户不再定义 `process()`（两者互斥，同时定义在类定义时直接报错）：`init()` 声明状态量，框架驱动可恢复迭代并在每轮返回后自动存档，最后一次 `loop()` 调用的返回值就是 Stage 输出。
 
 ```python
 class Train(Stage):
-    def process(self, data, ctx):
-        model, optimizer = create_model_and_optimizer(ctx.cfg)
-        if "model" in ctx.state:
-            model.load_state_dict(ctx.state["model"])
-            optimizer.load_state_dict(ctx.state["optimizer"])
+    def init(self, ctx):
+        self.epoch = 0
+        self.model = build_model(ctx.cfg)  # 权重是状态量，随迭代存档
 
-        for epoch in range(ctx.state.get("next_epoch", 0), ctx.cfg["epochs"]):
-            train_one_epoch(model, optimizer, data)
-            ctx.state["model"] = model.state_dict()
-            ctx.state["optimizer"] = optimizer.state_dict()
-            ctx.state["next_epoch"] = epoch + 1
-            ctx.checkpoint.save(step=epoch + 1)
-
-        return model.state_dict()
+    def loop(self, data, ctx, index, max_iter=Stage.cfg("epochs")):
+        train_one_epoch(self.model, data)
+        self.epoch = index + 1
+        if should_stop(self.model):
+            self.break_loop()
+        return self.model
 ```
 
-其中模型创建和训练函数由用户实现。checkpoint 保存整个 state 和进度，固定保留两份成功写入的文件；`ctx.checkpoint.step` 是最近恢复或保存的进度。最新文件损坏时 warning 并读取上一份，两份都不可用时恢复阶段入口状态。没有 checkpoint 的失败阶段也从入口重跑。
+`loop()` 的迭代总量 `max_iter` 在签名中声明且必须带默认值：字面量整数，或 `Stage.cfg("键名")`——后者在 Stage 运行时从 `ctx.cfg` 取值，缺键直接报错。框架每轮调用 `loop()` 时传入解析后的值，`index` 是跨续跑的扁平单调迭代位置，`data` 是上游传入的对象。`init()` 在其中创建的实例属性就是状态量，框架自动写入每个 checkpoint 和完成快照；下划线开头的属性是框架簿记，不会被捕获。dataloader、客户端等进程绑定资源不在 `init()` 中创建——资源加载由上游实现，上游阶段把资源打包进输出传递，`loop()` 内直接使用。
 
-默认目录为 `runs/<batch-id>/`，可通过 `output_dir=` 指定一个尚不存在的目录。配置在 Experiment 创建时保存一次，运行中的映射和列表使用只读包装；读取、索引、遍历照常，需要运行时对象时使用 state。
+有可读 checkpoint 的尝试会跳过 `init()`：存档中的状态量直接作为初值灌回实例，随机状态重置到存档时刻，然后从存档的 step 继续迭代，已完成的迭代位置被静默跳过。每次 `loop()` 正常返回后，框架自动保存一份包含状态量、随机状态和该轮返回值的 checkpoint（step=index+1），只保留最新一份；最新文件损坏时 warning 并读取上一份，两份都不可用时重新执行 `init()` 并从零开始迭代。`break_loop()` 请求在下一迭代前停止，标志不持久化，恢复后由 `loop()` 重新评估；触发早停的 Stage 正常完成，输出为最后一次 `loop()` 的返回值。loop 体应当由状态量、上游对象、`index` 和全局随机状态共同决定——按索引取数或依赖已恢复的随机序列都能精确重放，但不要跨断点持有流的游标。定义 `process()` 的 Stage 保持完全自定义执行，不产生中间 checkpoint，失败后从阶段入口重跑。不经过 Experiment/Batch 的裸 `Pipeline.run()` 静默降级：`init()` 照常执行，只是没有存档与恢复。
+
+其中模型创建和训练函数由用户实现。checkpoint 保存全部状态量和进度，与进度写入同一原子记录。
+
+默认目录为 `runs/<batch-id>/`，可通过 `output_dir=` 指定一个尚不存在的目录。配置在 Experiment 创建时保存一次，运行中的映射和列表使用只读包装；读取、索引、遍历照常，可变数据（张量、计数器等）定义为状态量。
 
 ```python
 # 原进程中创建并运行
@@ -369,9 +371,9 @@ from expman import seed_everything
 seed_everything(42)
 ```
 
-每个 run 将初始化后的随机状态原子写入 `experiments/<run_id>/rng_initial.pkl`。重试和恢复读取此记录，不重复设种子；随后按已有阶段快照和 checkpoint 恢复到相应位置。阶段完成快照及 checkpoint 都包含独立的 `rng_state` 字段，与业务 state 在同一文件、同一事务中保存，不占用 `ctx.state`。框架只保留最新一份 checkpoint，阶段完成时把它删掉：完成快照已经是恢复的依据，留着中间 epoch 的模型只是在占盘。
+每个 run 将初始化后的随机状态原子写入 `experiments/<run_id>/rng_initial.pkl`。重试和恢复读取此记录，不重复设种子；随后按已有阶段快照和 checkpoint 恢复到相应位置。阶段完成快照及 checkpoint 都包含独立的 `rng_state` 字段，与业务状态量在同一文件、同一事务中保存。框架只保留最新一份 checkpoint，阶段完成时把它删掉：完成快照已经是恢复的依据，留着中间 epoch 的模型只是在占盘。
 
-复用本 run 已完成阶段时恢复该阶段结束时的随机状态；失败阶段有 checkpoint 时恢复它，没有则从阶段入口的随机状态重跑。为避免 Stage 构造函数消耗随机数影响续跑，checkpoint 的随机状态在构造前验证恢复，并在构造后、执行阶段前再次恢复。用户在 `process()` 中重建模型、恢复数据迭代器等准备工作若消耗随机数，仍需自行管理这段恢复逻辑。
+复用本 run 已完成阶段时恢复该阶段结束时的随机状态；失败阶段有 checkpoint 时，框架在恢复状态量的同时把随机状态重置到存档时刻，没有 checkpoint 则从阶段入口的随机状态重跑。恢复尝试会跳过 `init()`，其随机数消耗自然不计入续跑序列；每轮 `loop()` 返回后立刻存档，因此作废的随机消耗只有失败所在的那一次迭代。
 
 随机状态记录覆盖 Python 全局生成器（含 Gaussian 缓存）、NumPy 全局 RandomState、PyTorch CPU 及全部可见 CUDA 设备的生成器。NumPy 数组转为普通列表、PyTorch ByteTensor 转为 bytes 存储，因此仅查看快照元数据不会为了随机状态反序列化 CUDA Tensor。保存可见 CUDA 状态会初始化相关生成器，需要可用的 CUDA 环境；GPU 调度器已在子进程启动前限制设备可见范围。
 
@@ -385,9 +387,9 @@ seed_everything(42)
 
 Batch 自动共享已完成的阶段结果。Pipeline 从 0 号阶段开始匹配声明的配置依赖；一旦某阶段不匹配，本次 run 后续阶段全部实际执行。根部 seed 和 Pipeline 定义参与缓存隔离。每个 Stage 通过 `config_dependencies(cfg)` 显式声明依赖，框架只按声明匹配缓存：不再运行探查阶段，也不在运行时记录配置读取。
 
-例如两个实验仅 model 不同，阶段 0 声明只依赖 data，阶段 1 声明只依赖 model，那么第二个实验可以复用阶段 0。命中时恢复返回值、完整 state 和随机数状态，并将该阶段的数值指标写入当前 run 的 SQLite 记录。示例：`python examples/shared_prefix.py`。
+例如两个实验仅 model 不同，阶段 0 声明只依赖 data，阶段 1 声明只依赖 model，那么第二个实验可以复用阶段 0。命中时恢复返回值和随机数状态，并将该阶段的数值指标写入当前 run 的 SQLite 记录。示例：`python examples/shared_prefix.py`。
 
-依赖声明与配置树同构：节点为 `True` 表示依赖该子树，为映射则递归到子键（序列用整数下标），缺省或 `False` 表示不依赖，返回 `True` 表示依赖完整配置。声明方法接收只读的 `cfg`，因此可以按取值选择分支——例如 `Baseline` 为 `B1` 时只声明 `imputer`，为 `B2` 时同时声明 `predictor`。默认返回 `True`：读取 `ctx.cfg` 却未重写该方法的 Stage 会保守地依赖完整配置，不会错误复用。配置中的字段必须显式声明，`get()` 和 `in` 判断抛出 TypeError，索引不存在的字段抛出 KeyError。state 仍是普通字典。checkpoint 和完成快照保存当前声明的依赖，恢复时按同一声明校验。
+依赖声明与配置树同构：节点为 `True` 表示依赖该子树，为映射则递归到子键（序列用整数下标），缺省或 `False` 表示不依赖，返回 `True` 表示依赖完整配置。声明方法接收只读的 `cfg`，因此可以按取值选择分支——例如 `Baseline` 为 `B1` 时只声明 `imputer`，为 `B2` 时同时声明 `predictor`。默认返回 `True`：读取 `ctx.cfg` 却未重写该方法的 Stage 会保守地依赖完整配置，不会错误复用。配置中的字段必须显式声明，`get()` 和 `in` 判断抛出 TypeError，索引不存在的字段抛出 KeyError。checkpoint 和完成快照保存当前声明的依赖，恢复时按同一声明校验。
 
 共享快照位于 Batch 的 cache 目录，各 run 的 completed.pkl 保存引用；移动实验记录时应保留完整 Batch 目录。自身已有快照和 checkpoint 优先恢复。并发进程只读取已经发布完成的共享节点，同时启动的相同工作仍可能各自计算。嵌套 Pipeline 的依赖由外层 Stage 的声明覆盖。
 
@@ -395,7 +397,7 @@ Batch 自动共享已完成的阶段结果。Pipeline 从 0 号阶段开始匹�
 
 ## 可恢复的阶段诊断计时
 
-每个阶段的完成快照及 checkpoint 都包含 `elapsed_seconds`（秒）。阶段恢复 state 和随机状态之后、构造 Stage 之前启动单调时钟；保存时将恢复的累计值与本次执行时长相加，与进度写入同一原子记录。计时字段由框架管理，不占用 ctx.state。
+每个阶段的完成快照及 checkpoint 都包含 `elapsed_seconds`（秒）。构造 Stage 之前启动单调时钟；保存时将恢复的累计值与本次执行时长相加，与进度写入同一原子记录。计时字段由框架管理，不占用状态量。
 
 例如 checkpoint 记录 100 秒，随后运行 20 秒后中断；恢复后再运行 30 秒完成，阶段快照记录 130 秒。没有 checkpoint 的失败阶段重跑时从零计时。停机时间和恢复检查点的加载时间不计入累计值。保存时取写入前的时间截点，因此当前保存操作的耗时不在该记录内；不中断继续运行时，它会进入下一次记录的执行时长。嵌套阶段独立计时，外层耗时包含内层执行，不能直接将各层耗时相加。
 

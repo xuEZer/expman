@@ -10,15 +10,15 @@ class Sample(Stage):
     def config_dependencies(cls, cfg):
         return {"count": True}
 
-    def process(self, data, ctx):
-        samples = ctx.state.setdefault("samples", [])
-        while len(samples) < ctx.cfg["count"]:
-            samples.append(random.random())
-            ctx.checkpoint.save(step=len(samples))
-            if ctx.attempt == 1 and len(samples) == 2:
-                random.random()  # Work after the checkpoint will be replayed.
-                raise RuntimeError("example: retry from checkpoint")
-        return samples
+    def init(self, ctx):
+        self.samples: list[float] = []
+
+    def loop(self, data, ctx, index, max_iter=Stage.cfg("count")):
+        self.samples.append(random.random())
+        if ctx.attempt == 1 and index == ctx.cfg["count"] - 2:
+            random.random()  # Consumed after the checkpoint; replayed on resume.
+            raise RuntimeError("example: retry from checkpoint")
+        return self.samples
 
 
 def main():

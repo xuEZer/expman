@@ -53,12 +53,12 @@ class RunContext:
     run_id: str = field(default_factory=lambda: uuid4().hex)
     recorder: Recorder = field(default_factory=InMemoryRecorder)
     cfg: Mapping[str, Any] = field(default_factory=dict, kw_only=True)
-    state: dict[str, Any] = field(default_factory=dict, kw_only=True)
     stage_id: int | None = field(default=None, kw_only=True)
     _metrics: MetricStore | None = field(default=None, kw_only=True, repr=False)
     _store: RunStore | None = field(default=None, kw_only=True, repr=False)
     _stage_path: tuple[int, ...] = field(default=(), kw_only=True, repr=False)
     _checkpoint: Checkpoint | None = field(default=None, kw_only=True, repr=False)
+    _checkpoint_record: dict | None = field(default=None, kw_only=True, repr=False)
     _pipeline_calls: dict = field(default_factory=dict, kw_only=True, repr=False)
     attempt: int = field(default=1, kw_only=True)
     _execution_id: str | None = field(default=None, repr=False)
@@ -71,16 +71,6 @@ class RunContext:
         if not isinstance(self.cfg, Mapping):
             raise TypeError("cfg must be a mapping")
         object.__setattr__(self, "cfg", freeze(self.cfg))
-        if not isinstance(self.state, dict):
-            raise TypeError("state must be a dictionary")
-
-    @property
-    def checkpoint(self) -> Checkpoint:
-        if self._checkpoint is None:
-            raise RuntimeError(
-                "checkpoint requires a stage managed by Experiment or Batch"
-            )
-        return self._checkpoint
 
     @property
     def execution_id(self) -> str | None:

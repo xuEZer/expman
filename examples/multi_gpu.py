@@ -1,6 +1,6 @@
 """Run independent experiments on the GPU list in a YAML file.
 
-This example uses a timed placeholder; replace Work.process with GPU business code.
+This example uses a timed placeholder; replace Work.loop with GPU business code.
 """
 
 import argparse
@@ -16,15 +16,16 @@ class Work(Stage):
     def config_dependencies(cls, cfg):
         return {"epochs": True}
 
-    def process(self, data, ctx):
-        for epoch in range(ctx.state.get("epoch", 0), ctx.cfg["epochs"]):
-            sleep(0.1)
-            ctx.log_metrics({"train": {"loss": 1 / (epoch + 1)}}, step=epoch)
-            ctx.state["epoch"] = epoch + 1
-            ctx.checkpoint.save(step=epoch)
+    def init(self, ctx):
+        self.epoch = 0
+
+    def loop(self, data, ctx, index, max_iter=Stage.cfg("epochs")):
+        sleep(0.1)
+        ctx.log_metrics({"train": {"loss": 1 / (index + 1)}}, step=index)
+        self.epoch = index + 1
         return {
             "device": os.environ.get("CUDA_VISIBLE_DEVICES"),
-            "epochs": ctx.state["epoch"],
+            "epochs": self.epoch,
         }
 
 

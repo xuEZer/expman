@@ -336,29 +336,30 @@ class RunStore:
 
 
 class Checkpoint:
-    """Save current state synchronously; keep only the newest written file."""
+    """Save Stage state synchronously; keep only the newest written file.
+
+    The framework owns one instance per managed Stage; ``state`` is the
+    Stage's attribute snapshot captured by the framework's loop driver
+    and run().
+    """
 
     def __init__(
         self,
         store: RunStore,
         position,
-        state: dict,
-        step=None,
         pipeline_calls=None,
         dependencies=None,
     ):
         self._store = store
         self._position = position
-        self._state = state
-        self.step = step
         self._pipeline_calls = {} if pipeline_calls is None else pipeline_calls
         self.dependencies = dependencies
 
-    def save(self, *, step: int | None = None) -> Path:
-        if step is not None and (
-            isinstance(step, bool) or not isinstance(step, int) or step < 0
-        ):
-            raise ValueError("step must be a nonnegative integer or None")
+    def save(self, *, step: int, state: dict, result: Any = None) -> Path:
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("step must be a nonnegative integer")
+        if not isinstance(state, dict):
+            raise ValueError("state must be a dictionary")
         existing = self._store.checkpoints(self._position)
         sequence = int(existing[0].stem) + 1 if existing else 1
         path = (
@@ -369,7 +370,8 @@ class Checkpoint:
         record = {
             "position": self._position,
             "step": step,
-            "state": self._state,
+            "state": state,
+            "loop_result": result,
             "pipeline_calls": self._pipeline_calls,
             **self._store.random_snapshot(),
             "elapsed_seconds": self._store.elapsed(self._position),
@@ -377,13 +379,16 @@ class Checkpoint:
         if self.dependencies is not None:
             record["config_dependencies"] = self.dependencies
         write_record(path, record, self._store.serializer)
-        self.step = step
         # One checkpoint, not two: each one carries the whole Stage state, and a
         # Batch has one Stage in flight per run.  A resume needs the newest one
         # only, and a completed Stage keeps none at all.
         for old in self._store.checkpoints(self._position)[1:]:
             old.unlink()
         return path
+
+    def restore_random(self, record: dict) -> None:
+        """Rewind the run's random state to the moment the record was written."""
+        self._store.restore_random(record)
 
 
 class RunLock:

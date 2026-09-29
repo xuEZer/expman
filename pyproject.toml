@@ -41,5 +41,8 @@ target-version = "py312"
 line-length = 88
 
 [tool.ruff.lint]
+# B008 is ignored because `max_iter=Stage.cfg("key")` in the loop() signature is
+# the supported idiom for declaring a configuration-resolved iteration count;
+# the call is cheap, idempotent and evaluated exactly once per class definition.
 select = ["E", "F", "I", "B", "UP", "SIM", "W"]
-ignore = ["E501"]
+ignore = ["E501", "B008"]

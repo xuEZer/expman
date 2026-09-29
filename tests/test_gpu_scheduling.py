@@ -40,13 +40,16 @@ class GpuWork(Stage):
             "device": True,
         }
 
-    def process(self, data, ctx):
+    def init(self, ctx):
+        self.saved = 0
+
+    def loop(self, data, ctx, index, max_iter=2):
         root = Path(ctx.cfg["markers"])
-        ctx.cfg["item"]
-        (root / f"{ctx.run_id}.started").write_text(str(os.getpid()))
-        ctx.state["saved"] = ctx.state.get("saved", 0) + 1
-        ctx.checkpoint.save()
-        (root / f"{ctx.run_id}.checkpoint").touch()
+        if index == 0:
+            (root / f"{ctx.run_id}.started").write_text(str(os.getpid()))
+            self.saved += 1
+            (root / f"{ctx.run_id}.checkpoint").touch()
+            return None
         if ctx.cfg["crash"]:
             os._exit(7)
         if ctx.cfg["fail_once"] and ctx.attempt == 1:
@@ -66,7 +69,7 @@ class GpuWork(Stage):
                 "device": os.environ.get("CUDA_VISIBLE_DEVICES"),
                 "import_device": IMPORT_DEVICE,
                 "pid": os.getpid(),
-                "saved": ctx.state["saved"],
+                "saved": self.saved,
                 "cfg_devices": list(ctx.cfg["device"]),
             }
         finally:
@@ -78,8 +81,11 @@ class SharedWork(Stage):
     def config_dependencies(cls, cfg):
         return {}
 
+    def init(self, ctx):
+        self.producer = None
+
     def process(self, data, ctx):
-        ctx.state["producer"] = os.getpid()
+        self.producer = os.getpid()
         ctx.log_metrics({"loss": 0.25}, step=0)
         return os.getpid()
 
@@ -506,10 +512,10 @@ class TestGpuScheduling:
         resumed = Batch.resume(Pipeline([GpuWork]), batch.output_dir)
         results = resumed.run(progress=False)
         assert all(item.status is Status.SUCCEEDED for item in results)
+        # The state attribute comes from the checkpoint, not a re-executed loop.
         saved = [item.output["saved"] for item in results]
         assert len(saved) == 2
-        assert all(value in (1, 2) for value in saved)
-        assert 2 in saved
+        assert all(value == 1 for value in saved)
         assert all(len(item.attempts) in (1, 2) for item in results)
         assert max(len(item.attempts) for item in results) == 2
         assert max(resumed._stage_attempts.values()) == 2

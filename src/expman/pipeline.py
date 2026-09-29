@@ -18,8 +18,6 @@ from .storage import Checkpoint, RecoveryWarning
 def _reuse_completed(scoped, store, completed, position, restore_seconds):
     """Restore one completed Stage's snapshot and record the reuse."""
     with scoped.observe(completed["name"], kind="stage", reused=True):
-        scoped.state.clear()
-        scoped.state.update(completed["state"])
         output = completed["output"]
         store.status(
             position,
@@ -158,22 +156,17 @@ class Pipeline:
                     if store is not None:
                         dependencies = stage_dependencies(stage_type, scoped.cfg)
                         store.status(position, Status.RUNNING.value, context.attempt)
-                        checkpoint = store.latest(
-                            position, config=scoped.cfg, restore_random=True
-                        )
+                        checkpoint = store.latest(position, config=scoped.cfg)
                         if checkpoint is not None:
-                            scoped.state.clear()
-                            scoped.state.update(checkpoint["state"])
                             scoped._pipeline_calls.update(
                                 checkpoint.get("pipeline_calls", {})
                             )
                         scoped = replace(
                             scoped,
+                            _checkpoint_record=checkpoint,
                             _checkpoint=Checkpoint(
                                 store,
                                 position,
-                                scoped.state,
-                                None if checkpoint is None else checkpoint.get("step"),
                                 scoped._pipeline_calls,
                                 dependencies,
                             ),
@@ -181,10 +174,6 @@ class Pipeline:
                     if store is not None:
                         store.start_timing(position, checkpoint)
                     stage = stage_type()
-                    if store is not None and checkpoint is not None:
-                        # Reconstruction may consume randomness; process resumes at
-                        # the checkpoint's RNG position, not after reconstruction.
-                        store.restore_random(checkpoint)
                     data = stage.run(data, scoped)
                     if store is not None:
                         store.status(

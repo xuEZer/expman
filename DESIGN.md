@@ -60,16 +60,24 @@ class Stage(Generic[InputT, OutputT], ABC):
     def __init__(self, *, name: str | None = None): ...
     @classmethod
     def config_dependencies(cls, cfg) -> Mapping | bool: ...
+    def init(self, ctx: RunContext) -> None: ...
+    def loop(self, data, ctx: RunContext, index: int, max_iter=...) -> Any: ...
+    def break_loop(self) -> None: ...
     def run(self, data: InputT, ctx: RunContext | None = None) -> OutputT: ...
-    def process(self, data: InputT, ctx: RunContext) -> OutputT: ...
+    def process(
+        self, data: InputT, ctx: RunContext
+    ) -> Any: ...  # loop Stage 由框架构建
 ```
 
-- 用户实现抽象方法 `process()`，接收输入并返回输出；重写 `config_dependencies()` 声明该 Stage 结果依赖的配置位置（见 §7）。
-- `run()` 是基类提供的执行入口，通过 RunContext 统一包装生命周期监测。
-- `run()` 使用 `typing.final` 标记，供静态工具检查覆盖行为；Python 运行时不会阻止子类覆盖，因此扩展契约要求用户只覆盖 `process()`。
+- Stage 必须且只能定义 `process()` 或 `loop()` 之一（`__init_subclass__` 在类定义时校验）。重写 `config_dependencies()` 声明该 Stage 结果依赖的配置位置（见 §7）。
+- 定义 `loop()` 时框架自动构建执行：最后一次 `loop()` 的返回值是 Stage 输出，用户不定义 `process()`。`loop()` 的 `data` 是上游传入的对象，`index` 是跨续跑的扁平单调位置；迭代总量 `max_iter` 在签名中声明且必须带默认值——字面量整数或 `Stage.cfg("键名")`（运行时从 `ctx.cfg` 取值，缺键报错），框架每轮传入解析后的值。定义 `process()` 时保持完全自定义执行，不产生中间 checkpoint。
+- `init()` 在从零开始的尝试中执行：在其中创建的实例属性就是状态量，框架在 init 前后对 `__dict__` 做 diff 自动识别（下划线开头的属性除外），写入每个 checkpoint 和完成快照。有可读 checkpoint 的尝试跳过 `init()`，存档直接提供状态量初值。dataloader 等进程绑定资源不在 `init()` 中创建——资源加载由上游实现，上游阶段把资源打包进输出传递，`loop()` 内直接使用。
+- 有 checkpoint 时框架从其 step 续跑（已完成下标静默跳过，`max_iter` 是跨续跑总次数），随机状态重置到存档时刻；`loop()` 正常返回后框架自动保存 checkpoint（step=index+1，含状态量、随机状态与该轮返回值），只保留最新一份。`break_loop()` 请求在下一迭代前停止，标志不持久化，恢复后由 `loop()` 重新评估；触发早停的 Stage 正常完成。
+- `run()` 是基类提供的执行入口，依次执行 `init()` 与 `process()`，通过 RunContext 统一包装生命周期监测；完成时保存状态量。未接入 Experiment/Batch 时静默降级：无存档与恢复。
+- `run()` 使用 `typing.final` 标记，供静态工具检查覆盖行为；Python 运行时不会阻止子类覆盖，因此扩展契约要求用户只覆盖 `process()` 及上述钩子。
 - 名称默认使用子类名，可通过 `super().__init__(name="...")` 设置。自定义构造函数须调用基类构造函数。
-- 阶段可持有模型、优化器、缓存等实例状态，也可在 `process()` 中组织自己的循环、验证与早停。通过 `ctx.cfg` 读取完整实验配置。
-- Pipeline 接收 Stage 类，并通过无参构造函数创建实例。模型等依赖当前配置的对象在 `process()` 内构建。
+- 阶段可持有模型、优化器、缓存等实例状态。通过 `ctx.cfg` 读取完整实验配置。
+- Pipeline 接收 Stage 类，并通过无参构造函数创建实例。模型等依赖当前配置的对象在 `init()` 内构建并声明为状态量。
 - Stage 实例也可直接调用 `run()`，这时实例状态由调用方管理。
 
 计时实现集中在 RunContext，Stage 和 Pipeline 共用同一套生命周期语义。
@@ -86,7 +94,7 @@ Pipeline 在构造时将 Stage 类序列保存为 tuple，防止调用方后续�
 执行规则：
 
 1. 创建 Pipeline 执行作用域，记录开始事件。
-2. 按位置检查已完成快照；可复用时恢复输出和 state 并跳过构造，否则无参构造 Stage 并调用 `run()`。
+2. 按位置检查已完成快照；可复用时恢复输出并跳过构造，否则无参构造 Stage 并调用 `run()`。
 3. 将每个阶段返回的对象直接传给下一个阶段。
 4. 返回最后一个阶段的输出，记录成功事件。
 
@@ -100,7 +108,7 @@ Pipeline 在构造时将 Stage 类序列保存为 tuple，防止调用方后续�
 
 ## 5. RunContext：运行身份与公共服务
 
-RunContext 保存 `run_id`、尝试编号 `attempt`、只读完整配置 `cfg`、可变 `state`、位置标识 `stage_id`、Recorder 和当前执行作用域，提供：
+RunContext 保存 `run_id`、尝试编号 `attempt`、只读完整配置 `cfg`、位置标识 `stage_id`、Recorder 和当前执行作用域，提供：
 
 | 接口 | 用途 |
 |---|---|
@@ -109,13 +117,12 @@ RunContext 保存 `run_id`、尝试编号 `attempt`、只读完整配置 `cfg`�
 | `log_metrics(mapping, step=...)` | 将嵌套数值指标事务写入 SQLite |
 | `report_progress(completed, total=..., unit=...)` | 上报绝对完成量，可省略总量 |
 | `emit(event)` | 将事件发送给记录器并隔离普通记录故障 |
-| `checkpoint.save(step=...)` | 同步保存当前阶段 state，只保留最新一份 checkpoint；阶段完成时删除 |
 
 业务数据通过阶段输入输出传递，RunContext 承载配置和执行服务。`ctx.cfg` 是当前尝试的完整配置，用户自行读取其中需要的字段。
 
 每次顶层调用省略 `ctx` 时自动创建独立 RunContext。需要检查记录或接入自己的存储时，由调用方显式创建并传入上下文。显式复用同一个上下文表示这些调用属于同一 `run_id`；每次具体执行仍获得不同的 `execution_id`。
 
-上下文本身为 frozen dataclass。配置递归包装为只读映射和序列，同一次尝试的阶段共享可变的 state；需要恢复的模型数据、循环位置等由用户放入 state。每次尝试先创建新的上下文，再从持久化快照恢复业务状态。运行时的尝试编号、执行 ID 和 Recorder 使用本次执行的信息。
+上下文本身为 frozen dataclass。配置递归包装为只读映射和序列；需要恢复的模型数据、循环位置等由 Stage 在 `init()` 中声明为状态量，框架经内部通道把最新 checkpoint 记录交给 Stage，在阶段执行入口恢复。每次尝试先创建新的上下文，再由 Stage 恢复业务状态。运行时的尝试编号、执行 ID 和 Recorder 使用本次执行的信息。
 
 ## 6. 观测契约
 
@@ -247,7 +254,7 @@ results = batch.run()
 
 ### 8.1 实验身份与隔离
 
-Experiment 保存一份具体配置、稳定的 `run_id` 和独立目录。首次执行从 `None` 输入开始；每次尝试使用新的上下文，复用已完成阶段的快照，并自动恢复待执行阶段最新可用的 checkpoint。只实例化仍需执行的阶段。
+Experiment 保存一份具体配置、稳定的 `run_id` 和独立目录。首次执行从 `None` 输入开始；每次尝试使用新的上下文，复用已完成阶段的快照，并把待执行阶段最新可用的 checkpoint 交给 Stage 在执行入口恢复。只实例化仍需执行的阶段。
 
 阶段收到完整的 `ctx.cfg`，尝试编号 `ctx.attempt` 从 1 开始递增。`experiment.cfg` 返回配置副本，调用方不能通过该属性修改实验的初始配置。用户的类变量、模块全局变量、外部服务和文件不在实例隔离范围内。
 
@@ -286,23 +293,23 @@ Batch 默认使用一个内存 Recorder 收集所有实验事件，可传入自�
             pipeline.pkl           当前流程签名
             0/
                 status.pkl         框架维护的阶段状态
-                completed.pkl      返回值 + state + 随机状态的完整快照
+                completed.pkl      返回值 + 状态量 + 随机状态的完整快照
                 checkpoints/
-                    000...001.pkl  state + 进度 + 内部调用位置
+                    000...001.pkl  状态量 + 进度 + 内部调用位置
                     000...002.pkl
 ```
 
 Stage ID 直接取局部位置 `0、1、2…`，名称只用于展示。嵌套流程使用父阶段位置、调用序号和子阶段位置形成数字路径；checkpoint 同步保存内部调用计数，避免恢复循环中的嵌套 Pipeline 时混用结果。
 
-阶段完成快照是返回值和 state 的单个保存事务。写入临时文件、flush/fsync 后原子替换目标路径，成功后才算完成。保存失败按普通阶段失败处理；未完成的临时文件不参与恢复。状态文件自动记录 running、succeeded、failed 或 cancelled，恢复复用时记录 reused 标记，执行事件也带有该标记和 stage_id。
+阶段完成快照是返回值和状态量的单个保存事务。写入临时文件、flush/fsync 后原子替换目标路径，成功后才算完成。保存失败按普通阶段失败处理；未完成的临时文件不参与恢复。状态文件自动记录 running、succeeded、failed 或 cancelled，恢复复用时记录 reused 标记，执行事件也带有该标记和 stage_id。
 
-Checkpoint 通过 `ctx.checkpoint.save(step=...)` 同步保存当前 state，保留最近两份成功写入记录。进入 process 前先恢复阶段入口的输出/state，再用最新可读取 checkpoint 的 state 覆盖；最新损坏时 warning 并尝试上一份，两份都不可用则使用入口状态。已完成阶段快照损坏会报 StorageError，避免静默传递错误的阶段输入。
+Checkpoint 由框架在每次 `loop()` 正常返回后自动保存（step=index+1，含状态量、随机状态与该轮返回值），只保留最新一份成功写入的记录。恢复发生在阶段执行入口：有可读 checkpoint 时框架跳过 `init()`，直接把存档状态量灌回实例、重置随机状态并从其 step 续跑；最新损坏时 warning 并尝试上一份，两份都不可用则重新执行 `init()` 并从零开始迭代。已完成阶段快照损坏会报 StorageError，避免静默传递错误的阶段输入。
 
 Batch 清单原子记录待执行队列、当前活动成员及尝试摘要。Ctrl+C 会将当前成员放回队首并保存取消记录；进程突然结束时，resume 根据活动成员补记中断尝试，其未知耗时记为 0。已完成成员保持完成，失败预算依据已持久化的 failed 尝试数计算。快照和清单不能构成跨文件的单次事务；若进程在结果保存后、清单更新前结束，恢复会复用已保存阶段结果补完该实验。
 
 恢复读取保存的配置而非原 YAML，并校验阶段类、顺序及可获取的源码摘要；默认模块和类标识不等同于完整依赖环境指纹。实例已加载后如果清单被另一执行者更新，会拒绝使用陈旧队列。运行期间持有操作系统锁，进程退出后锁自动释放。
 
-默认 PickleSerializer 保存可 pickle 的 Python 对象，加载只适用于可信文件和兼容的依赖、设备环境。Serializer 协议允许替换 dump/load，创建与恢复时须使用匹配的实现。用户负责填充和应用 model/optimizer state_dict、独立随机生成器和数据位置等业务状态；框架不会自动捕获活跃模型的内部执行状态。配置中的字典、列表、集合转换为只读包装，任意可变业务对象应放进 state。
+默认 PickleSerializer 保存可 pickle 的 Python 对象，加载只适用于可信文件和兼容的依赖、设备环境。Serializer 协议允许替换 dump/load，创建与恢复时须使用匹配的实现。用户负责在 `init()` 中声明 model/optimizer 等状态量，独立随机生成器和数据位置等业务状态由用户保存；框架不会自动捕获活跃模型的内部执行状态。配置中的字典、列表、集合转换为只读包装，任意可变业务对象应定义为状态量。
 
 这里的状态快照与清单用于恢复，Recorder 事件仍由用户选择存储适配器；默认内存 Recorder 不提供跨进程指标历史。
 
@@ -330,7 +337,7 @@ Batch 清单原子记录待执行队列、当前活动成员及尝试摘要。Ct
 
 配置测试覆盖候选组合、分支独立性、普通列表、模型切换、默认合并、文件路径解析、缺失警告、错误输入和 Run 数据隔离。
 
-批量与恢复测试覆盖队尾顺序、尝试预算、阶段复用、只读配置、state 恢复、单份 checkpoint、阶段完成后不留 checkpoint、损坏回退、保存失败、进程锁、Pipeline 匹配，以及独立子进程的 SIGINT 和突然退出恢复。
+批量与恢复测试覆盖队尾顺序、尝试预算、阶段复用、只读配置、状态量恢复、单份 checkpoint、阶段完成后不留 checkpoint、损坏回退、保存失败、进程锁、Pipeline 匹配，以及独立子进程的 SIGINT 和突然退出恢复。
 
 版本记录见 [CHANGELOG.md](CHANGELOG.md)，开发和 Git 约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
@@ -369,9 +376,9 @@ YAML 顶层 `device` 是 Batch 级必填的非空、非负且不重复的 NVIDIA
 
 根部 `seed` 是 run 级必填框架参数，只接受 uint32 范围整数。Batch 在创建目录前验证每份配置，Experiment 也独立验证。`RandomStateManager` 在尝试开始时加载 Python、NumPy/PyTorch；首次执行设种子并原子保存 rng_initial.pkl，之后的尝试读取该记录。依赖损坏等导入错误继续传播。GPU 子进程已在导入这些库前绑定可见设备。
 
-RunStore 的运行期 rng 服务负责为完成快照/checkpoint 加入独立 rng_state 字段。状态包含格式版本、有效 seed、Python 状态、NumPy 全局状态（普通标量/列表）、PyTorch CPU/CUDA 状态（bytes 列表）；不放进 ctx.state，不将库模块或运行期管理器序列化。公开 seed_everything() 提供相同的初始化行为。
+RunStore 的运行期 rng 服务负责为完成快照/checkpoint 加入独立 rng_state 字段。状态包含格式版本、有效 seed、Python 状态、NumPy 全局状态（普通标量/列表）、PyTorch CPU/CUDA 状态（bytes 列表）；与状态量同文件保存但字段独立，不将库模块或运行期管理器序列化。公开 seed_everything() 提供相同的初始化行为。
 
-Pipeline 复用已完成阶段时恢复其结束随机状态；选择 checkpoint 时先校验并恢复随机状态，构造 Stage 后再次恢复 checkpoint 状态，避免构造消耗推进业务随机序列。无有效 checkpoint 时通过初始状态与上游完成快照重建阶段入口。状态恢复先校验 Python/NumPy/CPU 生成器及 CUDA 数量，应用失败时回滚到应用前随机状态，使候选 checkpoint 回退不会残留部分恢复结果。随机状态保存故障与对应业务快照保存故障同样视为阶段失败。
+Pipeline 复用已完成阶段时恢复其结束随机状态；有 checkpoint 时框架在把状态量灌回实例的同时把随机状态重置到 checkpoint 存档时刻，恢复尝试跳过 `init()`，其随机数消耗不计入续跑序列。无有效 checkpoint 时通过初始状态与上游完成快照重建阶段入口。状态恢复先校验 Python/NumPy/CPU 生成器及 CUDA 数量，应用失败时回滚到应用前随机状态，使候选 checkpoint 回退不会残留部分恢复结果。随机状态保存故障与对应业务快照保存故障同样视为阶段失败。
 
 旧记录缺少 rng_state 时 warning 后保留业务恢复兼容性，不承诺随机连续。新的初始记录和已完成记录随机状态损坏不静默重置种子。随机库/可见 CUDA 设备需兼容；独立生成器、子数据加载进程、process 内部的模型重建逻辑和确定性算法选择仍由业务代码负责。当前实现为单个 run 的随机状态初始化与恢复，跨实验前缀共享另行实现。
 
@@ -387,7 +394,7 @@ PrefixCache 使用 Pipeline 签名与根 seed 隔离树；树边包含阶段位�
 
 ## 可恢复的阶段诊断计时
 
-每个阶段的完成快照及 checkpoint 都包含 `elapsed_seconds`（秒）。阶段恢复 state 和随机状态之后、构造 Stage 之前启动单调时钟；保存时将恢复的累计值与本次执行时长相加，与进度写入同一原子记录。计时字段由框架管理，不占用 ctx.state。
+每个阶段的完成快照及 checkpoint 都包含 `elapsed_seconds`（秒）。构造 Stage 之前启动单调时钟；保存时将恢复的累计值与本次执行时长相加，与进度写入同一原子记录。计时字段由框架管理，不占用状态量。
 
 例如 checkpoint 记录 100 秒，随后运行 20 秒后中断；恢复后再运行 30 秒完成，阶段快照记录 130 秒。没有 checkpoint 的失败阶段重跑时从零计时。停机时间和恢复检查点的加载时间不计入累计值。保存时取写入前的时间截点，因此当前保存操作的耗时不在该记录内；不中断继续运行时，它会进入下一次记录的执行时长。嵌套阶段独立计时，外层耗时包含内层执行，不能直接将各层耗时相加。
 
