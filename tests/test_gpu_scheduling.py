@@ -181,10 +181,10 @@ def make_batch(root, *, count=3, devices=None, **options):
 def warm(batch, *, gpu_peak_kb=1024, peak_kb=4096):
     """Give every Stage the completed sample a previous run would have left.
 
-    A Batch measures each Stage once before it starts packing attempts
-    concurrently, and a Stage that has never reported CUDA usage receives no
-    GPU contract afterwards. Tests about packing therefore start from a Batch
-    whose Stages have already been measured, with a CUDA peak on record.
+    An unmeasured Stage probes at a bounded share of the device, and a Stage
+    that has never reported CUDA usage receives no GPU contract afterwards.
+    Tests about packing therefore start from a Batch whose Stages have
+    already been measured, with a CUDA peak on record.
     """
     for experiment in batch.experiments:
         for stage_index in range(len(experiment.pipeline.stages)):
@@ -616,67 +616,37 @@ class TestGpuScheduling:
             scheduler._relieve(None)
             assert shed == ["newer"]
 
-    def test_cold_start_launches_one_attempt_until_every_stage_has_completed(
-        self, tmp_path
-    ):
+    def test_an_unmeasured_batch_probes_within_a_host_share(self, tmp_path):
         batch = make_batch(tmp_path, count=4, devices=[0, 1], delay=0)
         scheduler = GpuScheduler(batch)
         memory = Memory([0, 1]).sample()
         host = Host().sample()
-        assert scheduler._cold_start()
+        probe_kb = devices.probe_cap_kb(
+            host.total_kb, devices.HOST_PEAK_KB_DEFAULT, scheduler.peaks.ceiling_kb
+        )
         launched = []
         with patch.object(
-            GpuScheduler, "_launch", side_effect=lambda *a: launched.append(a)
+            GpuScheduler,
+            "_launch",
+            side_effect=lambda *a: launched.append(a[3]),
         ):
             scheduler._launch_available(memory, host)
-        assert len(launched) == 1
-        assert launched[0][3].run_id == scheduler._warmup_run()
+        # Each probe is priced at a quarter of the host, so the packing
+        # arithmetic itself bounds concurrency; nothing serialises the probes.
+        assert len(launched) == 2
+        assert {candidate.host_reserve_kb for candidate in launched} == {probe_kb}
 
-        # One completed record per Stage is what releases concurrent packing.
-        for stage_index in range(len(batch.experiments[0].pipeline.stages)):
-            batch._stage_history.append(
-                {
-                    "run_id": batch.experiments[0].run_id,
-                    "stage": stage_index,
-                    "status": Status.SUCCEEDED.value,
-                }
-            )
-        assert not scheduler._cold_start()
-        plan = scheduler._launch_plan(memory, host)
-        assert len(plan) > 1
+        # Measured peaks replace the probe pricing, and every run fits at once.
+        warm(batch)
+        fresh = GpuScheduler(batch)
         launched.clear()
         with patch.object(
             GpuScheduler, "_launch", side_effect=lambda *a: launched.append(a)
         ):
-            scheduler._launch_available(memory, host)
-        assert len(launched) == len(plan)
+            fresh._launch_available(memory, host)
+        assert len(launched) == 4
 
-    def test_warmup_walks_one_pipeline_to_its_later_stages(self, tmp_path):
-        # The queue rotates as Stages finish. Following its head would measure
-        # every run's first Stage before any run reached a second one, which is
-        # why the warm-up run is the one furthest along instead.
-        path = tmp_path / "warmup-order.yaml"
-        path.write_text(
-            f"device: [0, 1]\nseed: 0\nmarkers: {tmp_path}\noffset: 10\n"
-            "item: !choice [1, 2, 3]\n"
-        )
-        batch = Batch(
-            Pipeline([Prepare, Consume]), path, output_dir=tmp_path / "warmup-order"
-        )
-        scheduler = GpuScheduler(batch)
-        first = batch._queue[0]
-        batch._queue.remove(first)
-        batch._queue.append(first)  # A finished Stage re-queues the run at the tail.
-        batch._stage_progress[first] = 1
-
-        assert scheduler._warmup_run() == first
-        plan = scheduler._launch_plan(
-            Memory([0, 1]).sample(), Host().sample(), warmup_only=True
-        )
-        assert [candidate.stage_index for candidate, _ in plan] == [1]
-        assert [candidate.run_id for candidate, _ in plan] == [first]
-
-    def test_cold_start_holds_launches_while_an_attempt_is_alive(self, tmp_path):
+    def test_a_live_attempt_does_not_hold_other_launches_back(self, tmp_path):
         batch = make_batch(tmp_path, count=4, devices=[0, 1], delay=0)
         scheduler = GpuScheduler(batch)
         scheduler.workers["running"] = Mock(
@@ -687,32 +657,22 @@ class TestGpuScheduling:
             GpuScheduler, "_launch", side_effect=lambda *a: launched.append(a)
         ):
             scheduler._launch_available(Memory([0, 1]).sample(), Host().sample())
-        assert launched == []
+        # The probes a live attempt used to serialise now launch beside it;
+        # only the host share bounds how many.
+        assert len(launched) == 2
 
-    def test_a_failed_first_attempt_still_measures_its_stage(self, tmp_path):
-        # A Stage that never fits its ceiling must not run without one forever:
-        # a limit-free attempt is retried outside the failure budget, so only the
-        # recorded attempt can end the uncapped phase.
-        batch = make_batch(tmp_path, count=1, devices=[0], delay=0)
-        scheduler = GpuScheduler(batch)
-        assert scheduler._cold_start()
-        batch._stage_history.append(
-            {
-                "run_id": batch.experiments[0].run_id,
-                "stage": 0,
-                "status": Status.CANCELLED.value,
-                "peak_kb": 0.0,
-            }
-        )
-        assert scheduler._stage_measured(0)
-        assert not scheduler._cold_start()
-
-    def test_cold_start_leaves_device_memory_uncapped(self, tmp_path):
+    def test_a_probe_is_capped_on_device_memory(self, tmp_path):
         batch = make_batch(tmp_path, count=2, devices=[0], delay=0)
         ceilings = _captured_gpu_ceilings(batch)
         assert all(item.status is Status.SUCCEEDED for item in batch.results)
-        # The Stage's first attempt ran without a PyTorch allocator ceiling.
-        assert ceilings[0] is None
+        # The probe runs at a quarter of the card instead of without a ceiling.
+        card_kb = Memory([0]).sample()[0].total * 1024
+        expected = min(
+            cap_kb(devices.probe_cap_kb(card_kb, devices.GPU_PEAK_KB_DEFAULT)),
+            card_kb,
+        )
+        assert len(ceilings) == 2
+        assert [float(item) for item in ceilings] == [pytest.approx(expected)] * 2
 
     def test_a_measured_stage_is_capped_on_device_memory(self, tmp_path):
         batch = warm(make_batch(tmp_path, count=1, devices=[0], delay=0))
@@ -721,14 +681,14 @@ class TestGpuScheduling:
         assert len(ceilings) == 1
         assert float(ceilings[0]) > 0
 
-    def test_every_stage_completing_releases_cold_start_serialisation(self, tmp_path):
-        path = tmp_path / "warmup.yaml"
+    def test_probes_start_beside_live_attempts(self, tmp_path):
+        path = tmp_path / "probes.yaml"
         path.write_text(
             f"device: [0, 1]\nseed: 0\nmarkers: {tmp_path}\noffset: 10\n"
             "item: !choice [1, 2, 3]\n"
         )
         batch = Batch(
-            Pipeline([Prepare, Consume]), path, output_dir=tmp_path / "warmup"
+            Pipeline([Prepare, Consume]), path, output_dir=tmp_path / "probes"
         )
         started = []
         original_launch = GpuScheduler._launch
@@ -736,16 +696,16 @@ class TestGpuScheduling:
         def watched(scheduler, device, memory, host, candidate):
             # Sampled at the launch itself: a launch is the only moment that can
             # put a second attempt beside a live one.
-            started.append((len(scheduler.workers), scheduler._cold_start()))
+            started.append(len(scheduler.workers))
             return original_launch(scheduler, device, memory, host, candidate)
 
         with patch.object(GpuScheduler, "_launch", watched):
             results = batch.run(progress=False)
 
         assert all(item.status is Status.SUCCEEDED for item in results)
-        # Nothing started beside a live attempt while a Stage was unmeasured.
-        assert all(running == 0 for running, cold in started if cold)
-        assert not GpuScheduler(batch)._cold_start()
+        # Probes go out while other attempts are still running: unmeasured
+        # Stages are bounded by their share, not by serialisation.
+        assert any(running > 0 for running in started)
 
     def test_host_memory_shortage_pauses_launches_until_it_recovers(self, tmp_path):
         batch = make_batch(tmp_path, count=1, devices=[0], delay=0.05)

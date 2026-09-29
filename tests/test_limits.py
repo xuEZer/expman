@@ -31,26 +31,7 @@ def test_systemd_scope_does_not_guess_a_cgroup_path():
     assert cap.mechanism == "systemd"
 
 
-def test_cold_start_runs_uncapped_and_creates_no_cgroup():
-    # The short circuit has to precede the mechanisms: a zero limit written
-    # through _direct would be memory.max = 0, which cgroup v2 reads as
-    # "this group may use no memory at all".
-    with (
-        patch("expman.limits._direct") as direct,
-        patch("expman.limits._scope") as scope,
-    ):
-        cap = limits.memory_limit("expman-test", 1024, cold_start=True)
-
-    direct.assert_not_called()
-    scope.assert_not_called()
-    assert cap.command == ()
-    assert cap.cgroup is None
-    assert cap.cap_kb == 0.0
-    assert not cap.capped
-    assert cap.mechanism == "cold-start"
-
-
-def test_a_stage_without_a_cold_start_is_capped_from_its_estimate():
+def test_memory_limit_caps_every_attempt_from_its_estimate():
     with (
         patch("expman.limits._direct", return_value=None) as direct,
         patch("expman.limits._scope", return_value=None),

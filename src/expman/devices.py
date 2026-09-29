@@ -31,6 +31,13 @@ HOST_PEAK_KB_DEFAULT = 1024 * 1024
 # samples that never report PyTorch CUDA usage will subsequently receive no GPU
 # contract and can run without occupying a card.
 GPU_PEAK_KB_DEFAULT = 1024 * 1024
+# Share of a device's total memory one probe attempt may reach. A Stage
+# with no sample in this Batch is capped at this share of the host (or of
+# one card) instead of running without a ceiling: several probes can then
+# run beside each other without being able to exhaust the machine, and an
+# OOM against the cap feeds the estimator a raised floor for the retry,
+# exactly as for any other capped attempt.
+PROBE_SHARE = 0.25
 # Empirical percentile of nearby Stage samples used for admission. It is high
 # because the reserve has to bound the next attempt, not describe the average one.
 PEAK_QUANTILE = 0.9
@@ -63,6 +70,17 @@ QUERY_TIMEOUT = 3.0
 MEMINFO_PATH = Path("/proc/meminfo")
 # WSL2 installs the Linux nvidia-smi here without adding it to PATH.
 NVIDIA_SMI_FALLBACKS = (Path("/usr/lib/wsl/lib/nvidia-smi"),)
+
+
+def probe_cap_kb(total_kb, floor_kb, ceiling_kb=0.0):
+    """Hard ceiling for one probe attempt.
+
+    A share of the device, never below the framework default, and never
+    below the largest peak already observed in this Batch: that peak was
+    reached on this machine, so it is a level another Stage may explore
+    with instead of failing against a smaller cap.
+    """
+    return max(floor_kb, total_kb * PROBE_SHARE, ceiling_kb)
 
 
 class MemoryObservationError(RuntimeError):

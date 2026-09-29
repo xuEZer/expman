@@ -312,49 +312,13 @@ class GpuScheduler:
             return None
         return model.predict(run_id)
 
-    def _stage_measured(self, stage_index):
-        """Whether this Stage has ever run here, so it has a peak to size from.
-
-        An attempt that failed still measured the Stage: the peak it reached is a
-        lower bound, and the estimator raises it again for the retry. Counting
-        only a success would leave a Stage that never fits its ceiling running
-        without one forever, because a limit-free attempt is retried outside the
-        failure budget.
-        """
-        return any(
-            entry.get("stage") == stage_index for entry in self.batch._stage_history
-        )
-
-    def _cold_start(self):
-        """Whether some Stage still has nothing measured to size its attempts from.
-
-        Every Stage of the pipeline has to run once before the scheduler packs
-        attempts concurrently: a peak observed while another attempt shared the
-        host describes that contention as much as the Stage, and it is the sample
-        later attempts are capped and admitted from.
-        """
-        return any(
-            not self._stage_measured(stage_index)
-            for experiment in self.batch.experiments
-            for stage_index in range(len(experiment.pipeline.stages))
-        )
-
-    def _warmup_run(self):
-        """The one run a cold Batch advances before any packing happens.
-
-        The queue rotates as Stages finish, so this is the run furthest along
-        rather than whatever sits at the head: one pipeline is measured end to
-        end, instead of every run's first Stage being measured before any run
-        reaches its second.
-        """
-        best = None
-        for run_id in self.batch._queue:
-            progress = self.batch._stage_progress[run_id]
-            if best is None or progress > self.batch._stage_progress[best]:
-                best = run_id
-        return best
-
-    def _stage_candidates(self, stage_index, gpu_capacity_kb, only=None):
+    def _stage_candidates(
+        self,
+        stage_index,
+        gpu_capacity_kb,
+        host_probe_kb: float = devices.HOST_PEAK_KB_DEFAULT,
+        gpu_probe_kb: float = devices.GPU_PEAK_KB_DEFAULT,
+    ):
         """Return diverse ready candidates for one Stage and its own history only."""
         batch = self.batch
         # A group with an attempt already running must not start another member.
@@ -374,7 +338,6 @@ class GpuScheduler:
             run_id
             for run_id in batch._queue
             if batch._stage_progress[run_id] == stage_index
-            and (only is None or run_id == only)
             and self._stage_group(run_id, stage_index) not in running
         ]
         # Declared dependency groups are known before execution. Keep exactly one
@@ -431,10 +394,10 @@ class GpuScheduler:
         denominator = max(1, len(selected) - 1)
         for rank, (run_id, _value) in enumerate(selected):
             host_estimate = self._stage_peak(
-                run_id, stage_index, "peak_kb", devices.HOST_PEAK_KB_DEFAULT
+                run_id, stage_index, "peak_kb", host_probe_kb
             )
             gpu_estimate = self._stage_peak(
-                run_id, stage_index, "gpu_peak_kb", devices.GPU_PEAK_KB_DEFAULT
+                run_id, stage_index, "gpu_peak_kb", gpu_probe_kb
             )
             candidates.append(
                 Candidate(
@@ -668,12 +631,8 @@ class GpuScheduler:
         # Parameter diversity only breaks materially equivalent packing choices.
         return -unused + 1e-6 * plan.novelty
 
-    def _launch_plan(self, memory, host, warmup_only=False):
-        """Choose a bounded multi-resource packing plan for this scheduler tick.
-
-        ``warmup_only`` narrows the plan to the single run a cold Batch is
-        measuring, so that pipeline is walked end to end before any other starts.
-        """
+    def _launch_plan(self, memory, host):
+        """Choose a bounded multi-resource packing plan for this scheduler tick."""
         host_capacity, available_gpu = self._resource_left(memory, host)
         devices_in_plan = tuple(memory)
         if host_capacity <= 0 or not devices_in_plan:
@@ -681,17 +640,27 @@ class GpuScheduler:
         gpu_capacities = tuple(
             max(0.0, available_gpu[device]) for device in devices_in_plan
         )
-        only = self._warmup_run() if warmup_only else None
         stages = sorted(
-            {
-                self.batch._stage_progress[run_id]
-                for run_id in self.batch._queue
-                if only is None or run_id == only
-            }
+            {self.batch._stage_progress[run_id] for run_id in self.batch._queue}
         )
         gpu_capacity_kb = min(memory[device].total * 1024 for device in devices_in_plan)
+        # An unmeasured Stage probes at a bounded share of the device instead of
+        # running uncapped one at a time: the probe ceiling is what the candidate
+        # is priced at, so the number of concurrent probes falls out of the
+        # packing arithmetic rather than out of a serialisation rule.
+        host_probe_kb = devices.probe_cap_kb(
+            host.total_kb, devices.HOST_PEAK_KB_DEFAULT, self.peaks.ceiling_kb
+        )
+        gpu_probe_kb = devices.probe_cap_kb(
+            gpu_capacity_kb, devices.GPU_PEAK_KB_DEFAULT
+        )
         candidates = self._interleave(
-            [self._stage_candidates(stage, gpu_capacity_kb, only) for stage in stages]
+            [
+                self._stage_candidates(
+                    stage, gpu_capacity_kb, host_probe_kb, gpu_probe_kb
+                )
+                for stage in stages
+            ]
         )
         plans = [Plan(host_capacity, gpu_capacities)]
         for candidate in candidates:
@@ -724,13 +693,7 @@ class GpuScheduler:
 
     def _launch_available(self, memory, host):
         """Launch the resource-aware packing plan chosen from this tick's snapshot."""
-        cold = self._cold_start()
-        plan = self._launch_plan(memory, host, warmup_only=cold)
-        if cold and self.workers:
-            # One pipeline at a time: nothing starts beside the attempt that is
-            # measuring the Stage it is on.
-            plan = ()
-        for candidate, device in plan:
+        for candidate, device in self._launch_plan(memory, host):
             self._launch(device, memory[device], host, candidate)
 
     def _materialize_reuses(self):
@@ -894,11 +857,9 @@ class GpuScheduler:
             )
             # The unit is unique per attempt: systemd unloads a finished scope
             # asynchronously, and a retry must not collide with the previous one.
-            cold_start = not self._stage_measured(stage_index)
             limit = limits.memory_limit(
                 f"expman-{run_id[:12]}-{stage_index}-{stage_attempt}",
                 host_reserve,
-                cold_start=cold_start,
             )
             if limit.cgroup is not None:
                 env["EXPMAN_CGROUP"] = str(limit.cgroup)
@@ -911,12 +872,10 @@ class GpuScheduler:
             parent_socket.setblocking(False)
             env["EXPMAN_IPC_FD"] = str(child_socket.fileno())
             env["EXPMAN_POLL_INTERVAL"] = str(devices.POLL_INTERVAL)
-            # A Stage with nothing measured yet runs without a ceiling on either
-            # resource and is measured by what it reaches, exactly as it does for
-            # host RAM; the estimate it would be capped from is the framework's own
-            # cold-start default rather than an observation. Admission still
-            # charges the estimate, and a cold Stage is the only attempt running.
-            applied_gpu_kb = 0.0 if cold_start else candidate.gpu_cap_kb
+            # An unmeasured Stage probes at the share priced into its candidate;
+            # a measured Stage is capped at its estimate plus room to grow. Both
+            # feed whatever they reach back to the estimator either way.
+            applied_gpu_kb = candidate.gpu_cap_kb
             if applied_gpu_kb > 0:
                 env["EXPMAN_GPU_LIMIT_KB"] = str(applied_gpu_kb)
             self._account()
