@@ -5,12 +5,17 @@ regression can turn modest uncertainty in log space into an arbitrarily large
 number after exponentiation. The scheduler therefore uses nearby, finite
 observations from the same Stage. A capped cgroup sample is a lower bound, so it
 receives one fixed bump; it is never extrapolated into an unbounded tail.
+
+Neighborhoods are measured over the Stage's declared configuration variables,
+exactly as the duration model measures them, so both models agree on what a
+"nearby" configuration is.
 """
 
 from dataclasses import dataclass, field
 from math import ceil, isfinite
 
 from . import devices
+from ._time_model import Encoding, variable_distance
 
 LOCAL_MIN_SAMPLES = 4
 LOCAL_NEIGHBORS = 8
@@ -20,14 +25,14 @@ LOCAL_NEIGHBORS = 8
 class LocalQuantileEstimator:
     """A bounded high-quantile estimate from nearby configuration samples.
 
-    ``vectors`` are feature rows for all candidate runs and ``indices`` maps a
-    run id to its row. With only a few samples the Stage-wide observations are
-    safer than a spurious feature split. Once enough samples exist, only the
-    closest configurations participate. In either case the returned value is an
-    empirical order statistic, bounded by the largest finite adjusted sample.
+    ``encoding`` supplies one row per encoded run and ``indices`` maps a run id to
+    its row. With only a few samples the Stage-wide observations are safer than a
+    spurious feature split. Once enough samples exist, only the closest
+    configurations participate. In either case the returned value is an empirical
+    order statistic, bounded by the largest finite adjusted sample.
     """
 
-    vectors: list
+    encoding: Encoding
     indices: dict
     default: float
     quantile: float = devices.PEAK_QUANTILE
@@ -49,17 +54,17 @@ class LocalQuantileEstimator:
         if capped:
             self.floors[run_id] = max(self.floors.get(run_id, 0.0), adjusted)
 
-    @staticmethod
-    def _distance(left, right):
-        # Feature rows start with an intercept, which cannot distinguish runs.
-        return sum((a - b) ** 2 for a, b in zip(left[1:], right[1:], strict=True))
+    def _distance(self, left: int, right: int) -> float:
+        """Mean per-variable disagreement between two observed sample rows."""
+        rows = self.encoding.rows
+        return variable_distance(self.encoding, rows[left], rows[right])
 
     def _nearby(self, row):
         if len(self.observations) < LOCAL_MIN_SAMPLES:
             return [value for _, value in self.observations]
         closest = sorted(
             self.observations,
-            key=lambda item: self._distance(row, self.vectors[item[0]]),
+            key=lambda item: self._distance(row, item[0]),
         )[:LOCAL_NEIGHBORS]
         return [value for _, value in closest]
 
@@ -69,7 +74,7 @@ class LocalQuantileEstimator:
         index = self.indices.get(run_id)
         if index is None or not self.observations:
             return max(self.default, floor)
-        values = sorted(self._nearby(self.vectors[index]))
+        values = sorted(self._nearby(index))
         # Higher order statistic: never interpolate below a sample when the
         # requested percentile falls between two observations.
         position = max(0, min(len(values) - 1, ceil(self.quantile * len(values)) - 1))

@@ -22,6 +22,7 @@ from expman.devices import (
     nvidia_smi,
 )
 from expman.experiment import Experiment
+from expman.limits import cap_kb
 from expman.scheduling import GpuScheduler, HostGate
 
 IMPORT_DEVICE = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -270,7 +271,9 @@ class TestGpuScheduling:
             for item in batch.experiments
             for path in scheduler._prefix_paths(item.run_id, 1)
         } == {("item",), ("markers",), ("offset",)}
-        assert scheduler._stage_duration(results[0].run_id, 1) > 0
+        predicted = scheduler._stage_duration(results[0].run_id, 1)
+        assert predicted is not None
+        assert 0 < predicted.lower <= predicted.center <= predicted.upper
 
     def test_completed_zero_gpu_sample_needs_no_vram_reservation(self, tmp_path):
         batch = make_batch(tmp_path, count=2, devices=[0])
@@ -294,7 +297,7 @@ class TestGpuScheduling:
             == 0.0
         )
 
-    def test_gpu_contract_never_exceeds_physical_card_capacity(self, tmp_path):
+    def test_gpu_reservations_and_ceilings_never_exceed_card_capacity(self, tmp_path):
         batch = make_batch(tmp_path, count=2, devices=[0])
         scheduler = GpuScheduler(batch)
         capacity_kb = 3 * 1024
@@ -303,7 +306,55 @@ class TestGpuScheduling:
             candidates = scheduler._stage_candidates(0, capacity_kb)
 
         assert candidates
-        assert all(item.gpu_contract_kb == capacity_kb for item in candidates)
+        assert all(item.gpu_reserve_kb == capacity_kb for item in candidates)
+        assert all(item.gpu_cap_kb == capacity_kb for item in candidates)
+
+    def test_admission_charges_the_estimate_while_the_cgroup_adds_the_margin(
+        self, tmp_path
+    ):
+        # The allowance is what a single attempt may reach before it is retried,
+        # not capacity a packed plan may spend: charging it at admission too would
+        # idle memory that another attempt could use.
+        batch = make_batch(tmp_path, count=2, devices=[0])
+        scheduler = GpuScheduler(batch)
+        estimate = 4 * 1024**2
+
+        with patch.object(scheduler, "_stage_peak", return_value=estimate):
+            candidates = scheduler._stage_candidates(0, 8 * 1024**2)
+
+        assert candidates
+        assert all(item.host_reserve_kb == estimate for item in candidates)
+        assert all(
+            cap_kb(item.host_reserve_kb) > item.host_reserve_kb for item in candidates
+        )
+
+    def test_gpu_admission_charges_the_reserve_under_the_allocator_ceiling(
+        self, tmp_path
+    ):
+        batch = make_batch(tmp_path, count=2, devices=[0])
+        scheduler = GpuScheduler(batch)
+        capacity_kb = 1024
+
+        with patch.object(scheduler, "_stage_peak", return_value=capacity_kb // 2):
+            candidates = scheduler._stage_candidates(0, capacity_kb)
+
+        assert candidates
+        assert all(item.gpu_reserve_kb == capacity_kb // 2 for item in candidates)
+        assert all(
+            item.gpu_cap_kb == capacity_kb // 2 * devices.CAPACITY_FACTOR
+            for item in candidates
+        )
+
+    def test_a_running_worker_is_charged_up_to_its_reservation(self, tmp_path):
+        batch = make_batch(tmp_path, count=1, devices=[0], delay=0)
+        scheduler = GpuScheduler(batch)
+        scheduler.workers["running"] = Mock(
+            started=0.0, peak_kb=0.0, resident_kb=0.0, host_reserve_kb=2 * 1024**2
+        )
+        host = HostMemory(64 * 1024**2, HOST_RESERVE_KB + 3 * 1024**2, 0, 0)
+
+        assert scheduler._admits(host, 1024**2)
+        assert not scheduler._admits(host, 2 * 1024**2)
 
     def test_known_stage_group_has_only_one_runnable_representative(self, tmp_path):
         path = tmp_path / "groups.yaml"
@@ -419,6 +470,10 @@ class TestGpuScheduling:
             plan = scheduler._launch_plan(memory, host)
 
         stages = [candidate.stage_index for candidate, _device in plan]
+        # One joint plan, not a barrier per Stage: both Stages share this tick.
+        assert set(stages) == {0, 1}
+        # The card holds 3000 MiB, so a third 1 MiB Stage 1 reservation does not
+        # fit and every remaining slot goes to the Stage that reserves none.
         assert stages.count(0) == 4
         assert stages.count(1) == 2
 
@@ -625,7 +680,7 @@ class TestGpuScheduling:
         batch = make_batch(tmp_path, count=4, devices=[0, 1], delay=0)
         scheduler = GpuScheduler(batch)
         scheduler.workers["running"] = Mock(
-            started=0.0, peak_kb=0.0, resident_kb=0.0, limit=None
+            started=0.0, peak_kb=0.0, resident_kb=0.0, host_reserve_kb=0.0, limit=None
         )
         launched = []
         with patch.object(

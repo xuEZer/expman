@@ -57,7 +57,9 @@ def test_eta_counts_only_unmaterialized_stage_parameter_groups(tmp_path):
     # Stage 1 still needs one representative for item=1 and item=2.
     assert estimate.lower_seconds == 40.0
     assert estimate.upper_seconds == 40.0
-    assert str(estimate) == "00:00:01"
+    # One measured sample per Stage leaves a degenerate interval; the two
+    # representatives then share the single available slot.
+    assert str(estimate) == "00:00:00～00:00:01"
     assert estimate.completed_samples == 2
     assert estimate.remaining_experiments == 2
     assert batch._scheduler is scheduler

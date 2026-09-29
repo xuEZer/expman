@@ -37,11 +37,15 @@ PEAK_QUANTILE = 0.9
 # A run stopped by its own cgroup cap comes back with this much more than the peak
 # it was seen to reach; the cap is recomputed from the raised estimate.
 PEAK_BUMP_MARGIN = 1.5
-# Cgroup memory limit written for one worker: the estimate plus room to grow, and
-# never below a floor that a Python interpreter with CUDA can start inside. Only
-# memory.max is set: memory.high would throttle an allocator that has nothing
-# reclaimable to give back (anonymous memory, swap disabled) and stall it instead
-# of ending the attempt.
+# A hard ceiling written for one worker: the estimate plus room to grow, and
+# never below a floor that a Python interpreter with CUDA can start inside. It is
+# the one place a conservative allowance is added. Admission reserves the bare
+# estimate, so this is what a single attempt may reach rather than capacity a
+# packed plan can spend twice: an attempt that uses it is retried from a raised
+# estimate. Charging the allowance at admission too would idle capacity that
+# packing could otherwise fill. Only memory.max is set: memory.high would
+# throttle an allocator that has nothing reclaimable to give back (anonymous
+# memory, swap disabled) and stall it instead of ending the attempt.
 CAPACITY_FACTOR = 1.10
 CAPACITY_FLOOR_KB = 512 * 1024
 # A worker whose peak came this close to its own limit was stopped by it.

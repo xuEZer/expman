@@ -12,8 +12,9 @@ from pathlib import Path
 from time import perf_counter, sleep
 
 from . import devices, limits
+from ._duration_model import DurationModel, StageDuration
 from ._memory_model import LocalQuantileEstimator, PeakCeiling
-from ._time_model import features
+from ._time_model import encode
 from .dependencies import declared_paths
 from .dependencies import observation as config_observation
 from .events import Status
@@ -43,11 +44,16 @@ class Worker:
     stage_index: int | None = 0
     stage_attempt: int = 1
     channel: Channel | None = None
-    # The PyTorch allocator ceiling this attempt actually runs under, or zero when
-    # it was started without one. Admission charges only the growth above what it
-    # has already reserved, so an attempt with no ceiling charges its own usage.
-    gpu_contract_kb: float = 0.0
-    expected_seconds: float | None = None
+    # The peak estimates admission charges this attempt for. Admission reserves
+    # these rather than the hard ceilings below, so a packed plan spends what
+    # attempts are expected to need and the ceilings stay an allowance on top.
+    host_reserve_kb: float = 0.0
+    gpu_reserve_kb: float = 0.0
+    # The device ceiling this attempt actually runs under, or zero when it was
+    # started without one. Admission charges only the growth above what it has
+    # already reserved, so an attempt with no ceiling charges its own usage.
+    gpu_cap_kb: float = 0.0
+    expected: StageDuration | None = None
     area: float = 0.0
     limit: object = None
     # Sampled every tick: resident is what the worker holds now, peak is the most
@@ -67,14 +73,14 @@ class Worker:
 
 @dataclass(frozen=True)
 class Candidate:
-    """One ready Stage with its resource contracts for this scheduling tick."""
+    """One ready Stage with its resource reservations for this scheduling tick."""
 
     run_id: str
     stage_index: int
-    host_estimate_kb: float
-    host_contract_kb: float
-    gpu_contract_kb: float
-    expected_seconds: float | None
+    host_reserve_kb: float
+    gpu_reserve_kb: float
+    gpu_cap_kb: float
+    expected: StageDuration | None
     novelty: float
 
 
@@ -240,7 +246,7 @@ class GpuScheduler:
                     value = None
                 projected[repr(path)] = value
             configs.append(projected)
-        return features(configs), {
+        return encode(configs), {
             experiment.run_id: index
             for index, experiment in enumerate(self.batch.experiments)
         }
@@ -250,9 +256,9 @@ class GpuScheduler:
         key = (stage_index, field)
         model = self._stage_peak_models.get(key)
         if model is None:
-            vectors, indices = self._stage_vectors(stage_index)
+            encoding, indices = self._stage_vectors(stage_index)
             model = LocalQuantileEstimator(
-                vectors,
+                encoding,
                 indices,
                 default,
                 include_zero=field == "gpu_peak_kb",
@@ -271,53 +277,40 @@ class GpuScheduler:
         return model.estimate(run_id)
 
     def _stage_duration(self, run_id, stage_index):
-        """Estimate one Stage duration from its completed dependency samples.
+        """Estimate one Stage duration interval from its dependency samples.
 
         Models are cached and invalidated only when a Stage result arrives.  Tick
         processing merely reads the latest model; it never treats elapsed running
-        time as a new sample.
+        time as a new sample.  A cancelled attempt measured only a lower bound, so
+        it widens the lower side of the interval and stays out of the center and
+        the upper side, where it would make the answer too tight.
         """
         model = self._stage_duration_models.get(stage_index)
         if model is None:
-            vectors, indices = self._stage_vectors(stage_index)
-            completed = []
-            censored = []
+            encoding, indices = self._stage_vectors(stage_index)
+            model = DurationModel(
+                encoding, indices, coverage=self.batch.estimate_coverage
+            )
+            measured = False
             for entry in self.batch._stage_history:
                 if entry.get("stage") != stage_index or entry.get("reused"):
                     continue
-                entry_run_id = entry.get("run_id")
-                row = indices.get(entry_run_id)
                 duration = entry.get("stage_duration_seconds")
-                if (
-                    row is None
-                    or not isinstance(duration, (int, float))
-                    or duration <= 0
-                ):
+                if not isinstance(duration, (int, float)) or duration <= 0:
                     continue
-                if entry.get("status") == Status.SUCCEEDED.value:
-                    completed.append((entry_run_id, duration))
-                elif entry.get("status") == Status.CANCELLED.value:
-                    censored.append((entry_run_id, duration))
-            if not completed:
+                status = entry.get("status")
+                if status == Status.SUCCEEDED.value:
+                    measured = True
+                    model.record(entry.get("run_id"), duration)
+                elif status == Status.CANCELLED.value:
+                    model.record(entry.get("run_id"), duration, censored=True)
+            if not measured:
                 self._stage_duration_models[stage_index] = False
                 return None
-            model = LocalQuantileEstimator(
-                vectors,
-                indices,
-                0.0,
-                quantile=self.batch.estimate_coverage,
-                # A cancelled duration is already a finite lower bound. Unlike
-                # a cgroup peak it does not need a resource retry bump.
-                margin=1.0,
-            )
-            for entry_run_id, duration in completed:
-                model.record(entry_run_id, duration)
-            for entry_run_id, duration in censored:
-                model.record(entry_run_id, duration, capped=True)
             self._stage_duration_models[stage_index] = model
         if model is False:
             return None
-        return model.estimate(run_id)
+        return model.predict(run_id)
 
     def _stage_measured(self, stage_index):
         """Whether this Stage has ever run here, so it has a peak to size from.
@@ -399,7 +392,8 @@ class GpuScheduler:
         run_ids = list(representatives.values())
         if not run_ids:
             return []
-        vectors, indices = self._stage_vectors(stage_index)
+        encoding, indices = self._stage_vectors(stage_index)
+        rows = encoding.rows
         sampled = [
             indices[entry["run_id"]]
             for entry in batch._stage_history
@@ -413,11 +407,11 @@ class GpuScheduler:
         def novelty(run_id):
             if not sampled:
                 return 1.0
-            row = vectors[indices[run_id]][1:]
+            row = rows[indices[run_id]][1:]
             return min(
                 sum(
                     (left - right) ** 2
-                    for left, right in zip(row, vectors[item][1:], strict=True)
+                    for left, right in zip(row, rows[item][1:], strict=True)
                 )
                 for item in sampled
             )
@@ -447,11 +441,8 @@ class GpuScheduler:
                     run_id,
                     stage_index,
                     host_estimate,
-                    limits.cap_kb(host_estimate),
-                    min(
-                        gpu_estimate * devices.CAPACITY_FACTOR,
-                        gpu_capacity_kb,
-                    ),
+                    min(gpu_estimate, gpu_capacity_kb),
+                    min(gpu_estimate * devices.CAPACITY_FACTOR, gpu_capacity_kb),
                     self._stage_duration(run_id, stage_index),
                     1.0 - rank / denominator,
                 )
@@ -484,7 +475,15 @@ class GpuScheduler:
                     "uuid": worker.uuid,
                     "concurrency": worker.area / max(now - worker.started, 1e-9),
                     "duration": max(0.0, now - worker.started),
-                    "expected_seconds": worker.expected_seconds,
+                    "expected_seconds": None
+                    if worker.expected is None
+                    else worker.expected.center,
+                    "expected_lower_seconds": None
+                    if worker.expected is None
+                    else worker.expected.lower,
+                    "expected_upper_seconds": None
+                    if worker.expected is None
+                    else worker.expected.upper,
                     "stage_index": worker.stage_index,
                     "resident_kb": worker.resident_kb,
                     "peak_kb": worker.peak_kb,
@@ -621,40 +620,37 @@ class GpuScheduler:
         """Whether one more attempt of expected_kb fits above the host reserve.
 
         Every running worker is charged for the gap between what it holds now and
-        the most it has been seen to need, so a launch cannot spend memory that
-        attempts already in flight are still going to ask for.
+        its reservation, so a launch cannot spend memory that attempts already in
+        flight are still going to ask for. Its cgroup ceiling sits above that
+        reservation: the ceiling ends an attempt that overshoots rather than being
+        capacity a plan may spend twice, and a worker seen to exceed its own
+        reservation is charged for the peak it reached.
         """
         needed = expected_kb
         for _run_id, worker in self.workers.items():
-            reach = max(
-                worker.peak_kb,
-                0.0 if worker.limit is None else worker.limit.cap_kb,
-            )
+            reach = max(worker.peak_kb, worker.host_reserve_kb)
             needed += max(0.0, reach - worker.resident_kb)
         return devices.fits_reserve(host, needed)
 
-    def _admits_gpu(self, memory, device, contract_kb):
+    def _admits_gpu(self, memory, device, reserve_kb):
         """Reserve only each worker's future PyTorch allocator growth."""
-        needed = contract_kb
+        needed = reserve_kb
         for worker in self.workers.values():
             if worker.device != device:
                 continue
-            needed += max(0.0, worker.gpu_contract_kb - (worker.gpu_reserved_kb or 0))
+            needed += max(0.0, worker.gpu_reserve_kb - (worker.gpu_reserved_kb or 0))
         return memory.free * 1024 >= needed
 
     def _resource_left(self, memory, host):
         """Capacity available after reserving every running worker's future growth."""
         host_left = host.headroom_kb
         for worker in self.workers.values():
-            reach = max(
-                worker.peak_kb,
-                0.0 if worker.limit is None else worker.limit.cap_kb,
-            )
+            reach = max(worker.peak_kb, worker.host_reserve_kb)
             host_left -= max(0.0, reach - worker.resident_kb)
         gpu_left = {}
         for device, observation in memory.items():
             gpu_left[device] = observation.free * 1024 - sum(
-                max(0.0, worker.gpu_contract_kb - (worker.gpu_reserved_kb or 0))
+                max(0.0, worker.gpu_reserve_kb - (worker.gpu_reserved_kb or 0))
                 for worker in self.workers.values()
                 if worker.device == device
             )
@@ -701,16 +697,16 @@ class GpuScheduler:
         for candidate in candidates:
             expanded = list(plans)
             for plan in plans:
-                if candidate.host_contract_kb > plan.host_left_kb:
+                if candidate.host_reserve_kb > plan.host_left_kb:
                     continue
                 for index, gpu_left in enumerate(plan.gpu_left_kb):
-                    if candidate.gpu_contract_kb > gpu_left:
+                    if candidate.gpu_reserve_kb > gpu_left:
                         continue
                     left = list(plan.gpu_left_kb)
-                    left[index] -= candidate.gpu_contract_kb
+                    left[index] -= candidate.gpu_reserve_kb
                     expanded.append(
                         Plan(
-                            plan.host_left_kb - candidate.host_contract_kb,
+                            plan.host_left_kb - candidate.host_reserve_kb,
                             tuple(left),
                             (*plan.placements, (candidate, devices_in_plan[index])),
                             plan.novelty + candidate.novelty,
@@ -821,12 +817,11 @@ class GpuScheduler:
             batch._queue.remove(candidate.run_id)
         run_id = candidate.run_id
         stage_index = candidate.stage_index
-        host_estimate = candidate.host_estimate_kb
-        host_contract = candidate.host_contract_kb
-        gpu_contract = candidate.gpu_contract_kb
-        duration_estimate = candidate.expected_seconds
-        gpu_fits = self._admits_gpu(memory, device, gpu_contract)
-        if not self._admits(host, host_contract) or not gpu_fits:
+        host_reserve = candidate.host_reserve_kb
+        gpu_reserve = candidate.gpu_reserve_kb
+        duration_estimate = candidate.expected
+        gpu_fits = self._admits_gpu(memory, device, gpu_reserve)
+        if not self._admits(host, host_reserve) or not gpu_fits:
             # Put the selection back at the front. Dispatching updated the
             # estimator's own state, and re-selecting the same run is idempotent,
             # so the queue keeps its remaining order while the host is short.
@@ -902,7 +897,7 @@ class GpuScheduler:
             cold_start = not self._stage_measured(stage_index)
             limit = limits.memory_limit(
                 f"expman-{run_id[:12]}-{stage_index}-{stage_attempt}",
-                host_estimate,
+                host_reserve,
                 cold_start=cold_start,
             )
             if limit.cgroup is not None:
@@ -921,7 +916,7 @@ class GpuScheduler:
             # host RAM; the estimate it would be capped from is the framework's own
             # cold-start default rather than an observation. Admission still
             # charges the estimate, and a cold Stage is the only attempt running.
-            applied_gpu_kb = 0.0 if cold_start else gpu_contract
+            applied_gpu_kb = 0.0 if cold_start else candidate.gpu_cap_kb
             if applied_gpu_kb > 0:
                 env["EXPMAN_GPU_LIMIT_KB"] = str(applied_gpu_kb)
             self._account()
@@ -961,8 +956,10 @@ class GpuScheduler:
                 stage_index=stage_index,
                 stage_attempt=stage_attempt,
                 channel=Channel(parent_socket),
-                gpu_contract_kb=applied_gpu_kb,
-                expected_seconds=duration_estimate,
+                host_reserve_kb=host_reserve,
+                gpu_reserve_kb=gpu_reserve,
+                gpu_cap_kb=applied_gpu_kb,
+                expected=duration_estimate,
                 limit=limit,
             )
             parent_socket = None
@@ -1039,8 +1036,8 @@ class GpuScheduler:
                 error_type="GpuMemoryLimit",
                 error_message=(
                     "attempt reached its PyTorch memory limit of "
-                    f"{worker.gpu_contract_kb / 1024:.0f} MiB"
-                    if worker.gpu_contract_kb > 0
+                    f"{worker.gpu_cap_kb / 1024:.0f} MiB"
+                    if worker.gpu_cap_kb > 0
                     else "attempt ran out of device memory without a limit"
                 ),
             )
@@ -1066,8 +1063,8 @@ class GpuScheduler:
                 "gpu_peak_kb": max(
                     worker.gpu_peak_reserved_kb or 0.0,
                     (
-                        max(worker.gpu_contract_kb, devices.GPU_PEAK_KB_DEFAULT)
-                        if gpu_capped and worker.gpu_contract_kb > 0
+                        max(worker.gpu_cap_kb, devices.GPU_PEAK_KB_DEFAULT)
+                        if gpu_capped and worker.gpu_cap_kb > 0
                         else 0.0
                     ),
                 ),

@@ -8,8 +8,10 @@ import unicodedata
 from numbers import Real
 from threading import Event, Thread
 
+from .estimation import UNKNOWN_CLOCK
+
 _logger = logging.getLogger(__name__)
-_UNKNOWN = "??:??:??～??:??:??"
+_UNKNOWN = UNKNOWN_CLOCK
 
 
 class BatchProgress:

@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass
 from numbers import Real
 
+UNKNOWN_CLOCK = "??:??:??～??:??:??"
+
 
 def validate_coverage(value: object) -> float:
     """A coverage setting is a finite number strictly between 0 and 1."""
@@ -26,7 +28,15 @@ def _clock(seconds: float | None, *, upper: bool) -> str:
 
 @dataclass(frozen=True)
 class TimeEstimate:
-    """A model-based central prediction interval, not a calibrated guarantee."""
+    """A remaining-time interval, rendered as ``DD:HH:MM～DD:HH:MM``.
+
+    Both endpoints are required for a displayable estimate; ``coverage`` is the
+    side mass the residuals were calibrated to, so each side carries half of the
+    missing mass. It stays nominal rather than guaranteed: Stage samples are not
+    exchangeable across a growing schedule, a censored sample only bounds one
+    side, and the concurrency packing that combines Stages treats their
+    durations as independent.
+    """
 
     lower_seconds: float | None
     upper_seconds: float | None
@@ -35,4 +45,7 @@ class TimeEstimate:
     remaining_experiments: int
 
     def __str__(self) -> str:
-        return _clock(self.upper_seconds, upper=True)
+        return (
+            f"{_clock(self.lower_seconds, upper=False)}"
+            f"～{_clock(self.upper_seconds, upper=True)}"
+        )
