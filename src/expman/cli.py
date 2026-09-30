@@ -5,33 +5,32 @@ in the Batch manifest, so ``expman resume`` can rebuild it without the user
 repeating it. Every batch directory under ``runs/`` gets a small integer ID
 recorded in ``runs/.batches.json``: ``expman status`` without arguments keeps
 redrawing a live overview of all of them until Ctrl+C, and the same ID is a
-shortcut for ``expman stop`` and ``expman resume``. Retry counts and interval
-coverage are process-wide settings configured in code with ``expman.set(...)``
-next to the Pipeline, not command-line flags.
+shortcut for ``expman stop`` and ``expman resume``. ``expman web`` serves a
+dashboard over the same IDs from its own process, independent of any batch
+it watches. Retry counts and interval coverage are process-wide settings
+configured in code with ``expman.set(...)`` next to the Pipeline, not
+command-line flags.
 """
 
 import argparse
 import importlib
-import json
 import os
 import signal
 import sys
 from contextlib import suppress
 from pathlib import Path
-from time import sleep, time
+from time import sleep
 
 from . import settings
 from .batch import Batch
 from .estimation import TimeEstimate
 from .pipeline import Pipeline
+from .registry import RUNS_DIR, ensure_ids
 from .stage import Stage
 from .storage import PickleSerializer, StorageError, read_record
-from .webui import DEFAULT_PORT
+from .webui import DEFAULT_PORT, serve
 
 _PID_FILE = "expman.pid"
-_WEBUI_FILE = ".webui.json"
-_RUNS_DIR = Path("runs")
-_REGISTRY_NAME = ".batches.json"
 _STATUS_INTERVAL = 2.0
 
 
@@ -86,73 +85,18 @@ def _default_output_dir(spec: str, config: str) -> Path:
     attr = spec.rpartition(":")[2] or "batch"
     stem = Path(config).stem or "cfg"
     base = f"{attr}_{stem}"
-    candidate = _RUNS_DIR / base
+    candidate = RUNS_DIR / base
     suffix = 2
     while candidate.exists():
-        candidate = _RUNS_DIR / f"{base}_{suffix}"
+        candidate = RUNS_DIR / f"{base}_{suffix}"
         suffix += 1
     return candidate
-
-
-def _load_registry() -> dict:
-    """Read the ID registry, tolerating a missing or damaged file."""
-    try:
-        data = json.loads((_RUNS_DIR / _REGISTRY_NAME).read_text())
-    except (OSError, ValueError):
-        return {"next_id": 0, "batches": {}}
-    if not isinstance(data, dict) or not isinstance(data.get("batches"), dict):
-        return {"next_id": 0, "batches": {}}
-    if not isinstance(data.get("next_id"), int):
-        data["next_id"] = len(data["batches"])
-    return data
-
-
-def _save_registry(registry: dict) -> None:
-    _RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    (_RUNS_DIR / _REGISTRY_NAME).write_text(json.dumps(registry, indent=2))
-
-
-def _is_batch_dir(path: Path) -> bool:
-    return path.is_dir() and (path / "batch.pkl").exists()
-
-
-def _scan_runs(registry: dict) -> bool:
-    """Register unregistered runs/ batches, oldest first; True if changed."""
-    try:
-        root = _RUNS_DIR.resolve()
-        candidates = sorted(
-            (path for path in root.iterdir() if _is_batch_dir(path)),
-            key=lambda path: path.stat().st_mtime,
-        )
-    except OSError:
-        return False
-    known = set(registry["batches"].values())
-    changed = False
-    for path in candidates:
-        if path.name not in known:
-            registry["batches"][str(registry["next_id"])] = path.name
-            registry["next_id"] += 1
-            changed = True
-    return changed
-
-
-def _ensure_ids() -> dict[int, Path]:
-    """Assign stable IDs to runs/ batches; return the ID -> directory map."""
-    registry = _load_registry()
-    if _scan_runs(registry):
-        _save_registry(registry)
-    root = _RUNS_DIR.resolve()
-    return {
-        int(batch_id): root / name
-        for batch_id, name in registry["batches"].items()
-        if (root / name).is_dir()
-    }
 
 
 def _resolve_directory(token: str) -> Path:
     """Interpret the argument as a batch ID (``0``, ``1``, ...) or a path."""
     if token.isdigit():
-        ids = _ensure_ids()
+        ids = ensure_ids()
         directory = ids.get(int(token))
         if directory is None:
             known = ", ".join(str(i) for i in sorted(ids)) or "none"
@@ -204,61 +148,6 @@ def _read_timing(directory: Path) -> tuple[str, str]:
     return elapsed, remaining
 
 
-def _start_dashboard(batch: Batch, args: argparse.Namespace) -> str | None:
-    """Start the loopback dashboard; a dashboard problem never fails a Batch."""
-    if not args.web:
-        return None
-    if not 0 <= args.web_port <= 65535:
-        raise SystemExit("--web-port must be between 0 and 65535")
-    from .webui import serve
-
-    try:
-        dashboard = serve(
-            batch, host=args.web_host, port=args.web_port, allow_stop=True
-        )
-    except (OSError, ValueError) as error:
-        print(f"dashboard not started: {error}", file=sys.stderr)
-        return None
-    print(f"Dashboard: {dashboard.url}", flush=True)
-    try:
-        (batch.output_dir / _WEBUI_FILE).write_text(
-            json.dumps(
-                {"url": dashboard.url, "pid": os.getpid(), "started_at": time()},
-                indent=2,
-            )
-        )
-    except OSError as error:
-        print(f"could not record the dashboard URL: {error}", file=sys.stderr)
-    return dashboard.url
-
-
-def _forget_dashboard(batch: Batch) -> None:
-    with suppress(OSError):
-        (batch.output_dir / _WEBUI_FILE).unlink()
-
-
-def _read_dashboard(directory: Path) -> str | None:
-    """The dashboard URL a Batch process recorded, if it wrote one."""
-    try:
-        data = json.loads((directory / _WEBUI_FILE).read_text())
-    except (OSError, ValueError):
-        return None
-    url = data.get("url") if isinstance(data, dict) else None
-    return url if isinstance(url, str) and url else None
-
-
-def _run_with_dashboard(
-    batch: Batch, args: argparse.Namespace, *, progress: bool, resume_command: str
-) -> int:
-    """Run the Batch, serving its dashboard for as long as the process lives."""
-    url = _start_dashboard(batch, args)
-    try:
-        return _execute(batch, progress=progress, resume_command=resume_command)
-    finally:
-        if url is not None:
-            _forget_dashboard(batch)
-
-
 def _execute(batch: Batch, *, progress: bool, resume_command: str) -> int:
     """Run the batch; a stop signal maps to a resume hint and exit 143."""
     print(f"Batch directory: {batch.output_dir}", flush=True)
@@ -299,14 +188,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         output_dir=output_dir,
         _pipeline_spec={"module": module_name, "attr": attr_name},
     )
-    ids = _ensure_ids()
+    ids = ensure_ids()
     batch_id = next(
         (i for i, directory in ids.items() if directory == batch.output_dir), None
     )
     display = str(batch_id) if batch_id is not None else str(batch.output_dir)
-    return _run_with_dashboard(
+    return _execute(
         batch,
-        args,
         progress=args.progress,
         resume_command=f"expman resume {display}",
     )
@@ -327,9 +215,8 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         )
     pipeline = _resolve_pipeline(f"{spec['module']}:{spec['attr']}")
     batch = Batch.resume(pipeline, directory)
-    return _run_with_dashboard(
+    return _execute(
         batch,
-        args,
         progress=args.progress,
         resume_command=f"expman resume {args.directory}",
     )
@@ -369,15 +256,14 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(f"  {run_id}  {state:<10} {position}  attempts: {history or 'none'}")
     elapsed, remaining = _read_timing(directory)
     print(f"elapsed: {elapsed} | remaining: {remaining}")
-    url = _read_dashboard(directory)
-    if url is not None:
-        print(f"dashboard: {url}")
+    if args.directory.isdigit():
+        print(f"detail page: `expman web`, then /b/{args.directory}")
     return 0
 
 
 def _overview_line(batch_id: int, directory: Path) -> str:
     """One summary line of the runs/ overview, tolerating live rewriting."""
-    name = str(_RUNS_DIR / directory.name)
+    name = str(RUNS_DIR / directory.name)
     try:
         manifest = read_record(directory / "batch.pkl", PickleSerializer())
     except (StorageError, OSError):
@@ -424,9 +310,9 @@ def _overview_line(batch_id: int, directory: Path) -> str:
 
 
 def _print_overview() -> None:
-    ids = _ensure_ids()
+    ids = ensure_ids()
     print(
-        f"batches under {_RUNS_DIR}/"
+        f"batches under {RUNS_DIR}/"
         f" (refreshing every {_STATUS_INTERVAL:g}s; Ctrl+C to exit)"
     )
     if not ids:
@@ -476,6 +362,28 @@ def _cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_web(args: argparse.Namespace) -> int:
+    """Serve the run dashboard until Ctrl+C; it never runs an experiment.
+
+    The dashboard is its own process on purpose: it outlives every batch it
+    watches, and batches started later show up without restarting it.
+    """
+    root = None if args.root is None else Path(args.root)
+    try:
+        dashboard = serve(
+            root, host=args.host, port=args.port, allow_stop=not args.read_only
+        )
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"could not start the dashboard: {error}") from None
+    print(f"Dashboard: {dashboard.url}", flush=True)
+    print("Watching the batches under the runs directory; Ctrl+C to stop.", flush=True)
+    try:
+        dashboard.wait()
+    finally:
+        dashboard.close()
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="expman", description="Run and manage expman experiment Batches."
@@ -499,24 +407,35 @@ def _parser() -> argparse.ArgumentParser:
             action="store_true",
             help="show live progress while running (off by default)",
         )
-        command.add_argument(
-            "--web",
-            action="store_true",
-            help="serve a read-only dashboard on loopback for this batch",
-        )
-        command.add_argument(
-            "--web-port",
-            type=int,
-            default=DEFAULT_PORT,
-            help="dashboard port (default: 8765; 0 picks a free one)",
-        )
-        command.add_argument(
-            "--web-host",
-            default="127.0.0.1",
-            help="dashboard bind address (default: loopback only)",
-        )
     run.set_defaults(handler=_cmd_run)
     resume.set_defaults(handler=_cmd_resume)
+
+    web = commands.add_parser(
+        "web",
+        help="serve a read-only dashboard for every batch under runs/",
+    )
+    web.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help="dashboard port (default: 8765; 0 picks a free one)",
+    )
+    web.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="dashboard bind address (default: loopback only)",
+    )
+    web.add_argument(
+        "--root",
+        default=None,
+        help="directory holding the batches (default: runs/)",
+    )
+    web.add_argument(
+        "--read-only",
+        action="store_true",
+        help="refuse stop requests and hide the stop button",
+    )
+    web.set_defaults(handler=_cmd_web)
 
     status = commands.add_parser(
         "status",

@@ -1,5 +1,11 @@
 "use strict";
 
+const PAGE = document.body.dataset.page === "batch" ? "batch" : "list";
+const BATCH_ID = (() => {
+  const match = location.pathname.match(/^\/b\/(\d+)\/?$/);
+  return match ? Number(match[1]) : null;
+})();
+
 const state = {
   snapshot: null,
   paused: false,
@@ -10,7 +16,14 @@ const state = {
 };
 
 const KIND = { launch: "启动", finish: "结束", reuse: "复用", shed: "撤销", probe: "探测" };
-const STATE_TEXT = { running: "运行中", pending: "排队中", succeeded: "已完成", failed: "有失败", cancelled: "已停止" };
+const STATUS_TEXT = { running: "运行中", stopped: "已停止", finished: "已完成", failed: "有失败" };
+const STATUS_CLASS = { running: "ok", stopped: "warn", finished: "", failed: "bad" };
+const SOURCE_TEXT = {
+  live: "实时",
+  last: "停止前最后一次采样",
+  archive: "持久化记录",
+  missing: "记录不可读",
+};
 
 const app = document.getElementById("app");
 
@@ -43,23 +56,33 @@ function bar(segments, envelope, cap, cls) {
   const mark = ok(cap) ? '<span class="cap" style="left:' + clamp(cap) + '%"></span>' : "";
   return '<div class="track ' + (cls || "") + '">' + fills + box + mark + "</div>";
 }
+function pill(status) {
+  return '<span class="pill ' + (STATUS_CLASS[status] || "") + '">' + esc(STATUS_TEXT[status] || status || "") + "</span>";
+}
+function section(title, hint, body) {
+  return '<h2 class="section">' + esc(title) +
+    (hint ? '<span class="hint">' + esc(hint) + "</span>" : "") + "</h2>" + body;
+}
+function unavailable(title, message) {
+  return section(title, "", '<div class="card empty">' + esc(message) + "</div>");
+}
 
 function notices(s) {
   const parts = [];
-  if (s.degraded) parts.push('<div class="notice">快照降级：' + esc(s.degraded) + "</div>");
+  if (s.degraded) parts.push('<div class="notice">看板降级：' + esc(s.degraded) + "</div>");
   if (!state.connected) parts.push('<div class="notice warn">与看板的连接已断开，正在重连…</div>');
   const age = Date.now() / 1000 - (s.generated_at || 0);
-  if (state.connected && age > 5) parts.push('<div class="notice warn">数据已 ' + Math.round(age) + " 秒未更新</div>");
+  if (state.connected && age > 5) parts.push('<div class="notice warn">看板数据已 ' + Math.round(age) + " 秒未刷新</div>");
   return parts.join("");
 }
 
-function top(s) {
-  const b = s.batch || {};
-  const counts = b.counts || {};
-  const running = (s.workers || []).length;
-  const key = running ? "running" : counts.pending ? "pending" : "succeeded";
-  const pillClass = key === "running" ? "ok" : key === "pending" ? "warn" : "";
-  const estimate = (s.schedule || {}).estimate;
+function connectionPill() {
+  return state.connected
+    ? '<span class="pill ok"><span class="dot pulse"></span>实时</span>'
+    : '<span class="pill bad"><span class="dot" style="background:var(--danger)"></span>已断开</span>';
+}
+
+function controls() {
   const buttons = [
     '<button data-act="pause">' + (state.paused ? "继续" : "暂停") + "</button>",
     '<select data-act="throttle">' +
@@ -67,16 +90,79 @@ function top(s) {
     "</select>",
     '<button data-act="theme">' + (document.documentElement.dataset.theme === "dark" ? "亮色" : "暗色") + "</button>",
   ];
-  if (state.stopAllowed) buttons.push('<button class="danger" data-act="stop">停止实验</button>');
-  const connection = state.connected
-    ? '<span class="pill ok"><span class="dot pulse"></span>实时</span>'
-    : '<span class="pill bad"><span class="dot" style="background:var(--danger)"></span>已断开</span>';
+  return buttons.join("");
+}
+
+function sourceNote(s) {
+  if (!s || s.source === "live") return "";
+  const when = ok(s.age_seconds) ? "（" + compact(s.age_seconds) + " 前）" : "";
+  return '<div class="notice warn">该批次未在运行 —— 以下为' +
+    esc(SOURCE_TEXT[s.source] || "持久化记录") + when + "；内存、显存与调度计划等实时面板不可用。</div>";
+}
+
+/* ---------------------------------------------------------------- list page */
+
+function batchRow(b) {
+  const counts = b.counts || {};
+  const total = b.experiments || 0;
+  const done = counts.succeeded || 0;
+  const failed = counts.failed || 0;
+  const running = counts.running || 0;
+  const segments = [
+    { from: 0, size: pctOf(done, total), color: "var(--done)" },
+    { from: pctOf(done, total), size: pctOf(failed, total), color: "var(--danger)" },
+    { from: pctOf(done + failed, total), size: pctOf(running, total), color: "var(--running)" },
+  ];
+  const remaining = b.remaining || {};
+  const remainingText = ok(remaining.lower_seconds) && ok(remaining.upper_seconds)
+    ? compact(remaining.lower_seconds) + "～" + compact(remaining.upper_seconds)
+    : "–";
+  const fresh = ok(b.age_seconds) ? (b.age_seconds < 3 ? "刚刚" : compact(b.age_seconds) + "前") : "–";
+  return '<div class="row batch-row">' +
+    '<span class="mono muted">' + esc(b.id) + "</span>" +
+    '<a class="name" href="/b/' + esc(b.id) + '/">' + esc(b.name || "batch") + "</a>" +
+    pill(b.status) +
+    '<span class="mono faint">' + esc(SOURCE_TEXT[b.source] || b.source || "") + "</span>" +
+    "<div>" + bar(segments, null, null, "thin") + "</div>" +
+    '<span class="mono" style="text-align:right">' + running + " / " + (counts.pending || 0) + "</span>" +
+    '<span class="mono" style="text-align:right">' + secs(b.elapsed_seconds) + "</span>" +
+    '<span class="mono" style="text-align:right">' + remainingText + "</span>" +
+    '<span class="mono faint" style="text-align:right">' + fresh + "</span>" +
+    "</div>";
+}
+
+function renderList(s) {
+  const batches = s.batches || [];
+  const head = '<div class="row batch-row head-row">' +
+    ["ID", "批次", "状态", "数据来源", "进度", "运行/排队", "已运行", "预计剩余", "更新"]
+      .map((t) => "<span>" + t + "</span>").join("") + "</div>";
+  let html = notices(s);
+  html += '<div class="top"><span class="title">expman 运行看板</span>' +
+    '<span class="pill mono">runs/ · ' + batches.length + " 个批次</span>" +
+    '<span class="spacer"></span>' + controls() + connectionPill() + "</div>";
+  if (!batches.length) {
+    html += '<div class="card empty">runs/ 下还没有批次。用 expman run 启动一个再回来看。</div>';
+  } else {
+    html += '<div class="card rows scroll-x">' + head + batches.map(batchRow).join("") + "</div>";
+    html += '<div class="legend">点批次名进入详情 · 状态由 PID 记录与实时快照一起判定 · 「实时」表示该批次正在发布每秒快照</div>';
+  }
+  app.innerHTML = html;
+  wire();
+}
+
+/* -------------------------------------------------------------- detail page */
+
+function topBar(s, detail) {
+  const name = detail ? (detail.batch || {}).name || "batch" : "批次 " + BATCH_ID;
+  const buttons = controls();
+  const stopButton = detail && detail.running && state.stopAllowed
+    ? '<button class="danger" data-act="stop">停止实验</button>' : "";
   return '<div class="top">' +
-    '<span class="title">' + esc(b.name || "batch") + "</span>" +
-    '<span class="pill mono">' + esc(b.dir || "") + "</span>" +
-    '<span class="pill ' + pillClass + '">' + (STATE_TEXT[key] || key) + "</span>" +
-    '<span class="pill mono">等价组 ' + esc(estimate ? estimate.groups : "–") + "</span>" +
-    '<span class="spacer"></span>' + buttons.join("") + connection + "</div>";
+    '<a class="pill" href="/">← 全部批次</a>' +
+    '<span class="title">' + esc(name) + "</span>" +
+    (detail ? pill(detail.status) : "") +
+    (detail ? '<span class="pill mono">' + esc(SOURCE_TEXT[detail.source] || "") + "</span>" : "") +
+    '<span class="spacer"></span>' + buttons + stopButton + connectionPill() + "</div>";
 }
 
 function tiles(s) {
@@ -85,16 +171,19 @@ function tiles(s) {
   const remaining = b.remaining || {};
   const host = (s.resources || {}).host || {};
   const gate = (s.schedule || {}).gate;
+  const live = s.source === "live";
   const coverage = ok(remaining.coverage) ? Math.round(remaining.coverage * 100) + "%" : "–";
   const spanText = ok(remaining.lower_seconds) && ok(remaining.upper_seconds)
     ? secs(remaining.lower_seconds) + "～" + secs(remaining.upper_seconds) : "??:??:??";
   const tight = host.tight ? "主机内存紧张" : gate === "open" ? "可接纳" : "等待内存";
   return '<div class="grid tiles">' + [
-    tile("已运行", secs(b.elapsed_seconds), "共 " + esc(b.experiments) + " 个配置"),
+    tile("已运行", secs(b.elapsed_seconds), "共 " + esc(b.experiments) + " 个配置 · " + esc(b.stages) + " 个阶段"),
     tile("预计剩余", spanText, "覆盖 " + coverage + " · 样本 " + esc(remaining.samples)),
     tile("运行 / 排队", (counts.running || 0) + " / " + (counts.pending || 0),
       "成功 " + (counts.succeeded || 0) + " · 失败 " + (counts.failed || 0) + " · 停止 " + (counts.cancelled || 0)),
-    tile("调度门闸", gate === "open" ? "开放" : "关闭", tight + " · 排队 " + esc((s.schedule || {}).pending_runs) + " 个"),
+    live
+      ? tile("调度门闸", gate === "open" ? "开放" : "关闭", tight + " · 排队 " + esc((s.schedule || {}).pending_runs) + " 个")
+      : tile("调度门闸", "–", "批次未在运行，无实时准入数据"),
   ].join("") + "</div>";
 }
 
@@ -106,27 +195,29 @@ function tile(label, value, hint) {
 function stages(s) {
   const list = s.stages || [];
   if (!list.length) return "";
+  const live = s.source === "live";
   const running = (s.schedule || {}).running_by_stage || {};
+  const approximate = !live;
   const cards = list.map((stage) => {
     const known = stage.known !== false;
     const total = stage.groups_total || 0;
     const done = stage.groups_done || 0;
     const remaining = known ? Math.max(0, total - done) : null;
-    const live = known ? Math.min(remaining, running[stage.index] || running[String(stage.index)] || 0) : 0;
+    const liveCount = known && live ? Math.min(remaining, running[stage.index] || running[String(stage.index)] || 0) : 0;
     const samples = stage.samples || {};
     const width = (value) => pctOf(value, total);
     const segments = [
       { from: 0, size: width(done), color: "var(--done)" },
-      { from: width(done), size: width(live), color: "var(--running)" },
+      { from: width(done), size: width(liveCount), color: "var(--running)" },
     ];
     const unit = ok(stage.unit_lower_seconds) && ok(stage.unit_upper_seconds)
       ? compact(stage.unit_lower_seconds) + "～" + compact(stage.unit_upper_seconds)
-      : "估计中";
+      : live ? "估计中" : "需要实时样本";
     const serial = ok(stage.unit_lower_seconds) && ok(stage.unit_upper_seconds) && remaining
       ? compact(remaining * stage.unit_lower_seconds) + "～" + compact(remaining * stage.unit_upper_seconds)
       : "–";
     const count = remaining === null ? "–" : remaining;
-    const subtitle = known ? "剩余组　共 " + total + " 组" : "等待调度器启动";
+    const subtitle = known ? (approximate ? "剩余 run　共 " + total + " 个 run" : "剩余组　共 " + total + " 组") : "等待调度器启动";
     return '<div class="card">' +
       '<div class="stage-head"><span class="stage-name">' + esc(stage.name || "Stage") + '</span><span class="faint mono">S' + esc(stage.index) + "</span></div>" +
       '<div style="margin-top:8px">' + bar(segments, null, null) + "</div>" +
@@ -136,8 +227,10 @@ function stages(s) {
       '<div class="stage-meta mono">样本 ' + (samples.measured || 0) + " 实测 · " + (samples.reused || 0) + " 复用 · " + (samples.censored || 0) + " 截断</div>" +
       "</div>";
   });
-  return '<h2 class="section">各阶段剩余<span class="hint">实心 = 已完成 · 琥珀 = 运行中 · 底轨 = 待执行 · 串行合计不含并行加速</span></h2>' +
-    '<div class="grid stages">' + cards.join("") + "</div>";
+  const hint = live
+    ? "实心 = 已完成 · 琥珀 = 运行中 · 底轨 = 待执行 · 串行合计不含并行加速"
+    : "来自持久化记录 · 组数按已到达该阶段的 run 统计 · 单组耗时需要实时样本";
+  return section("各阶段剩余", hint, '<div class="grid stages">' + cards.join("") + "</div>");
 }
 
 function workers(s) {
@@ -182,9 +275,9 @@ function resources(s) {
   const r = s.resources || {};
   const rows = (r.devices || []).map(deviceRow);
   rows.push(hostRow(r.host || {}));
-  return '<h2 class="section">资源：分配 vs 实际<span class="hint">悬停无用，数值见下方明细</span></h2>' +
+  return section("资源：分配 vs 实际", "实心 = 实际 · 虚线 = 分配 · 红线 = 硬上限",
     '<div class="card">' + rows.join("") +
-    '<div class="legend">实心 = 实际占用 · 虚线框 = 调度分配（保留） · 红线 = 该尝试硬上限 · 右列 = 扣掉运行中尝试未来增长后可再接纳的量</div></div>';
+    '<div class="legend">实心 = 实际占用 · 虚线框 = 调度分配（保留） · 红线 = 该尝试硬上限 · 右列 = 扣掉运行中尝试未来增长后可再接纳的量</div></div>');
 }
 
 function deviceRow(card) {
@@ -225,20 +318,20 @@ function hostRow(host) {
 
 function plan(s) {
   const schedule = s.schedule || {};
-  const plan = schedule.plan;
+  const current = schedule.plan;
   const estimate = schedule.estimate;
-  const header = '<h2 class="section">本 tick 准入计划<span class="hint">' +
-    (estimate && ok(estimate.makespan && estimate.makespan.lower_seconds)
+  const header = section("本 tick 准入计划",
+    estimate && ok(estimate.makespan && estimate.makespan.lower_seconds)
       ? "预计完工 " + span(estimate.makespan.lower_seconds, estimate.makespan.upper_seconds)
-      : "尚无完工估计") + "</span></h2>";
+      : "尚无完工估计", "");
   const slots = Object.keys((estimate && estimate.device_slots) || {})
     .map((device) => "GPU" + device + "×" + estimate.device_slots[device]).join(" ");
   const summary = schedule.estimate === null
     ? "尚未产生调度估计"
-    : "就绪候选 " + esc(plan ? plan.ready : "–") + " · 采纳 " + esc(plan ? (plan.launched || []).length : 0) +
-      " · 剩余预算 host " + gib((plan && plan.capacity && plan.capacity.host_left_kb)) + " GiB" +
+    : "就绪候选 " + esc(current ? current.ready : "–") + " · 采纳 " + esc(current ? (current.launched || []).length : 0) +
+      " · 剩余预算 host " + gib((current && current.capacity && current.capacity.host_left_kb)) + " GiB" +
       (slots ? " · 并行位 " + slots : "");
-  const rows = plan && plan.placements ? plan.placements.map((item) =>
+  const rows = current && current.placements ? current.placements.map((item) =>
     '<div class="row" style="grid-template-columns:62px 80px 56px minmax(0,1fr) 84px">' +
       '<span class="mono">' + esc(String(item.run_id || "").slice(0, 6)) + "</span>" +
       "<span>" + esc(item.stage || "") + "</span>" +
@@ -251,7 +344,7 @@ function plan(s) {
 
 function events(s) {
   const items = (s.events || []).slice().reverse();
-  const header = '<h2 class="section">调度事件<span class="hint">最近 ' + items.length + " 条</span></h2>";
+  const header = section("调度事件", "最近 " + items.length + " 条", "");
   if (!items.length) return header + '<div class="card empty">暂无事件</div>';
   return header + '<div class="card events">' + items.map((e) => {
     const time = ok(e.at) ? new Date(e.at * 1000).toLocaleTimeString("zh-CN", { hour12: false }) : "??:??:??";
@@ -263,6 +356,31 @@ function events(s) {
   }).join("") + "</div>";
 }
 
+function renderBatch(s) {
+  const detail = s.batch;
+  let html = notices(s) + topBar(s, detail);
+  if (!detail) {
+    html += '<div class="card empty">批次 ' + esc(BATCH_ID) + " 不存在，或已被移出 runs/。</div>";
+    app.innerHTML = html;
+    wire();
+    return;
+  }
+  const live = detail.source === "live";
+  html += sourceNote(detail);
+  html += tiles(detail) + stages(detail);
+  html += '<div class="cols"><div>' +
+      section("运行中的尝试", (detail.workers || []).length + " 个 worker", live ? workers(detail) : '<div class="card empty">没有实时 worker 数据</div>') +
+    "</div><div>" +
+      (live ? resources(detail) : unavailable("资源：分配 vs 实际", "没有实时采样")) +
+    "</div></div>";
+  html += '<div class="cols">' +
+      (live ? plan(detail) : unavailable("本 tick 准入计划", "没有实时调度数据")) +
+      (live ? events(detail) : unavailable("调度事件", "没有实时事件")) +
+    "</div>";
+  app.innerHTML = html;
+  wire();
+}
+
 function render(force) {
   if (state.paused && !force) return;
   const now = Date.now();
@@ -270,12 +388,7 @@ function render(force) {
   state.lastPaint = now;
   const s = state.snapshot;
   if (!s) { app.innerHTML = '<p class="muted pad">等待第一个快照…</p>'; return; }
-  app.innerHTML = notices(s) + top(s) + (s.degraded ? "" : tiles(s) + stages(s) +
-    '<div class="cols"><div>' +
-      '<h2 class="section">运行中的尝试<span class="hint">' + (s.workers || []).length + " 个 worker</span></h2>" + workers(s) +
-    "</div><div>" + resources(s) + "</div></div>" +
-    '<div class="cols">' + plan(s) + events(s) + "</div>");
-  wire();
+  if (PAGE === "list") renderList(s); else renderBatch(s);
 }
 
 function wire() {
@@ -289,14 +402,15 @@ function wire() {
       render(true);
     };
     if (act === "stop") node.onclick = () => {
-      if (!window.confirm("停止正在运行的实验？已完成的阶段会保留，可以之后 resume。")) return;
-      fetch("/api/stop", { method: "POST" }).then(() => setTimeout(() => location.reload(), 1500));
+      if (!window.confirm("停止批次 " + BATCH_ID + " 正在运行的实验？已完成的阶段会保留，可以之后 resume。")) return;
+      fetch("/api/stop/" + BATCH_ID, { method: "POST" }).then(() => setTimeout(() => location.reload(), 1500));
     };
   });
 }
 
 function connect() {
-  const source = new EventSource("/api/stream");
+  const url = PAGE === "batch" && BATCH_ID !== null ? "/api/stream?batch=" + BATCH_ID : "/api/stream";
+  const source = new EventSource(url);
   source.onopen = () => { state.connected = true; render(); };
   source.onerror = () => { state.connected = false; render(); };
   source.onmessage = (message) => {
@@ -305,6 +419,8 @@ function connect() {
     render();
   };
 }
+
+document.title = PAGE === "batch" ? "expman 看板 · 批次 " + BATCH_ID : "expman 运行看板";
 
 fetch("/api/health").then((response) => response.json()).then((health) => {
   state.stopAllowed = Boolean(health.stop);

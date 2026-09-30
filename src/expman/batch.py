@@ -499,6 +499,7 @@ class Batch:
                 daemon=True,
             )
             timing_thread.start()
+            live = self._start_live()
             try:
                 display.start()
                 from .scheduling import GpuScheduler
@@ -525,3 +526,27 @@ class Batch:
                         RecoveryWarning,
                         stacklevel=2,
                     )
+                if live is not None:
+                    live.close()
+
+    def _start_live(self):
+        """Publish live state for the dashboard; never fail the Batch for it.
+
+        The dashboard is a separate process that cannot read this process's
+        memory, so the snapshot is written here.  It is an observation channel
+        only: a dashboard that nobody started must cost the experiment
+        nothing, so any failure to set it up is reported and dropped.
+        """
+        from .webui.live import LivePublisher, live_enabled
+
+        if not live_enabled():
+            return None
+        try:
+            return LivePublisher(self).start()
+        except Exception as error:
+            warnings.warn(
+                f"could not publish live dashboard state: {error}",
+                RecoveryWarning,
+                stacklevel=2,
+            )
+            return None

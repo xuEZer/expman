@@ -416,12 +416,16 @@ GPU 派发按 Stage 的异质配置距离生成候选，再联合主机内存和
 
 ## 运行看板（WebUI）
 
-看板是调度器的被动观察者，以进程内旁路的方式随 `run` / `resume --web` 启动：一个回环 HTTP 服务器把只读快照经 Server-Sent Events 推给浏览器，静态页面与脚本由标准库交付、不引用外网资源。接入看板不需要新增依赖，也不改变 `Batch` 的公开接口。
+看板是一个**独立进程**（`expman web`），不与任何实验进程耦合：它在回环地址上起一个 HTTP + Server-Sent Events 服务，启动即扫描 `runs/` 下的全部批次，可先于或晚于实验启动，实验结束后继续服务。静态页面与脚本由标准库交付、不引用外网资源；接入看板不需要新增依赖，也不改变 `Batch` 的公开接口。
 
-**只读与单写者。** 看板只在 `batch._state_lock` 下拷贝调度器已发布的状态（队列、活动表、阶段历史、设备与主机内存读数、`_schedule_view`、`last_plan`、事件环形缓冲），其余派生计算全部在锁外对这些副本进行。它绝不调用会懒建模型、记录样本或改动准入的内部入口（`_launch_plan` / `_stage_peak` / `_stage_duration`），因此打开的页面不会改变调度决策。`build_snapshot` 整体包裹：呈现层抛出的任何异常都降级为一条 `degraded` 负载继续推送，不会回到实验。测试用 `test_a_snapshot_never_fits_a_model` 固化「快照不训练模型」这一约束。
+**两级页面。** `/` 是批次列表（ID、名称、状态、run 计数、阶段进度、已用/剩余时间），`/b/<id>/` 是单批次详情；SSE 端点 `/api/stream?batch=<id>` 只序列化被订阅批次的快照，避免每 tick 全量序列化所有批次。停止按钮走唯一写操作 `POST /api/stop/<id>`，`--read-only` 时返回 403，`/api/health` 的 `stop` 字段告知前端是否显示。
 
-**观测 vs 估计。** 页面上每个资源读数都带 `age_seconds`：它是该观测被采集到现在的秒数。显存与主机内存由调度器每个 tick 采样，读数陈旧时前端转灰，避免把冻结的数字当成实时值。所有派生量都取自调度器已经算过的结果：Batch 级剩余时间取 `_display_estimate()`（CLI 显示的同一区间），不做第二次拟合；阶段剩余时间由「剩余组数 × 该 Stage 单组耗时区间」给出，其中单组中位区间由 `estimate_parallel` 在原有计算里顺带发布到 `_schedule_view`，而不是看板自己推断。下个 tick 的计划同样由调度侧在 `_launch_plan()` 里发布成 `last_plan`，看板只读，不预演调度。
+**两个生产者，一种形状。** 逐卡实时内存（`_gpu_running_info`、`_device_memory`）与计划（`_schedule_view`、`last_plan`）只在实验进程内存、不落盘；`batch.pkl` 事件驱动写入、长 Stage 期间静止，`timing.pkl` 约每 5 秒落盘。为了让独立看板也能看到实时指标，运行中的批次由实验进程内的旁路线程把 `build_snapshot()` 的结果约每秒原子写入 `runs/<目录>/live.json`（临时文件 + `os.replace`）；看板把 `live.json` 与持久化记录合并成**同一种形状**，因此「运行中」与「已停止」只是同一渲染路径的两种数据来源。心跳默认开启（`EXPMAN_LIVE=off` 可关），写入失败全静默，绝不回到实验；批次结束不删除 `live.json`，其内容即停止前的最后真实状态。
 
-**数据面边界。** `batch.pkl` 事件驱动写入、长 Stage 期间静止，`timing.pkl` 约每 5 秒落盘；逐卡实时内存（`_gpu_running_info`、`_device_memory`）与计划（`_schedule_view`、`last_plan`）只在内存、不落盘。因此「分配 vs 实际」只有运行中的进程能提供——看板正是依附在该进程上的旁路，而不是事后从磁盘重建的离线视图。
+**三种来源。** 每个批次按 PID 存活与 `live.json` 新鲜度（`STALE_SECONDS`）判定：`live`（PID 存活且快照新鲜，实时面板可用）、`last`（进程已退但留有快照，显示停止前最后读数）、`archive`（只有持久化记录，实时面板置空）。状态收敛为 `running` / `stopped` / `finished` / `failed`。
 
-**停止按钮。** 默认只读；CLI 以 `allow_stop=True` 启动时打开 `POST /api/stop`，服务端先应答再延迟触发 `SIGTERM`，复用既有调度器的 `except BaseException` 清理路径，退出码 143、与 `expman stop` 一致。未打开写通道时该端点返回 403，`/api/health` 的 `stop` 字段告知前端是否显示按钮。绑定地址默认仅回环，暴露到网络需显式传 `--web-host`。
+**只读与单写者。** 写 `live.json` 的线程与调度器同进程，只在 `batch._state_lock` 下拷贝调度器已发布的状态（队列、活动表、阶段历史、设备与主机内存读数、`_schedule_view`、`last_plan`、事件环形缓冲），其余派生计算全部在锁外对这些副本进行。它绝不调用会懒建模型、记录样本或改动准入的内部入口（`_launch_plan` / `_stage_peak` / `_stage_duration`），因此发布的快照不会改变调度决策。看板进程自身是纯读者：不导入 Pipeline 类、不执行用户代码，只在需要时读取上述文件。`build_snapshot` 整体包裹：呈现层抛出的任何异常都降级为一条 `degraded` 负载继续推送，不会回到实验。测试用 `test_a_snapshot_never_fits_a_model` 固化「快照不训练模型」这一约束。
+
+**观测 vs 估计。** 页面上每个资源读数都带 `age_seconds`：它是该观测被采集到现在的秒数。显存与主机内存由调度器每个 tick 采样，读数陈旧时前端转灰，避免把冻结的数字当成实时值。所有派生量都取自调度器已经算过的结果：Batch 级剩余时间取 `_display_estimate()`（CLI 显示的同一区间），不做第二次拟合；阶段剩余时间由「剩余组数 × 该 Stage 单组耗时区间」给出，其中单组中位区间由 `estimate_parallel` 在原有计算里顺带发布到 `_schedule_view`，而不是看板自己推断。下个 tick 的计划同样由调度侧在 `_launch_plan()` 里发布成 `last_plan`，看板只读，不预演调度。仅归档批次没有实时样本，其阶段区间退化为按已到达该阶段的 run 计数近似（`approximate: True`）。
+
+**停止按钮。** 默认开放；`--read-only` 时关闭 `POST /api/stop`。服务端先应答再读 `expman.pid` 发送 `SIGTERM`，复用既有调度器的 `except BaseException` 清理路径，退出码 143、与 `expman stop` 一致。绑定地址默认仅回环，暴露到网络需显式传 `--host`。

@@ -109,3 +109,12 @@ h2.section .hint { font-size: 11px; font-weight: 400; color: var(--faint); }
 .notice.warn { border-color: var(--running); color: var(--running); }
 .detail { font-size: 11px; color: var(--muted); margin-top: 3px; }
 .empty { color: var(--muted); font-size: 12px; }
+
+.scroll-x { overflow-x: auto; }
+.batch-row { grid-template-columns: 34px minmax(150px, 1.6fr) 72px 132px minmax(96px, 1fr) 70px 92px 128px 62px; font-size: 12px; }
+.rows .batch-row + .batch-row { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border); }
+.head-row { font-size: 11px; color: var(--faint); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+a.name { color: var(--text); text-decoration: none; font-weight: 600; }
+a.name:hover { color: var(--actual); text-decoration: underline; }
+a.pill { text-decoration: none; }
+a.pill:hover { border-color: var(--faint); color: var(--text); }

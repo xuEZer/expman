@@ -40,7 +40,7 @@
 
 ### Added
 
-- 运行看板：`run` / `resume` 新增 `--web` / `--web-port` / `--web-host`，在当前进程内附带一个只读看板（回环 HTTP + Server-Sent Events，前端零外网依赖），实时展示各 run 状态计数、Batch 累计与剩余时间区间、各顶层 Stage 的剩余组数与单组耗时区间、调度队列与准入闸门、最近一次装箱计划、逐卡与主机的「分配 vs 实际」内存/显存（实心＝实测占用、虚线＝分配、红线＝硬上限，读数带 `age`、陈旧转灰）以及调度器事件流。看板只读：仅在调度器锁下拷贝已发布状态，绝不训练模型或改动准入，快照构建失败降级为 `degraded` 负载继续推送；`--web` 启动的实例开放 `POST /api/stop`（先应答再优雅停止，退出码 143），默认只读时返回 403。URL 写入批目录 `.webui.json`，`expman status` 顺带打印。绑定默认仅回环，端口被占自动顺延 10 个。
+- 运行看板改为**独立进程** `expman web`：不再依附 `run` / `resume`（移除 `--web` / `--web-port` / `--web-host`），启动即扫描 `runs/` 下全部批次，`/` 列出所有批次、`/b/<id>/` 查看单批次详情；运行中批次显示实时指标，已停止的显示最后读数，仅归档的从 `batch.pkl` / `timing.pkl` 重建。实时指标（逐卡内存、调度计划）只存在于实验进程内存、不落盘，故运行中的批次由实验进程旁路线程约每秒把只读快照原子写入 `runs/<目录>/live.json`（`EXPMAN_LIVE=off` 可关，失败全静默，批次结束不删除），看板把 `live.json` 与持久化记录合并成同一形状；批次列表与详情经回环 HTTP + Server-Sent Events 呈现（前端零外网依赖），实时展示各 run 状态计数、Batch 累计与剩余时间区间、各顶层 Stage 的剩余组数与单组耗时区间、调度队列与准入闸门、最近一次装箱计划、逐卡与主机的「分配 vs 实际」内存/显存（实心＝实测占用、虚线＝分配、红线＝硬上限，读数带 `age`、陈旧转灰）以及调度器事件流。看板是纯读者（不导入 Pipeline 类、不执行用户代码），仅在调度器锁下拷贝已发布状态，绝不训练模型或改动准入；`--port`（默认 `8765`，`0` 由系统分配、被占顺延 10 个）、`--host`（默认仅回环）、`--root`、`--read-only` 可选，唯一写操作 `POST /api/stop/<id>` 在 `--read-only` 时返回 403。
 
 - 框架静默配置工作进程环境，项目无需自行声明：每个 worker 的线程上限固定为 4（`OMP`/`MKL`/`OPENBLAS`/`NUMEXPR`/`VECLIB`/`BLIS`/`RAYON`/`NUMBA` 的 `*_NUM_THREADS` 一并设置），避免并行尝试合计抢占 CPU；`HF_ENDPOINT` 未设置时指向 `https://hf-mirror.com`。shell 已导出的值一律优先（导出任一 `*_NUM_THREADS` 即整组交还），`EXPMAN_THREADS`（`off` 或正整数）与 `EXPMAN_HF_MIRROR`（`off`/`cn`/端点）可覆盖默认；写入值随该次尝试记入 `bootstrap.pkl` 的 `environment` 字段，非法取值在构造 Batch 时即报错，早于输出目录创建。
 

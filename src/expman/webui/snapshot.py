@@ -19,18 +19,18 @@ from ..events import ProgressEvent, Status
 SCHEMA = 1
 
 
-def _number(value):
+def number(value):
     """A finite float, or None for anything that is not one."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
-    return number if math.isfinite(number) else None
+    number_value = float(value)
+    return number_value if math.isfinite(number_value) else None
 
 
-def _age(stamp):
+def age(stamp):
     """Seconds since an observation was taken, or None when unknown."""
-    number = _number(stamp)
-    return None if number is None else round(max(0.0, time() - number), 3)
+    moment = number(stamp)
+    return None if moment is None else round(max(0.0, time() - moment), 3)
 
 
 def _stage_names(batch):
@@ -48,9 +48,9 @@ def _remaining(batch):
     except Exception:
         return None
     return {
-        "lower_seconds": _number(estimate.lower_seconds),
-        "upper_seconds": _number(estimate.upper_seconds),
-        "coverage": _number(estimate.coverage),
+        "lower_seconds": number(estimate.lower_seconds),
+        "upper_seconds": number(estimate.upper_seconds),
+        "coverage": number(estimate.coverage),
         "samples": estimate.completed_samples,
         "remaining_groups": estimate.remaining_experiments,
     }
@@ -119,25 +119,25 @@ def _workers(scheduler, running_info, names, progress, now):
                 "expected": None
                 if expected is None
                 else {
-                    "lower_seconds": _number(expected.lower),
-                    "center_seconds": _number(expected.center),
-                    "upper_seconds": _number(expected.upper),
+                    "lower_seconds": number(expected.lower),
+                    "center_seconds": number(expected.center),
+                    "upper_seconds": number(expected.upper),
                 },
                 "host": {
-                    "reserved_kb": _number(worker.host_reserve_kb),
-                    "resident_kb": _number(worker.resident_kb),
-                    "peak_kb": _number(worker.peak_kb),
-                    "cap_kb": _number(getattr(limit, "cap_kb", None)),
+                    "reserved_kb": number(worker.host_reserve_kb),
+                    "resident_kb": number(worker.resident_kb),
+                    "peak_kb": number(worker.peak_kb),
+                    "cap_kb": number(getattr(limit, "cap_kb", None)),
                     "capped": bool(getattr(limit, "capped", False)),
                     "reached_cap": bool(worker.cap_hit),
                 },
                 "gpu": {
-                    "budget_kb": _number(worker.gpu_reserve_kb),
-                    "reserved_kb": _number(info.get("gpu_reserved_kb")),
-                    "allocated_kb": _number(info.get("gpu_allocated_kb")),
-                    "peak_reserved_kb": _number(info.get("gpu_peak_reserved_kb")),
-                    "peak_allocated_kb": _number(info.get("gpu_peak_allocated_kb")),
-                    "cap_kb": _number(worker.gpu_cap_kb),
+                    "budget_kb": number(worker.gpu_reserve_kb),
+                    "reserved_kb": number(info.get("gpu_reserved_kb")),
+                    "allocated_kb": number(info.get("gpu_allocated_kb")),
+                    "peak_reserved_kb": number(info.get("gpu_peak_reserved_kb")),
+                    "peak_allocated_kb": number(info.get("gpu_peak_allocated_kb")),
+                    "cap_kb": number(worker.gpu_cap_kb),
                 },
                 "dependencies": None
                 if worker.dependencies is None
@@ -163,8 +163,8 @@ def _resources(device_memory, host_memory, workers, plan):
         entry["budget_kb"] += worker["gpu"]["budget_kb"] or 0.0
     cards = []
     for device, observation in sorted(device_memory.items()):
-        total = _number(observation.get("total_kb"))
-        free = _number(observation.get("free_kb"))
+        total = number(observation.get("total_kb"))
+        free = number(observation.get("free_kb"))
         used = None if total is None or free is None else max(0.0, total - free)
         mine = held.get(device, {})
         cards.append(
@@ -179,12 +179,12 @@ def _resources(device_memory, host_memory, workers, plan):
                 "expman_actual_kb": mine.get("actual_kb", 0.0),
                 "expman_allocated_kb": mine.get("allocated_kb", 0.0),
                 "expman_budget_kb": mine.get("budget_kb", 0.0),
-                "launchable_kb": _number(gpu_left.get(device)),
-                "age_seconds": _age(observation.get("observed_at")),
+                "launchable_kb": number(gpu_left.get(device)),
+                "age_seconds": age(observation.get("observed_at")),
             }
         )
-    host_total = _number(host_memory.get("total_kb"))
-    host_available = _number(host_memory.get("available_kb"))
+    host_total = number(host_memory.get("total_kb"))
+    host_available = number(host_memory.get("available_kb"))
     resident = sum(worker["host"]["resident_kb"] or 0.0 for worker in workers)
     budget = sum(worker["host"]["reserved_kb"] or 0.0 for worker in workers)
     used = (
@@ -201,18 +201,18 @@ def _resources(device_memory, host_memory, workers, plan):
             "other_kb": None if used is None else max(0.0, used - resident),
             "expman_actual_kb": resident,
             "expman_budget_kb": budget,
-            "launchable_kb": _number(capacity.get("host_left_kb")),
-            "headroom_kb": _number(host_memory.get("headroom_kb")),
-            "swap_total_kb": _number(host_memory.get("swap_total_kb")),
-            "swap_free_kb": _number(host_memory.get("swap_free_kb")),
+            "launchable_kb": number(capacity.get("host_left_kb")),
+            "headroom_kb": number(host_memory.get("headroom_kb")),
+            "swap_total_kb": number(host_memory.get("swap_total_kb")),
+            "swap_free_kb": number(host_memory.get("swap_free_kb")),
             "tight": bool(host_memory.get("tight", False)),
             "admits_next": bool(host_memory.get("admits_next", False)),
-            "age_seconds": _age(host_memory.get("observed_at")),
+            "age_seconds": age(host_memory.get("observed_at")),
         },
     }
 
 
-def _stage_samples(history):
+def stage_samples(history):
     """How each Stage's samples were obtained: measured, reused or censored."""
     counts = {}
     for entry in history:
@@ -259,8 +259,8 @@ def _stages(completion, names, view, samples):
                 "groups_remaining": None
                 if not known or total is None or completed is None
                 else max(0, total - completed),
-                "unit_lower_seconds": _number(unit.get("unit_lower_seconds")),
-                "unit_upper_seconds": _number(unit.get("unit_upper_seconds")),
+                "unit_lower_seconds": number(unit.get("unit_lower_seconds")),
+                "unit_upper_seconds": number(unit.get("unit_upper_seconds")),
                 "unit_samples": unit.get("spans"),
                 "samples": samples.get(stage_index, {}),
             }
@@ -272,8 +272,8 @@ def _events(items, limit=40):
     """The tail of the scheduler's own event log, oldest first."""
     return [
         {
-            "at": _number(item.get("at")),
-            "age_seconds": _age(item.get("at")),
+            "at": number(item.get("at")),
+            "age_seconds": age(item.get("at")),
             "kind": item.get("kind"),
             "run": None
             if not isinstance(item.get("run_id"), str)
@@ -339,7 +339,7 @@ def _gather(batch) -> dict:
         window["device_memory"], window["host_memory"], workers, window["plan"]
     )
     stages = _stages(
-        window["completion"], names, window["view"], _stage_samples(window["history"])
+        window["completion"], names, window["view"], stage_samples(window["history"])
     )
     pending_by_stage = {}
     for run_id in window["queue"]:
@@ -359,7 +359,7 @@ def _gather(batch) -> dict:
             "name": batch.output_dir.name,
             "dir": str(batch.output_dir),
             "elapsed_seconds": window["elapsed"],
-            "coverage": _number(batch.estimate_coverage),
+            "coverage": number(batch.estimate_coverage),
             "max_retries": batch.max_retries,
             "experiments": len(batch.experiments),
             "stages": len(names),

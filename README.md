@@ -213,8 +213,8 @@ train = Pipeline([LoadData, Train, Eval])
 # 默认输出目录 runs/<pipeline名>_<config名>，重名时追加 _2、_3……
 expman run mypkg.pipelines:train experiments.yaml
 
-# 加 --web 同时启动只读运行看板（默认 127.0.0.1:8765，端口被占自动顺延）
-expman run mypkg.pipelines:train experiments.yaml --web
+# 独立启动运行看板，扫描 runs/ 下全部批次（运行中显示实时指标，已停止显示为已停止）
+expman web
 
 # 查看持久化进度与剩余时间区间（按 ID 或路径；只读，不影响运行中的 Batch）
 expman status 0
@@ -236,22 +236,31 @@ expman resume 0
 - 进度显示默认关闭，需要时加 `--progress`；`run` 可用 `-o` 覆盖默认输出目录。
 - 停止是协作式的：运行进程把 PID 写入批目录的 `expman.pid`，正常结束或停止后删除；目录无 PID 记录时 `stop` 报告未在运行。
 - `resume` 要求 manifest 记录过 pipeline 定位（由 CLI 创建的 Batch 都会记录）；库 API 创建的目录请继续用 `Batch.resume(pipeline, ...)`。
-- `run` / `resume` 支持 `--web`（只读运行看板）、`--web-port`（默认 `8765`，`0` 由系统分配）、`--web-host`（默认仅回环）；详见[运行看板](#运行看板)。
+- 看板是独立命令 `expman web`，扫描 `runs/` 下全部批次并常驻服务，与实验进程互不依赖；可选 `--port`（默认 `8765`，`0` 由系统分配、被占顺延 10 个）、`--host`（默认仅回环）、`--root`、`--read-only`；详见[运行看板](#运行看板)。
 - 库 API 不受影响：CLI 是 `Batch` 之上的薄壳。
 
 ## 运行看板
 
-`run` / `resume` 加 `--web` 时，在当前进程里附带一个只读看板，用浏览器实时查看这次运行的调度、进度、耗时与内存/显存占用：
+看板是一个**独立进程**，与实验进程互不依赖：它不训练模型、不参与调度，启动后扫描 `runs/` 下的**全部**批次，一次呈现所有历史与在飞实验。实验进程可以不存在，看板仍然可用；看板启动前后，实验也可以随时起停。
 
 ```bash
-# 默认 127.0.0.1:8765，端口被占自动顺延 10 个
-expman run mypkg.pipelines:train experiments.yaml --web
+# 在项目根目录启动看板，默认 127.0.0.1:8765（端口被占自动顺延 10 个）
+expman web
 
-# 指定端口（0 由系统分配）与绑定地址（默认仅回环）
-expman run mypkg.pipelines:train experiments.yaml --web --web-port 8899 --web-host 127.0.0.1
+# 指定端口与绑定地址（0 由系统分配；默认仅回环）
+expman web --port 8899 --host 127.0.0.1
+
+# 指向别处的 runs/，或只读运行（禁用停止按钮）
+expman web --root /path/to/runs --read-only
 ```
 
-启动后终端打印一行 `Dashboard: http://127.0.0.1:8765/`，同时把 URL 写入批目录的 `.webui.json`；`expman status <ID>` 会顺带打印 `dashboard: <url>`，方便回连正在运行的批次。进程结束时该文件被删除。
+终端启动时打印一行 `Dashboard: http://127.0.0.1:8765/`。页面分两级：`/` 列出 `runs/` 下所有批次（ID、名称、状态、run 计数、阶段进度、已用/剩余时间），点进 `/b/<ID>/` 查看该批次的完整细节。每个批次按当前状态呈现三类信息：
+
+| 情形 | 判定 | 显示 |
+| --- | --- | --- |
+| 运行中 | 进程存活且心跳新鲜 | 实时指标：调度、进度、逐卡「分配 vs 实际」、事件流 |
+| 已停止 | 进程已退出、留有最后快照 | 停止前的最后读数，明确标注「已停止」 |
+| 仅归档 | 只有持久化记录 | 从 `batch.pkl` / `timing.pkl` 重建的历史状态，实时面板置空 |
 
 看板展示四类信息：
 
@@ -260,7 +269,9 @@ expman run mypkg.pipelines:train experiments.yaml --web --web-port 8899 --web-ho
 - **调度任务**：待定与运行中的 Stage 分布、准入闸门开闭、最近一次装箱计划，以及调度器事件流（启动/减载/完成/复用）。
 - **内存与显存**：逐卡与主机的「分配 vs 实际」——实心条是实测占用（`expman_actual_kb`），虚线框是调度分配（`expman_budget_kb`），红线是该 worker 的硬上限。每段读数带 `age`，超过约 2.5 秒未更新即变灰。
 
-看板是纯粹旁路：它在调度器锁下**只读**拷贝已发布的状态，绝不训练模型、不记录样本、不改动准入，因此打开或关闭页面都不会改变实验行为。页面与脚本都用标准库交付，前端不引用任何 CDN，离线集群可用。`--web` 启动的实例带一个停止按钮，等价于 `expman stop`（先应答再优雅停止，退出码 143）。
+**两个生产者，一种形状。** 逐卡实时内存与调度计划只存在于实验进程内存里，磁盘上没有。运行中的批次因此由实验进程旁路**每秒**把只读快照原子写入 `runs/<目录>/live.json`（临时文件 + `os.replace`）；看板把 `live.json` 与 `batch.pkl` / `timing.pkl` 合并成同一种形状渲染，于是「运行中」与「已停止」只是同一渲染路径的两种数据来源。写快照的线程与调度器同进程，只在状态锁下拷贝，绝不调用会训练模型或改动准入的内部入口——单写者铁律不变。心跳默认开启（`EXPMAN_LIVE=off` 可关），写入失败全程静默，绝不影响实验；批次结束后保留 `live.json`，「已停止」页显示的正是真实的最后状态。
+
+看板本身是纯读者：它不导入 Pipeline 类、不执行用户代码，只在需要时读取上述文件，因此打开或关闭页面都不会改变实验行为。默认只读；`--read-only` 关闭唯一写操作 `POST /api/stop/<id>`——它向批目录 `expman.pid` 记录的进程发送 SIGTERM，等价于 `expman stop`，先应答再优雅停止、退出码 143。绑定地址默认仅回环，暴露到网络需显式传 `--host`。页面与脚本都用标准库交付，前端不引用任何 CDN，离线集群可用。
 
 ## 工作进程环境
 

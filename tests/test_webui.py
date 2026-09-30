@@ -11,10 +11,14 @@ import yaml
 
 from expman import Batch, Pipeline, Stage, Status, devices
 from expman._duration_model import StageDuration
+from expman.cli import _parser
 from expman.devices import DeviceMemory, HostMemory
 from expman.parallel_estimation import estimate_parallel
+from expman.registry import ensure_ids
 from expman.scheduling import GpuScheduler, Worker
-from expman.webui import SCHEMA, build_snapshot, serve
+from expman.storage import PickleSerializer, write_record
+from expman.webui import SCHEMA, build_snapshot, read_batch, serve, summarize
+from expman.webui.live import LIVE_FILE, LivePublisher, live_enabled
 
 POSIX = pytest.mark.skipif(os.name != "posix", reason="POSIX worker process groups")
 GIB = 1024 * 1024
@@ -46,6 +50,13 @@ class Memory:
 class Host:
     def sample(self):
         return HostMemory(64 * GIB, 40 * GIB, 0, 0)
+
+
+class Broken:
+    """A stand-in for a Batch whose attributes cannot be read at all."""
+
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
 
 
 @pytest.fixture(autouse=True)
@@ -148,6 +159,93 @@ def live_worker(batch, run_id, *, device=0, elapsed=30.0):
         "admits_next": True,
         "observed_at": time(),
     }
+
+
+def write_batch_dir(root, name, *, runs=2, status="succeeded", stages=1, pid=None):
+    """A batch directory written straight to disk, without running anything."""
+    directory = root / name
+    directory.mkdir(parents=True)
+    experiments = [
+        {
+            "run_id": f"{index:032x}",
+            "attempts": [
+                {
+                    "attempt": 1,
+                    "status": status,
+                    "duration_seconds": 1.0,
+                    "error_type": None,
+                    "error_message": None,
+                }
+            ],
+        }
+        for index in range(runs)
+    ]
+    pending = status == "pending"
+    manifest = {
+        "version": 1,
+        "pipeline": [
+            {"class": f"demo.Stage{index}", "source": None} for index in range(stages)
+        ],
+        "pipeline_spec": None,
+        "max_retries": 1,
+        "experiments": experiments,
+        "queue": [entry["run_id"] for entry in experiments] if pending else [],
+        "active_gpu": {},
+        "stage_progress": {},
+        "stage_attempts": {},
+        "stage_elapsed": {},
+        "stage_history": [],
+        "gpu_history": [],
+        "estimation": {"version": 1, "execution": "gpu", "coverage": 0.8},
+    }
+    serializer = PickleSerializer()
+    write_record(directory / "batch.pkl", manifest, serializer)
+    write_record(
+        directory / "timing.pkl",
+        {"version": 1, "elapsed_seconds": 120.0, "estimate": None},
+        serializer,
+    )
+    if pid is not None:
+        (directory / "expman.pid").write_text(str(pid))
+    return directory
+
+
+def write_live(directory, *, age=0.0, **batch):
+    payload = {
+        "schema": SCHEMA,
+        "generated_at": time() - age,
+        "source": "live",
+        "batch": {
+            "name": directory.name,
+            "dir": str(directory),
+            "elapsed_seconds": 30.0,
+            "coverage": 0.8,
+            "max_retries": 1,
+            "experiments": 2,
+            "stages": 1,
+            "counts": {
+                "running": 2,
+                "pending": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "cancelled": 0,
+            },
+            "remaining": None,
+            **batch,
+        },
+        "stages": [],
+        "workers": [{"run": "abc123", "stage_index": 0}],
+        "resources": {"devices": [], "host": {"total_kb": 64 * GIB}},
+        "schedule": {"pending_runs": 0, "running_runs": 2},
+        "events": [],
+    }
+    (directory / LIVE_FILE).write_text(json.dumps(payload))
+    return payload
+
+
+# --------------------------------------------------------------------------
+# The snapshot the experiment process builds for itself.
+# --------------------------------------------------------------------------
 
 
 @POSIX
@@ -268,11 +366,179 @@ def test_a_snapshot_without_a_scheduler_still_lists_the_stages(tmp_path):
     assert snapshot["workers"] == []
 
 
-def test_a_snapshot_degrades_instead_of_raising():
-    snapshot = build_snapshot(object())
+def test_a_snapshot_degrades_instead_of_raising(tmp_path):
+    snapshot = build_snapshot(Broken(tmp_path))
 
     assert snapshot["schema"] == SCHEMA
     assert snapshot["degraded"].startswith("AttributeError")
+
+
+# --------------------------------------------------------------------------
+# Publishing live state from the experiment process.
+# --------------------------------------------------------------------------
+
+
+def test_publishing_is_on_by_default_and_can_be_switched_off(monkeypatch):
+    monkeypatch.delenv("EXPMAN_LIVE", raising=False)
+    assert live_enabled() is True
+    monkeypatch.setenv("EXPMAN_LIVE", "off")
+    assert live_enabled() is False
+    monkeypatch.setenv("EXPMAN_LIVE", "1")
+    assert live_enabled() is True
+
+
+def test_publishing_degrades_instead_of_raising(tmp_path):
+    publisher = LivePublisher(Broken(tmp_path))
+
+    publisher.publish()
+
+    payload = json.loads((tmp_path / LIVE_FILE).read_text())
+    assert payload["degraded"].startswith("AttributeError")
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+@POSIX
+def test_a_batch_publishes_live_state_while_it_runs(tmp_path):
+    batch = make_batch(tmp_path)
+
+    batch.run(progress=False)
+
+    payload = json.loads((batch.output_dir / LIVE_FILE).read_text())
+    assert payload["schema"] == SCHEMA
+    assert payload["batch"]["counts"]["succeeded"] == 2
+    assert payload["resources"]["host"]["total_kb"] == pytest.approx(64 * GIB)
+
+
+@POSIX
+def test_publishing_is_skipped_when_switched_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("EXPMAN_LIVE", "off")
+    batch = make_batch(tmp_path)
+
+    batch.run(progress=False)
+
+    assert not (batch.output_dir / LIVE_FILE).exists()
+
+
+@POSIX
+def test_a_finished_batch_reads_back_from_the_snapshot_it_left(tmp_path):
+    batch = make_batch(tmp_path)
+    batch.run(progress=False)
+
+    snapshot = read_batch(batch.output_dir, 3)
+
+    assert snapshot["source"] == "last"
+    assert snapshot["status"] == "finished"
+    assert snapshot["running"] is False
+    assert snapshot["id"] == 3
+    assert snapshot["batch"]["counts"]["succeeded"] == 2
+    assert snapshot["batch"]["elapsed_seconds"] > 0
+    assert [stage["name"] for stage in snapshot["stages"]] == ["Work"]
+
+
+# --------------------------------------------------------------------------
+# Reading a batch that is not running, or not publishing.
+# --------------------------------------------------------------------------
+
+
+def test_a_batch_without_a_snapshot_falls_back_to_its_records(tmp_path):
+    directory = write_batch_dir(tmp_path, "run_a", runs=3)
+
+    snapshot = read_batch(directory, 7)
+
+    assert snapshot["source"] == "archive"
+    assert snapshot["id"] == 7
+    assert snapshot["status"] == "finished"
+    assert snapshot["batch"]["counts"]["succeeded"] == 3
+    assert snapshot["batch"]["elapsed_seconds"] == 120.0
+    assert [stage["name"] for stage in snapshot["stages"]] == ["Stage0"]
+    assert snapshot["stages"][0]["approximate"] is True
+    assert snapshot["stages"][0]["groups_total"] == 3
+    assert snapshot["stages"][0]["unit_lower_seconds"] is None
+    assert snapshot["workers"] == []
+    assert snapshot["resources"] is None
+    assert snapshot["events"] == []
+
+
+def test_a_live_pid_plus_a_fresh_snapshot_reads_as_running(tmp_path):
+    directory = write_batch_dir(tmp_path, "run_a")
+    write_live(directory)
+    (directory / "expman.pid").write_text(str(os.getpid()))
+
+    snapshot = read_batch(directory, 0)
+
+    assert snapshot["source"] == "live"
+    assert snapshot["status"] == "running"
+    assert snapshot["running"] is True
+    assert snapshot["age_seconds"] < 3
+    assert len(snapshot["workers"]) == 1
+
+
+def test_a_stale_snapshot_reads_as_the_last_state_it_reached(tmp_path):
+    directory = write_batch_dir(tmp_path, "run_a", status="cancelled")
+    write_live(directory, age=60.0)
+
+    snapshot = read_batch(directory, 0)
+
+    assert snapshot["source"] == "last"
+    assert snapshot["status"] == "stopped"
+    assert snapshot["running"] is False
+    assert snapshot["age_seconds"] > 30
+    # The last published readings survive, so a stopped batch still explains
+    # what it was doing when it stopped.
+    assert snapshot["resources"]["host"]["total_kb"] == 64 * GIB
+
+
+def test_the_terminal_status_reflects_the_attempts(tmp_path):
+    failed = read_batch(write_batch_dir(tmp_path, "bad", status="failed"), 0)
+    stopped = read_batch(write_batch_dir(tmp_path, "cut", status="cancelled"), 0)
+    pending = read_batch(write_batch_dir(tmp_path, "wait", status="pending"), 0)
+
+    assert failed["status"] == "failed"
+    assert stopped["status"] == "stopped"
+    assert pending["status"] == "stopped"
+    assert pending["batch"]["counts"]["pending"] == 2
+
+
+def test_a_directory_without_records_is_reported_not_raised(tmp_path):
+    directory = tmp_path / "empty"
+    directory.mkdir()
+
+    snapshot = read_batch(directory, 0)
+
+    assert snapshot["source"] == "missing"
+    assert snapshot["id"] == 0
+    assert snapshot["stages"] == []
+    assert snapshot["resources"] is None
+
+
+def test_the_list_entry_carries_what_the_table_renders(tmp_path):
+    directory = write_batch_dir(tmp_path, "run_a", runs=3)
+
+    entry = summarize(read_batch(directory, 4))
+
+    assert entry["id"] == 4
+    assert entry["name"] == "run_a"
+    assert entry["status"] == "finished"
+    assert entry["counts"]["succeeded"] == 3
+    assert entry["experiments"] == 3
+    assert entry["stages"] == 1
+    assert entry["workers"] == 0
+
+
+def test_only_directories_holding_records_become_batches(tmp_path):
+    write_batch_dir(tmp_path / "runs", "run_a")
+    write_batch_dir(tmp_path / "runs", "run_b")
+    (tmp_path / "runs" / "notes").mkdir()
+
+    ids = ensure_ids(tmp_path / "runs")
+
+    assert sorted(ids) == [0, 1]
+    assert {directory.name for directory in ids.values()} == {"run_a", "run_b"}
+
+
+# --------------------------------------------------------------------------
+# The dashboard process.
+# --------------------------------------------------------------------------
 
 
 class TestDashboard:
@@ -284,45 +550,74 @@ class TestDashboard:
         except HTTPError as error:
             return error.code, error.read(), error.headers
 
-    def test_the_page_and_its_assets_are_served(self):
-        dashboard = serve(object(), port=0, interval=1.0)
+    @pytest.fixture
+    def runs(self, tmp_path):
+        """Two batch directories with a fixed age order, so IDs are stable.
+
+        ``scan_runs`` assigns IDs oldest-first, and two directories written in
+        the same instant would otherwise swap IDs between runs.
+        """
+        root = tmp_path / "runs"
+        write_batch_dir(root, "run_a", runs=3)
+        write_batch_dir(root, "run_b", runs=1, status="failed")
+        now = time()
+        os.utime(root / "run_a", (now - 10, now - 10))
+        os.utime(root / "run_b", (now, now))
+        return root
+
+    def test_the_pages_and_their_assets_are_served(self, runs):
+        dashboard = serve(runs, port=0, interval=1.0)
         try:
             dashboard.refresh()
             status, body, headers = self.get(dashboard.url)
             assert status == 200
             assert b"expman" in body
             assert headers["Content-Type"].startswith("text/html")
+
+            status, body, _headers = self.get(dashboard.url + "b/0/")
+            assert status == 200
+            assert b"app.js" in body
+
             status, _body, headers = self.get(dashboard.url + "static/app.js")
             assert status == 200
             assert headers["Content-Type"].startswith("text/javascript")
-            status, _body, _headers = self.get(dashboard.url + "static/nope.js")
-            assert status == 404
-            status, _body, _headers = self.get(dashboard.url + "api/nope")
-            assert status == 404
+
+            assert self.get(dashboard.url + "static/nope.js")[0] == 404
+            assert self.get(dashboard.url + "api/nope")[0] == 404
+            assert self.get(dashboard.url + "b/nope/")[0] == 404
         finally:
             dashboard.close()
 
-    def test_the_snapshot_endpoint_returns_the_published_payload(self):
-        dashboard = serve(object(), port=0, interval=1.0)
+    def test_the_list_endpoint_lists_every_batch(self, runs):
+        dashboard = serve(runs, port=0, interval=1.0)
         try:
             dashboard.refresh()
-            status, body, headers = self.get(dashboard.url + "api/snapshot")
+            status, body, _headers = self.get(dashboard.url + "api/batches")
             assert status == 200
-            assert headers["Content-Type"].startswith("application/json")
             payload = json.loads(body)
             assert payload["schema"] == SCHEMA
-            assert "degraded" in payload
-            status, body, _headers = self.get(dashboard.url + "api/health")
-            assert status == 200
-            assert json.loads(body)["stop"] is False
+            assert [entry["name"] for entry in payload["batches"]] == ["run_a", "run_b"]
+            assert payload["batches"][1]["status"] == "failed"
         finally:
             dashboard.close()
 
-    def test_the_stream_pushes_a_frame(self):
-        dashboard = serve(object(), port=0, interval=1.0)
+    def test_the_batch_endpoint_returns_one_snapshot(self, runs):
+        dashboard = serve(runs, port=0, interval=1.0)
+        try:
+            status, body, _headers = self.get(dashboard.url + "api/batch/0")
+            assert status == 200
+            payload = json.loads(body)
+            assert payload["id"] == 0
+            assert payload["batch"]["name"] == "run_a"
+            assert self.get(dashboard.url + "api/batch/99")[0] == 404
+        finally:
+            dashboard.close()
+
+    def test_the_stream_pushes_a_frame_for_the_watched_batch(self, runs):
+        dashboard = serve(runs, port=0, interval=1.0)
         try:
             dashboard.refresh()
-            with urlopen(dashboard.url + "api/stream", timeout=5) as response:
+            with urlopen(dashboard.url + "api/stream?batch=0", timeout=5) as response:
                 assert response.readline().startswith(b"retry:")
                 while True:
                     line = response.readline()
@@ -330,53 +625,83 @@ class TestDashboard:
                         payload = json.loads(line[len(b"data:") :])
                         break
             assert payload["schema"] == SCHEMA
+            assert payload["batch"]["id"] == 0
+            assert len(payload["batches"]) == 2
         finally:
             dashboard.close()
 
-    def test_stopping_is_refused_unless_the_caller_allows_it(self):
-        dashboard = serve(object(), port=0, interval=1.0)
+    def test_a_read_only_dashboard_refuses_to_stop(self, runs):
+        dashboard = serve(runs, port=0, interval=1.0, allow_stop=False)
         try:
             status, _body, _headers = self.get(
-                Request(dashboard.url + "api/stop", method="POST")
+                Request(dashboard.url + "api/stop/0", method="POST")
             )
             assert status == 403
         finally:
             dashboard.close()
 
-    def test_stopping_calls_back_once_allowed(self):
-        calls = []
-        dashboard = serve(
-            object(),
-            port=0,
-            interval=1.0,
-            allow_stop=True,
-            on_stop=lambda: calls.append(1),
+    def test_stopping_signals_the_recorded_pid(self, runs, monkeypatch):
+        signals = []
+        monkeypatch.setattr(
+            os, "kill", lambda pid, sig: signals.append((pid, sig)) if sig else None
         )
+        (runs / "run_a" / "expman.pid").write_text("424242")
+        dashboard = serve(runs, port=0, interval=1.0, allow_stop=True)
         try:
             status, body, _headers = self.get(
-                Request(dashboard.url + "api/stop", method="POST")
+                Request(dashboard.url + "api/stop/0", method="POST")
             )
             assert status == 200
             assert json.loads(body)["status"] == "stopping"
-            for _ in range(50):
-                if calls:
-                    break
-                sleep(0.05)
-            assert len(calls) == 1
+            assert signals == [(424242, 15)]
         finally:
             dashboard.close()
 
-    def test_a_taken_port_falls_back_to_the_next_one(self):
+    def test_stopping_an_idle_batch_is_refused(self, runs):
+        dashboard = serve(runs, port=0, interval=1.0, allow_stop=True)
+        try:
+            status, body, _headers = self.get(
+                Request(dashboard.url + "api/stop/0", method="POST")
+            )
+            assert status == 200
+            assert json.loads(body)["status"] == "refused"
+            assert (
+                self.get(Request(dashboard.url + "api/stop/99", method="POST"))[0]
+                == 404
+            )
+        finally:
+            dashboard.close()
+
+    def test_the_health_endpoint_reports_the_stop_capability(self, runs):
+        dashboard = serve(runs, port=0, interval=1.0, allow_stop=False)
+        try:
+            status, body, _headers = self.get(dashboard.url + "api/health")
+            assert status == 200
+            assert json.loads(body) == {"status": "ok", "schema": SCHEMA, "stop": False}
+        finally:
+            dashboard.close()
+
+    def test_a_taken_port_falls_back_to_the_next_one(self, runs):
         with socket.socket() as blocker:
             blocker.bind(("127.0.0.1", 0))
             blocker.listen(1)
             taken = blocker.getsockname()[1]
-            dashboard = serve(object(), port=taken, interval=1.0)
+            dashboard = serve(runs, port=taken, interval=1.0)
             try:
                 assert taken < dashboard.port < taken + 10
                 assert self.get(dashboard.url)[0] == 200
             finally:
                 dashboard.close()
+
+    def test_a_missing_tree_is_an_empty_list_not_an_error(self, tmp_path):
+        dashboard = serve(tmp_path / "nowhere", port=0, interval=1.0)
+        try:
+            dashboard.refresh()
+            status, body, _headers = self.get(dashboard.url + "api/batches")
+            assert status == 200
+            assert json.loads(body)["batches"] == []
+        finally:
+            dashboard.close()
 
     @pytest.mark.parametrize(
         "kwargs",
@@ -391,6 +716,31 @@ class TestDashboard:
             {"allow_stop": "yes"},
         ],
     )
-    def test_invalid_settings_are_refused(self, kwargs):
+    def test_invalid_settings_are_refused(self, tmp_path, kwargs):
         with pytest.raises(ValueError):
-            serve(object(), **kwargs)
+            serve(tmp_path, **kwargs)
+
+
+# --------------------------------------------------------------------------
+# The command line.
+# --------------------------------------------------------------------------
+
+
+def test_the_web_command_replaces_the_in_process_flag():
+    parser = _parser()
+
+    args = parser.parse_args(["web", "--port", "0"])
+    assert args.port == 0
+    assert args.host == "127.0.0.1"
+    assert args.read_only is False
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run", "pkg.mod:train", "cfg.yaml", "--web"])
+
+
+def test_a_sleeping_dashboard_can_be_closed_while_it_waits(tmp_path):
+    dashboard = serve(tmp_path, port=0, interval=1.0)
+    try:
+        dashboard.close()
+    finally:
+        dashboard.close()

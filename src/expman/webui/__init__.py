@@ -1,11 +1,27 @@
-"""In-process run dashboard for a Batch.
+"""Run dashboard for the batches under a runs/ tree.
 
-``serve`` starts a loopback HTTP server with a server-sent-events feed of
-read-only snapshots, plus a dependency-free page that renders them.  The
-dashboard observes the scheduler; it never participates in scheduling.
+``expman web`` starts a loopback HTTP server that discovers every batch the
+CLI knows, publishes server-sent events of read-only snapshots, and serves a
+dependency-free page that renders them.  A batch that is not running is
+reported from the records it left behind, so the dashboard outlives every
+experiment process it watches.  The dashboard observes; it never takes part
+in scheduling.
 """
 
+from .archive import read_batch, summarize
+from .live import LIVE_FILE, LivePublisher, live_enabled
 from .server import DEFAULT_PORT, WebUI, serve
 from .snapshot import SCHEMA, build_snapshot
 
-__all__ = ["DEFAULT_PORT", "SCHEMA", "WebUI", "build_snapshot", "serve"]
+__all__ = [
+    "DEFAULT_PORT",
+    "LIVE_FILE",
+    "LivePublisher",
+    "SCHEMA",
+    "WebUI",
+    "build_snapshot",
+    "live_enabled",
+    "read_batch",
+    "serve",
+    "summarize",
+]
