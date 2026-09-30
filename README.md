@@ -235,6 +235,25 @@ expman resume 0
 - `resume` 要求 manifest 记录过 pipeline 定位（由 CLI 创建的 Batch 都会记录）；库 API 创建的目录请继续用 `Batch.resume(pipeline, ...)`。
 - 库 API 不受影响：CLI 是 `Batch` 之上的薄壳。
 
+## 工作进程环境
+
+每次尝试都在独立解释器里运行，用户代码与所有数值库都在其中导入，框架在那里静默配置两件容易做错的事，项目不必重复配置：
+
+- **线程上限**：每个 worker 固定 4 个线程（`OMP`/`MKL`/`OPENBLAS`/`NUMEXPR`/`VECLIB`/`BLIS`/`RAYON`/`NUMBA` 的 `*_NUM_THREADS` 一并设置），使并行尝试不会合起来抢占 CPU。上限是固定值而非按机器折算，同一 config 的每次尝试因此都在同一 CPU 预算下计时，耗时样本才可比。
+- **HF 镜像**：`HF_ENDPOINT` 未设置时指向 `https://hf-mirror.com`，模型下载不依赖到 huggingface.co 的直连。
+
+shell 里已导出的值优先：导出其中任一 `*_NUM_THREADS` 即把整个线程组交还给你，导出 `HF_ENDPOINT` 即保留你的端点。两个环境变量可以改默认：
+
+```bash
+EXPMAN_THREADS=8 expman run mypkg.pipelines:train experiments.yaml   # 改上限
+EXPMAN_THREADS=off expman run ...                                    # 关闭线程上限
+EXPMAN_HF_MIRROR=off expman run ...                                  # 不动 HF_ENDPOINT
+EXPMAN_HF_MIRROR=cn expman run ...                                   # 用默认镜像
+EXPMAN_HF_MIRROR=https://mirror.internal expman run ...              # 指定端点
+```
+
+实际写入 worker 的值随每次尝试记入该次尝试的 `bootstrap.pkl`（`environment` 字段），排查下载路径或线程数异常时可直接查看。`EXPMAN_THREADS` 取值非法会在构造 Batch 时（输出目录创建之前）报错。
+
 ## 阶段快照与 checkpoint
 
 Stage ID 是 Pipeline 中从 0 开始的位置，通过 `ctx.stage_id` 读取。返回值和状态量一起原子保存，保存成功才标记阶段完成；不可序列化的返回值或状态量会使该阶段失败并进入重试流程。

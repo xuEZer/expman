@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 import pytest
 import yaml
 
-from expman import Batch, ConfigError, Pipeline, Stage, Status, devices
+from expman import Batch, ConfigError, Pipeline, Stage, Status, devices, environment
 from expman.devices import (
     GPU_PEAK_KB_DEFAULT,
     HOST_RESERVE_KB,
@@ -24,6 +24,7 @@ from expman.devices import (
 from expman.experiment import Experiment
 from expman.limits import cap_kb
 from expman.scheduling import GpuScheduler, HostGate
+from expman.storage import PickleSerializer, read_record
 
 IMPORT_DEVICE = os.environ.get("CUDA_VISIBLE_DEVICES")
 
@@ -162,6 +163,22 @@ def _captured_gpu_ceilings(batch):
     return ceilings
 
 
+def _captured_worker_env(batch):
+    """Run the Batch, returning the environment each worker was started with."""
+    envs = []
+    original = subprocess.Popen
+
+    def captured(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args", ())
+        if "expman._worker" in argv:
+            envs.append(kwargs.get("env", {}))
+        return original(*args, **kwargs)
+
+    with patch("expman.scheduling.subprocess.Popen", side_effect=captured):
+        batch.run(progress=False)
+    return envs
+
+
 def make_batch(root, *, count=3, devices=None, **options):
     cfg = {
         "device": [0, 1] if devices is None else devices,
@@ -210,6 +227,28 @@ class TestGpuScheduling:
         monkeypatch.setattr(devices, "NvidiaMemory", Memory)
         monkeypatch.setattr(devices, "MeminfoMonitor", Host)
         monkeypatch.setattr(devices, "POLL_INTERVAL", 0.01)
+
+    def test_worker_environment_gets_the_framework_defaults(
+        self, tmp_path, monkeypatch
+    ):
+        """The thread ceiling and the HF mirror reach every worker untouched."""
+        for name in (*environment.THREAD_VARIABLES, "HF_ENDPOINT"):
+            monkeypatch.delenv(name, raising=False)
+        batch = warm(make_batch(tmp_path, count=1))
+
+        envs = _captured_worker_env(batch)
+
+        assert envs, "no worker process was launched"
+        assert envs[0]["OMP_NUM_THREADS"] == str(environment.WORKER_THREADS)
+        assert envs[0]["MKL_NUM_THREADS"] == str(environment.WORKER_THREADS)
+        assert envs[0]["HF_ENDPOINT"] == environment.HF_MIRROR
+        # CUDA_VISIBLE_DEVICES stays the scheduler's own decision.
+        assert "expman.environment" not in envs[0]
+        recorded = read_record(
+            next(batch.output_dir.rglob("bootstrap.pkl")), PickleSerializer()
+        )["environment"]
+        assert recorded["HF_ENDPOINT"] == environment.HF_MIRROR
+        assert recorded["OMP_NUM_THREADS"] == str(environment.WORKER_THREADS)
 
     def test_multiple_devices_and_metrics_results_are_collected(self, tmp_path):
         batch = warm(make_batch(tmp_path, count=4, delay=0.25))

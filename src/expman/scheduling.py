@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import perf_counter, sleep
 
-from . import devices, limits
+from . import devices, environment, limits
 from ._duration_model import DurationModel, StageDuration
 from ._memory_model import LocalQuantileEstimator, PeakCeiling
 from ._time_model import encode
@@ -113,6 +113,9 @@ class GpuScheduler:
         self.monitor = devices.NvidiaMemory(batch.devices)
         self.host = devices.MeminfoMonitor()
         self.host_gate = HostGate()
+        # Resolved once per run: a bad EXPMAN_THREADS fails here, before any
+        # attempt has been started or any output written.
+        self._environment = environment.overlay()
         self.workers = {}
         self.last_tick = perf_counter()
         # Peak host memory per attempt: admission charges the configuration-based
@@ -823,6 +826,9 @@ class GpuScheduler:
                 {
                     "main_script": str(Path(script).resolve()) if script else None,
                     "sys_path": [str(Path(path).resolve()) for path in sys.path],
+                    # What the framework configured for this attempt, for
+                    # diagnosis; the shell keeps the last word.
+                    "environment": dict(self._environment),
                 },
                 PickleSerializer(),
             )
@@ -855,6 +861,7 @@ class GpuScheduler:
             env["PYTHONPATH"] = os.pathsep.join(
                 str(Path(path).resolve()) for path in sys.path
             )
+            env.update(self._environment)
             # The unit is unique per attempt: systemd unloads a finished scope
             # asynchronously, and a retry must not collide with the previous one.
             limit = limits.memory_limit(

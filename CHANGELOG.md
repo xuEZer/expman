@@ -40,6 +40,8 @@
 
 ### Added
 
+- 框架静默配置工作进程环境，项目无需自行声明：每个 worker 的线程上限固定为 4（`OMP`/`MKL`/`OPENBLAS`/`NUMEXPR`/`VECLIB`/`BLIS`/`RAYON`/`NUMBA` 的 `*_NUM_THREADS` 一并设置），避免并行尝试合计抢占 CPU；`HF_ENDPOINT` 未设置时指向 `https://hf-mirror.com`。shell 已导出的值一律优先（导出任一 `*_NUM_THREADS` 即整组交还），`EXPMAN_THREADS`（`off` 或正整数）与 `EXPMAN_HF_MIRROR`（`off`/`cn`/端点）可覆盖默认；写入值随该次尝试记入 `bootstrap.pkl` 的 `environment` 字段，非法取值在构造 Batch 时即报错，早于输出目录创建。
+
 - GPU Batch 改为按顶层 Stage 派发：已完成前缀从快照恢复，Stage 通过 IPC 上报完成状态、耗时、cgroup 内存峰值、PyTorch 显存峰值、Recorder 事件和声明的配置依赖。按滚动依赖特征分别估计每个 Stage 的耗时、主机内存和显存峰值，并优先尝试与既有样本距离更远的可行参数组合。
 
 - `Stage.config_dependencies(cfg)`：与配置树同构的分层依赖声明，`True` 表示整棵子树、映射递归到子键（序列用整数下标）、缺省或 `False` 表示不依赖；接收只读 `cfg`，可按取值选择分支。默认返回 `True`，未声明的 Stage 保守依赖完整配置。

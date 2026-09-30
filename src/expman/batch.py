@@ -13,6 +13,7 @@ from uuid import uuid4
 from .config import load_configs
 from .context import _nonnegative_integer
 from .devices import configured_devices
+from .environment import validate as _validate_environment
 from .estimation import TimeEstimate, validate_coverage
 from .events import Status
 from .experiment import AttemptResult, Experiment, ExperimentResult
@@ -82,6 +83,9 @@ class Batch:
         if not isinstance(pipeline, Pipeline):
             raise TypeError("pipeline must be a Pipeline")
         _nonnegative_integer(max_retries, "max_retries")
+        # A malformed thread or mirror override fails here, before the output
+        # directory exists and before any attempt is started.
+        _validate_environment()
         if not isinstance(cfg, (str, Path, dict)):
             raise TypeError(
                 "cfg must be a YAML path or a concrete configuration dictionary"
