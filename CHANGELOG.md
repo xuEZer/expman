@@ -4,6 +4,8 @@
 
 ### Changed
 
+- 新增命令行入口 `expman`（`run` / `resume` / `status` / `stop`）：pipeline 以 `module:attr` 定位，支持 `Pipeline` 实例、Stage 类列表或零参工厂，创建时记入 manifest 供 `resume` 自动重建；`status` 只读批目录展示各 run 进度与剩余时间区间，`stop` 向运行进程发送 SIGTERM 优雅停止（PID 记录在批目录 `expman.pid`，退出码 143），恢复仍走既有 checkpoint 通道。`Batch` 新增内部 `_pipeline_spec` 参数；库 API 行为不变。
+- CLI 细化：`run` 默认输出到 `runs/<pipeline名>_<config名>`（重名时追加 `_2`、`_3`……）且默认不显示进度（`--progress` 打开）；`--retries` 与 `--coverage` 从命令行移除，改为进程级全局设置 `expman.set(retries=..., coverage=...)`，在 pipeline 模块里调用即可，CLI 因导入该模块而生效；`runs/` 下每个 Batch 在 `runs/.batches.json` 登记从 0 开始的稳定整数 ID（按创建顺序），`stop` / `resume` / `status` 均可按 ID 快捷引用；`status` 不带参数时持续刷新 `runs/` 下全部 Batch 的总览（runs 数、运行/待定/完成/失败/停止计数、阶段进度、已用与剩余时间），直到 Ctrl+C。
 - 冷启动由“整个 Batch 串行推进单个 run”改为**探测式**：无样本的 Stage 不再无上限地单独运行，而是以设备的 1/4（`devices.PROBE_SHARE`，不低于 1 GiB 默认值、也不低于本 Batch 已观测的最大主机峰值）作为计价与硬上限并行探测；能同时启动几个由装箱算术决定。探测命中上限时与普通上限相同：以抬高的下界重估并重试。`limits.memory_limit` 移除 `cold_start` 参数，首次尝试不再无上限运行。
 
 - 剩余时间区间改用核加权的 log 尺度模型：中心是配置距离加权下的几何均值，带宽取约第 `n/8` 近的配置距离，取代固定 8 个最近邻的经验顺序统计量，避免样本跨过邻域边界时估计跳变，也不再从 8 个样本里取极值当区间端点；距离按声明配置项等权平均，多水平类别项只算一个变量，不再因为展开成多列 one-hot 而压倒数值项。上下界由留一残差的 conformal 顺序统计量给出，位置取 `⌈p·(n+1)⌉`、两侧各分走一半缺失概率，残差在样本自身的配置处测量；区间是乘性的，`estimate_coverage` 因此成为区间的名义覆盖率而不是单点估计的分位数。被中断的尝试只测得耗时的下界，只进入下界一侧。`TimeEstimate.__str__` 渲染区间两端。

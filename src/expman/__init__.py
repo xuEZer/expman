@@ -9,6 +9,7 @@ from .experiment import AttemptResult, ExperimentResult, StageResult
 from .pipeline import Pipeline
 from .randomness import seed_everything
 from .recorders import InMemoryRecorder, Recorder
+from .settings import get, set
 from .stage import Stage
 from .storage import (
     Checkpoint,
@@ -41,6 +42,8 @@ __all__ = [
     "StorageError",
     "Status",
     "TimeEstimate",
+    "get",
     "load_configs",
     "seed_everything",
+    "set",
 ]

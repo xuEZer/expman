@@ -1,0 +1,5 @@
+device: [0]
+seed: 0
+values: [1, 2, 3]
+max_iter: 3
+interrupt_once: false

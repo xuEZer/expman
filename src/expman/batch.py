@@ -43,6 +43,24 @@ def _is_seconds(value: float | None) -> TypeGuard[float]:
     )
 
 
+def _validate_pipeline_spec(
+    spec: dict[str, str] | None,
+) -> dict[str, str] | None:
+    """Check the recorded pipeline location that lets the CLI resume a Batch."""
+    if spec is None:
+        return None
+    if (
+        not isinstance(spec, dict)
+        or set(spec) != {"module", "attr"}
+        or any(not isinstance(value, str) or not value for value in spec.values())
+    ):
+        raise ValueError(
+            "pipeline_spec must be a {'module': ..., 'attr': ...} mapping "
+            "of nonempty strings"
+        )
+    return dict(spec)
+
+
 class Batch:
     """A durable experiment collection. Use resume() after interruption.
 
@@ -59,6 +77,7 @@ class Batch:
         recorder: Recorder | None = None,
         output_dir: str | Path | None = None,
         serializer: Serializer | None = None,
+        _pipeline_spec: dict[str, str] | None = None,
     ) -> None:
         if not isinstance(pipeline, Pipeline):
             raise TypeError("pipeline must be a Pipeline")
@@ -74,6 +93,7 @@ class Batch:
             if "seed" not in config:
                 raise ValueError("seed is required")
             validate_seed(config["seed"])
+        self._pipeline_spec = _validate_pipeline_spec(_pipeline_spec)
         self._active_gpu = {}
         self._stage_progress = {}
         self._stage_attempts = {}
@@ -171,6 +191,7 @@ class Batch:
         manifest = {
             "version": 1,
             "pipeline": self._signature,
+            "pipeline_spec": self._pipeline_spec,
             "max_retries": self.max_retries,
             "experiments": experiments,
             "queue": list(self._queue),
@@ -229,6 +250,7 @@ class Batch:
             raise StorageError(
                 "pipeline classes, order or available source code changed"
             )
+        self._pipeline_spec = _validate_pipeline_spec(manifest.get("pipeline_spec"))
         self.max_retries = manifest["max_retries"]
         _nonnegative_integer(self.max_retries, "max_retries")
         self.recorder = InMemoryRecorder() if recorder is None else recorder

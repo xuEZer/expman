@@ -193,6 +193,48 @@ for result in results:
 
 完整示例见 [examples/batch_pipeline.py](examples/batch_pipeline.py)。
 
+## 命令行
+
+不写启动脚本，直接从终端运行与恢复。Pipeline 以 `module:attr` 定位——属性可以是 `Pipeline` 实例、Stage 类列表或返回两者的零参工厂：
+
+```python
+# mypkg/pipelines.py
+import expman
+from expman import Pipeline
+
+# 进程级默认值在这里配置，命令行没有对应旗标
+expman.set(retries=3, coverage=0.9)
+
+train = Pipeline([LoadData, Train, Eval])
+```
+
+```bash
+# 创建并运行；pipeline 定位会记入 manifest；
+# 默认输出目录 runs/<pipeline名>_<config名>，重名时追加 _2、_3……
+expman run mypkg.pipelines:train experiments.yaml
+
+# 查看持久化进度与剩余时间区间（按 ID 或路径；只读，不影响运行中的 Batch）
+expman status 0
+
+# 不带参数：持续刷新 runs/ 下所有 Batch 的总览，直到 Ctrl+C
+expman status
+
+# 优雅停止运行中的 Batch：向运行进程发送 SIGTERM，
+# worker 被终止、尝试记录为 cancelled、状态落盘后退出（退出码 143）
+expman stop 0
+
+# 从停止或中断处恢复；从 manifest 重新导入 pipeline，
+# 源码漂移仍由既有签名校验拦截
+expman resume 0
+```
+
+- `runs/` 下每个 Batch 在 `runs/.batches.json` 中登记一个从 0 开始的稳定整数 ID（按创建顺序），`status` / `stop` / `resume` 都接受 ID 或目录路径。
+- 重试次数与区间覆盖率不在命令行配置：在 pipeline 模块里调用 `expman.set(retries=..., coverage=...)`（默认 `retries=1`、`coverage=0.8`），对进程内所有入口生效；非法键与取值当场报错。
+- 进度显示默认关闭，需要时加 `--progress`；`run` 可用 `-o` 覆盖默认输出目录。
+- 停止是协作式的：运行进程把 PID 写入批目录的 `expman.pid`，正常结束或停止后删除；目录无 PID 记录时 `stop` 报告未在运行。
+- `resume` 要求 manifest 记录过 pipeline 定位（由 CLI 创建的 Batch 都会记录）；库 API 创建的目录请继续用 `Batch.resume(pipeline, ...)`。
+- 库 API 不受影响：CLI 是 `Batch` 之上的薄壳。
+
 ## 阶段快照与 checkpoint
 
 Stage ID 是 Pipeline 中从 0 开始的位置，通过 `ctx.stage_id` 读取。返回值和状态量一起原子保存，保存成功才标记阶段完成；不可序列化的返回值或状态量会使该阶段失败并进入重试流程。
