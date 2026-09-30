@@ -106,6 +106,10 @@ class Batch:
         self._gpu_history = []
         self._host_memory = {}
         self._gpu_running_info = {}
+        # Live-only observations for the dashboard: recorded by the scheduler
+        # each tick and never persisted, so they describe this session only.
+        self._device_memory = {}
+        self._schedule_view = None
         self.output_dir = (
             Path("runs") / uuid4().hex if output_dir is None else Path(output_dir)
         ).resolve()
@@ -319,6 +323,8 @@ class Batch:
         self._active_gpu = {}
         self._host_memory = {}
         self._gpu_running_info = {}
+        self._device_memory = {}
+        self._schedule_view = None
         history = manifest.get("gpu_history", [])
         attempts_by_id = {
             item.run_id: len(item.result.attempts) for item in experiments

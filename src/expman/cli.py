@@ -18,7 +18,7 @@ import signal
 import sys
 from contextlib import suppress
 from pathlib import Path
-from time import sleep
+from time import sleep, time
 
 from . import settings
 from .batch import Batch
@@ -26,8 +26,10 @@ from .estimation import TimeEstimate
 from .pipeline import Pipeline
 from .stage import Stage
 from .storage import PickleSerializer, StorageError, read_record
+from .webui import DEFAULT_PORT
 
 _PID_FILE = "expman.pid"
+_WEBUI_FILE = ".webui.json"
 _RUNS_DIR = Path("runs")
 _REGISTRY_NAME = ".batches.json"
 _STATUS_INTERVAL = 2.0
@@ -202,6 +204,61 @@ def _read_timing(directory: Path) -> tuple[str, str]:
     return elapsed, remaining
 
 
+def _start_dashboard(batch: Batch, args: argparse.Namespace) -> str | None:
+    """Start the loopback dashboard; a dashboard problem never fails a Batch."""
+    if not args.web:
+        return None
+    if not 0 <= args.web_port <= 65535:
+        raise SystemExit("--web-port must be between 0 and 65535")
+    from .webui import serve
+
+    try:
+        dashboard = serve(
+            batch, host=args.web_host, port=args.web_port, allow_stop=True
+        )
+    except (OSError, ValueError) as error:
+        print(f"dashboard not started: {error}", file=sys.stderr)
+        return None
+    print(f"Dashboard: {dashboard.url}", flush=True)
+    try:
+        (batch.output_dir / _WEBUI_FILE).write_text(
+            json.dumps(
+                {"url": dashboard.url, "pid": os.getpid(), "started_at": time()},
+                indent=2,
+            )
+        )
+    except OSError as error:
+        print(f"could not record the dashboard URL: {error}", file=sys.stderr)
+    return dashboard.url
+
+
+def _forget_dashboard(batch: Batch) -> None:
+    with suppress(OSError):
+        (batch.output_dir / _WEBUI_FILE).unlink()
+
+
+def _read_dashboard(directory: Path) -> str | None:
+    """The dashboard URL a Batch process recorded, if it wrote one."""
+    try:
+        data = json.loads((directory / _WEBUI_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    url = data.get("url") if isinstance(data, dict) else None
+    return url if isinstance(url, str) and url else None
+
+
+def _run_with_dashboard(
+    batch: Batch, args: argparse.Namespace, *, progress: bool, resume_command: str
+) -> int:
+    """Run the Batch, serving its dashboard for as long as the process lives."""
+    url = _start_dashboard(batch, args)
+    try:
+        return _execute(batch, progress=progress, resume_command=resume_command)
+    finally:
+        if url is not None:
+            _forget_dashboard(batch)
+
+
 def _execute(batch: Batch, *, progress: bool, resume_command: str) -> int:
     """Run the batch; a stop signal maps to a resume hint and exit 143."""
     print(f"Batch directory: {batch.output_dir}", flush=True)
@@ -247,8 +304,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         (i for i, directory in ids.items() if directory == batch.output_dir), None
     )
     display = str(batch_id) if batch_id is not None else str(batch.output_dir)
-    return _execute(
+    return _run_with_dashboard(
         batch,
+        args,
         progress=args.progress,
         resume_command=f"expman resume {display}",
     )
@@ -269,8 +327,9 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         )
     pipeline = _resolve_pipeline(f"{spec['module']}:{spec['attr']}")
     batch = Batch.resume(pipeline, directory)
-    return _execute(
+    return _run_with_dashboard(
         batch,
+        args,
         progress=args.progress,
         resume_command=f"expman resume {args.directory}",
     )
@@ -310,6 +369,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(f"  {run_id}  {state:<10} {position}  attempts: {history or 'none'}")
     elapsed, remaining = _read_timing(directory)
     print(f"elapsed: {elapsed} | remaining: {remaining}")
+    url = _read_dashboard(directory)
+    if url is not None:
+        print(f"dashboard: {url}")
     return 0
 
 
@@ -429,20 +491,31 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="batch directory (default: runs/<pipeline>_<config>)",
     )
-    run.add_argument(
-        "--progress",
-        action="store_true",
-        help="show live progress while running (off by default)",
-    )
-    run.set_defaults(handler=_cmd_run)
-
     resume = commands.add_parser("resume", help="continue a stopped Batch")
     resume.add_argument("directory", help="batch ID from expman status, or a path")
-    resume.add_argument(
-        "--progress",
-        action="store_true",
-        help="show live progress while running (off by default)",
-    )
+    for command in (run, resume):
+        command.add_argument(
+            "--progress",
+            action="store_true",
+            help="show live progress while running (off by default)",
+        )
+        command.add_argument(
+            "--web",
+            action="store_true",
+            help="serve a read-only dashboard on loopback for this batch",
+        )
+        command.add_argument(
+            "--web-port",
+            type=int,
+            default=DEFAULT_PORT,
+            help="dashboard port (default: 8765; 0 picks a free one)",
+        )
+        command.add_argument(
+            "--web-host",
+            default="127.0.0.1",
+            help="dashboard bind address (default: loopback only)",
+        )
+    run.set_defaults(handler=_cmd_run)
     resume.set_defaults(handler=_cmd_resume)
 
     status = commands.add_parser(

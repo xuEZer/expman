@@ -6,10 +6,11 @@ import socket
 import subprocess
 import sys
 import warnings
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from time import perf_counter, sleep
+from time import perf_counter, sleep, time
 
 from . import devices, environment, limits
 from ._duration_model import DurationModel, StageDuration
@@ -130,7 +131,26 @@ class GpuScheduler:
         self._declared_paths_cache = {}
         self._prefix_paths_cache = {}
         self._stage_group_cache = {}
+        # Dashboard state: a bounded event log and the admission plan this
+        # scheduler actually chose.  Both are published observations for the
+        # dashboard to read, and neither is ever an input to a decision.
+        self.events = deque(maxlen=200)
+        self.last_plan = None
         batch._scheduler = self
+
+    def _note(self, kind, **fields):
+        """Record one scheduling event for the dashboard; never a decision input."""
+        self.events.append({"at": time(), "kind": kind, **fields})
+
+    def _stage_label(self, stage_index):
+        """The Stage class name for display; any experiment defines the order."""
+        experiments = self.batch.experiments
+        if not experiments:
+            return None
+        stages = getattr(experiments[0].pipeline, "stages", ())
+        if 0 <= stage_index < len(stages):
+            return getattr(stages[stage_index], "__name__", None)
+        return None
 
     def _declared_paths(self, run_id, stage_index):
         """Return the paths one Stage declares for one run."""
@@ -522,6 +542,7 @@ class GpuScheduler:
             )
             with self.batch._state_lock:
                 self.batch._host_memory = {}
+                self.batch._device_memory = {}
             return None, None
         # One more attempt is charged at least the largest peak seen so far.
         admits_next = self._admits(
@@ -537,6 +558,19 @@ class GpuScheduler:
                 "swap_free_kb": host.swap_free_kb,
                 "tight": host.tight,
                 "admits_next": admits_next,
+                "observed_at": time(),
+            }
+            # Device readings are published alongside the host reading: the
+            # dashboard shows allocation against actual usage, and nothing else
+            # keeps the per-card totals the scheduler just queried.
+            self.batch._device_memory = {
+                device: {
+                    "uuid": observation.uuid,
+                    "total_kb": observation.total * 1024,
+                    "free_kb": observation.free * 1024,
+                    "observed_at": time(),
+                }
+                for device, observation in memory.items()
             }
         return memory, host
 
@@ -580,6 +614,15 @@ class GpuScheduler:
 
     def _shed(self, run_id):
         """Cancel one running attempt for memory pressure on its card."""
+        worker = self.workers[run_id]
+        self._note(
+            "shed",
+            run_id=run_id,
+            stage_index=worker.stage_index,
+            stage_attempt=worker.stage_attempt,
+            device=worker.device,
+            detail="主机内存紧张，撤销最新的尝试",
+        )
         self._finish(run_id, cancelled="MemoryPressure")
 
     def _admits(self, host, expected_kb):
@@ -689,15 +732,46 @@ class GpuScheduler:
                 key=lambda plan: self._plan_score(plan, host_capacity, gpu_capacities),
                 reverse=True,
             )[:PLAN_BEAM_WIDTH]
-        return max(
+        chosen = max(
             plans,
             key=lambda plan: self._plan_score(plan, host_capacity, gpu_capacities),
-        ).placements
+        )
+        # Published for the dashboard: what this tick could place and what it
+        # passed over.  Recorded here because only this thread may read the
+        # estimators that produced it.
+        self.last_plan = {
+            "at": time(),
+            "ready": len(candidates),
+            "capacity": {
+                "host_left_kb": host_capacity,
+                "gpu_left_kb": dict(available_gpu),
+            },
+            "placements": [
+                {
+                    "run_id": candidate.run_id,
+                    "stage_index": candidate.stage_index,
+                    "stage": self._stage_label(candidate.stage_index),
+                    "device": device,
+                    "host_reserve_kb": candidate.host_reserve_kb,
+                    "gpu_reserve_kb": candidate.gpu_reserve_kb,
+                    "gpu_cap_kb": candidate.gpu_cap_kb,
+                }
+                for candidate, device in chosen.placements
+            ],
+            "launched": [],
+        }
+        return chosen.placements
 
     def _launch_available(self, memory, host):
         """Launch the resource-aware packing plan chosen from this tick's snapshot."""
         for candidate, device in self._launch_plan(memory, host):
-            self._launch(device, memory[device], host, candidate)
+            if not self._launch(device, memory[device], host, candidate):
+                continue
+            # The plan is what admission chose; a placement refused between
+            # planning and process creation did not become a launch.
+            plan = self.last_plan
+            if plan is not None:
+                plan["launched"].append(candidate.run_id)
 
     def _materialize_reuses(self):
         """Advance cache-equivalent Stage members without creating a worker."""
@@ -768,6 +842,13 @@ class GpuScheduler:
                     self.batch._stage_progress[run_id] += 1
                     self.batch._queue.append(run_id)
                 changed = advanced = True
+                self._note(
+                    "reuse",
+                    run_id=run_id,
+                    stage_index=stage_index,
+                    stage_attempt=attempt,
+                    detail="等价配置命中前缀缓存",
+                )
                 break
             if not advanced:
                 break
@@ -929,6 +1010,21 @@ class GpuScheduler:
                 limit=limit,
             )
             parent_socket = None
+            self._note(
+                "launch",
+                run_id=run_id,
+                stage_index=stage_index,
+                stage_attempt=stage_attempt,
+                device=device,
+                detail=(
+                    f"host {host_reserve / 1024:.0f}M gpu {gpu_reserve / 1024:.0f}M"
+                    + (
+                        f" 上限 {applied_gpu_kb / 1024:.0f}M"
+                        if applied_gpu_kb > 0
+                        else ""
+                    )
+                ),
+            )
         except BaseException:
             if child_socket is not None:
                 child_socket.close()
@@ -1092,6 +1188,15 @@ class GpuScheduler:
                         error_message=result.error_message,
                     )
                 )
+            self._note(
+                "finish",
+                run_id=run_id,
+                stage_index=worker.stage_index,
+                stage_attempt=worker.stage_attempt,
+                device=worker.device,
+                status=str(result.status),
+                detail=f"{duration:.1f}s 峰值 {peak_kb / 1024:.0f}M",
+            )
             self.batch._save()
 
     def run(self):

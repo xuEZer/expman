@@ -213,6 +213,9 @@ train = Pipeline([LoadData, Train, Eval])
 # 默认输出目录 runs/<pipeline名>_<config名>，重名时追加 _2、_3……
 expman run mypkg.pipelines:train experiments.yaml
 
+# 加 --web 同时启动只读运行看板（默认 127.0.0.1:8765，端口被占自动顺延）
+expman run mypkg.pipelines:train experiments.yaml --web
+
 # 查看持久化进度与剩余时间区间（按 ID 或路径；只读，不影响运行中的 Batch）
 expman status 0
 
@@ -233,7 +236,31 @@ expman resume 0
 - 进度显示默认关闭，需要时加 `--progress`；`run` 可用 `-o` 覆盖默认输出目录。
 - 停止是协作式的：运行进程把 PID 写入批目录的 `expman.pid`，正常结束或停止后删除；目录无 PID 记录时 `stop` 报告未在运行。
 - `resume` 要求 manifest 记录过 pipeline 定位（由 CLI 创建的 Batch 都会记录）；库 API 创建的目录请继续用 `Batch.resume(pipeline, ...)`。
+- `run` / `resume` 支持 `--web`（只读运行看板）、`--web-port`（默认 `8765`，`0` 由系统分配）、`--web-host`（默认仅回环）；详见[运行看板](#运行看板)。
 - 库 API 不受影响：CLI 是 `Batch` 之上的薄壳。
+
+## 运行看板
+
+`run` / `resume` 加 `--web` 时，在当前进程里附带一个只读看板，用浏览器实时查看这次运行的调度、进度、耗时与内存/显存占用：
+
+```bash
+# 默认 127.0.0.1:8765，端口被占自动顺延 10 个
+expman run mypkg.pipelines:train experiments.yaml --web
+
+# 指定端口（0 由系统分配）与绑定地址（默认仅回环）
+expman run mypkg.pipelines:train experiments.yaml --web --web-port 8899 --web-host 127.0.0.1
+```
+
+启动后终端打印一行 `Dashboard: http://127.0.0.1:8765/`，同时把 URL 写入批目录的 `.webui.json`；`expman status <ID>` 会顺带打印 `dashboard: <url>`，方便回连正在运行的批次。进程结束时该文件被删除。
+
+看板展示四类信息：
+
+- **运行状态**：各 run 的运行/待定/成功/失败/取消计数，以及 Batch 累计运行时间与剩余时间区间。
+- **阶段视图**：每个顶层 Stage 的剩余组数与单组耗时区间，两者相乘即该 Stage 的串行剩余估计；同时给出该 Stage 已测/复用/删失的样本数。
+- **调度任务**：待定与运行中的 Stage 分布、准入闸门开闭、最近一次装箱计划，以及调度器事件流（启动/减载/完成/复用）。
+- **内存与显存**：逐卡与主机的「分配 vs 实际」——实心条是实测占用（`expman_actual_kb`），虚线框是调度分配（`expman_budget_kb`），红线是该 worker 的硬上限。每段读数带 `age`，超过约 2.5 秒未更新即变灰。
+
+看板是纯粹旁路：它在调度器锁下**只读**拷贝已发布的状态，绝不训练模型、不记录样本、不改动准入，因此打开或关闭页面都不会改变实验行为。页面与脚本都用标准库交付，前端不引用任何 CDN，离线集群可用。`--web` 启动的实例带一个停止按钮，等价于 `expman stop`（先应答再优雅停止，退出码 143）。
 
 ## 工作进程环境
 

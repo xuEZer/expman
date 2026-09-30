@@ -28,7 +28,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-expman = ["py.typed"]
+expman = ["py.typed", "webui/static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
