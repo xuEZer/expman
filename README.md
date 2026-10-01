@@ -61,96 +61,184 @@ for event in recorder.events:
 
 ## 配置实验集合
 
-使用 YAML 自由定义配置字段，`!choice` 表示候选值，普通列表保留为完整的参数值：
+使用 YAML 自由定义配置字段。普通列表始终是一个完整的参数值；需要一次跑多组配置时，加顶层控制键。**形状规则只有一条**——列表表示该节点取其中一个值，映射表示继续往下走——而**跑法由关键字决定**：
+
+| 控制键 | 取值 | 跑法 |
+| --- | --- | --- |
+| `combines` | 映射的列表 | 整份方案：每项是一份稀疏覆盖，逐项各跑一个 Run，项与项之间不组合 |
+| `grid` | 映射 | 笛卡尔积：列出的轴同时变，Run 集是各轴取值的乘积 |
+| `scan` | 映射 | 一次只动一个：每条轴取自己列出的第一个值当基准，其余取值逐个偏离 |
+
+三者是**三层**，由外向内 `combines` → `grid` → `scan`，写几个就乘几层（见「叠加三层控制键」）。
+
+### 笛卡尔积：`grid`
 
 ```yaml
-# experiment.yaml
-seed: !choice [0, 1, 2]
 device: [0]
+seed: 0
+
 models:
-  forecasting:
-    name: patchtst
-    patch_len: !choice [8, 16]
-    hidden_sizes: [128, 64, 32]
-```
+  imputation: {defaults: saits, hidden_size: 128}
+  forecasting: {defaults: patchtst, patch_len: 8}
 
-`name` 触发项目级默认参数查找。例如上述节点会加载 `<项目根目录>/configs/models/forecasting/patchtst.yaml`：
-
-```yaml
-patch_len: 32
-d_model: 128
+grid:                          # seed × imputation × patch_len，2×2×2 = 8 个 Run
+  seed: [0, 1]
+  models:
+    imputation:
+      - {defaults: saits, hidden_size: 128}
+      - {defaults: brits}
+    forecasting:
+      patch_len: [8, 16]
 ```
 
 ```python
 from expman import load_configs
 
 configs = load_configs("experiment.yaml")
-assert len(configs) == 6
-assert configs[0]["models"]["forecasting"]["patch_len"] == 8
+assert len(configs) == 8
+assert configs[0]["models"]["imputation"]["name"] == "saits"
 assert configs[0]["models"]["forecasting"]["d_model"] == 128
 ```
 
-每个字典表示一次具体运行，用户可以据此构建各自的 Pipeline。没有 `!choice` 时返回只含一个字典的列表。
+- 列出的字段由 `grid` 接管，文件里的取值被替换：上例 `seed` 写的是 0，实际跑的是 0 和 1。
+- 展开顺序由 `grid` 的书写顺序决定，与数据字段的书写顺序无关；多轴时最后一个轴变化最快。
+- 轴既可以落在叶子上，也可以落在子树上。子树候选整体替换该节点，仍然与其它轴相乘。
+- 每个叶子都必须是列表；标量叶子没有意义，会报错。
 
-- 独立候选按笛卡尔积展开，顺序遵循 YAML 字段和候选值的书写顺序。候选内部的选择只参与该分支的展开。
-- 先展开实验配置，再查找默认文件；参数与 `name` 并列。字典递归合并，实验配置优先；列表整体替换，显式 `null` 覆盖默认值。
-- 默认文件只允许固定参数，出现 `!choice` 会抛出 `ConfigError`。解析错误、重复键、顶层不是映射或映射候选的 `!choice` 也会报错，并包含来源文件。
-- 缺失默认文件发出 `MissingConfigWarning` 并保留显式参数继续；同一次加载对同一路径只警告一次。
-- `name` 在所有层次都是查找约定字段，默认参数中新增的嵌套 `name` 也会按最终层次解析。列表中的节点使用字段层次查找，列表索引不加入目录路径。
-- 各个 Run 的字典及嵌套对象互相独立。函数一次性生成全部配置，参数组合很多时需留意内存占用。
+### 单参数扫描：`scan`
 
-### 配对组合（根级 `!choice`）
-
-独立字段的 `!choice` 做笛卡尔积；要让同级字段联动，把整个文档写成一组完整配置的 `!choice`，每个候选是一个映射：
+`scan` 里的参数**只写在 `scan` 里**，文件不必重复定义。每条轴拿自己列出的**第一个值**当基准，其余取值逐个偏离，其它轴留在基准值：
 
 ```yaml
-# experiment.yaml：每个数据集各自绑定一个模型，而不是 2×2×2 的全组合
-!choice
-- name: base
-  dataset: {name: azure2019_I_5T}
-  imputer: {name: SAITS}
-  predictor: {name: Toto2}
-- name: base
-  dataset: {name: EWELD_Load_15T}
-  imputer: {name: DeepMVI}
-  predictor: {name: Chronos}
-```
-
-- 上例生成 2 个 Run，`dataset`/`imputer`/`predictor` 按候选配对，而不是 2×2×2。
-- 每个候选是完整的配置映射，可以继续使用 `!choice`（只在该候选内部展开）和 `name` 默认；上例两个候选都用根 `name: base` 共享 `configs/base.yaml`，只覆盖差异字段。
-- 根 `!choice` 的候选必须是映射，返回标量或列表会报错；`device` 仍不允许是 `!choice`。
-- 根 `!choice` 与顶层 `sweep` 互斥：`sweep` 只能是单映射文档的顶层键。
-
-### 参数敏感性扫描（`sweep`）
-
-顶层 `sweep` 段把同一份文件变成 OFAT（一次只动一个因子）敏感性扫描：文件自身的字段就是主实验基线，`axes` 用点号路径声明要扫的轴，其余轴固定在基线值：
-
-```yaml
-# 主实验默认：subspace_rank=3、epsilon=0.0001、cone_delta=0.03
 stage: B2
 device: [0]
 seed: 42
-training: {optimizer: AdamW, lr: 0.001, max_epochs: 5}
 tip:
-  subspace_rank: 3
-  epsilon: 0.0001
-  cone_delta: 0.03
+  cone_delta: 0.03        # 不扫描的字段留在文件里
 
-sweep:
-  include_baseline: true            # 先跑基线作为对照
-  axes:
-    tip.subspace_rank: [2, 4]       # 固定 b0、c0，只扫 a
-    tip.epsilon: [0.00001, 0.001]   # 固定 a0、c0，只扫 b
-    tip.cone_delta: [0.01, 0.1]     # 固定 a0、b0，只扫 c
+scan:
+  tip:
+    subspace_rank: [2, 4]      # 轴一
+    epsilon: [0.00001, 0.001]  # 轴二
 ```
 
-上例展开为 7 个 Run（1 个基线 + 2 + 2 + 2），而不是全网格的 3×3×3：
+上例 3 个 Run：基准点（rank=2 / epsilon=0.00001 / cone=0.03）打头，然后两条轴各偏离一次——动 `subspace_rank` 时 `epsilon` 停在基准的 0.00001，反之亦然。要一次跑满 2×2 = 4，改用 `grid`。
 
-- 轴路径必须已经显式出现在实验文件里（可以覆盖 `name` 默认文件给出的值）；路径经过 `!choice` 节点会报错，需要先把该选择钉死。
-- `mode: grid` 改为这些轴的笛卡尔积；`include_baseline: false` 去掉基线条目。
-- `sweep` 是框架保留的顶层键，不会进入 `ctx.cfg`；去掉 `sweep` 段，同一份文件就是普通的单 Run 配置。
-- 与 `!choice` 正交：`seed: !choice [...]` 之类的候选会在每个扫描变体上继续展开。
-- 默认文件里不允许出现 `sweep`。
+```python
+from expman import load_configs
+
+configs = load_configs("experiment.yaml")
+assert len(configs) == 3
+assert [cfg["tip"] for cfg in configs] == [
+    {"subspace_rank": 2, "epsilon": 0.00001, "cone_delta": 0.03},
+    {"subspace_rank": 4, "epsilon": 0.00001, "cone_delta": 0.03},
+    {"subspace_rank": 2, "epsilon": 0.001, "cone_delta": 0.03},
+]
+```
+
+- 基准点永远是第一个 Run，也永远产出，没有开关可以去掉。
+- 基准值是「第一个列出的值」，**不是文件里的值**：同一个字段在文件里写了也会被 `scan` 覆盖。想换基准就把值挪到列表首位，写成 `[3, 2, 4]`。
+- 一条轴列 N 个取值 → 1 个基准值 + N−1 个偏离 Run；重复取值不会重复跑。
+- 轴指向的字段不必预先存在，`scan` 自己声明它。
+
+### 整份方案：`combines`
+
+要让同级字段联动（数据集 A 配模型 a、数据集 B 配模型 b），把每套配置写成 `combines` 上的一项——**列表放在 `combines` 本身的位置**，各项之间不组合，各自作为一个 Run：
+
+```yaml
+# experiment.yaml：每个数据集各自绑定一个模型，而不是 2×2×2 的全组合
+device: [0]
+seed: 42
+
+combines:
+  - dataset: {name: azure2019_I_5T}
+    imputer: {name: SAITS}
+    predictor: {name: Toto2}
+  - dataset: {name: EWELD_Load_15T}
+    imputer: {name: DeepMVI}
+    predictor: {name: Chronos}
+```
+
+```python
+from expman import load_configs
+
+configs = load_configs("experiment.yaml")
+assert len(configs) == 2
+assert [cfg["dataset"]["name"] for cfg in configs] == [
+    "azure2019_I_5T",
+    "EWELD_Load_15T",
+]
+```
+
+- 上例 2 个 Run，`dataset` / `imputer` / `predictor` 按项配对，而不是 2×2×2。
+- 每项是**稀疏覆盖**：只覆盖它列出的字段，映射也只往下覆盖，其余字段（上例的 `device`、`seed`）沿用文件。
+- 一项可以只写一格字段：`- {seed: 7}` 就是「其余照文件、只把 seed 换成 7」。
+- `combines` 只接受列表，项必须是映射；项里的列表是普通数据，不当作轴。
+
+### 叠加三层控制键
+
+三个键可以同时写，嵌套关系由外向内固定为 `combines` → `grid` → `scan`；`grid` 与 `scan` 都作用在上一个键产出之后的文档上：
+
+```yaml
+stage: B1
+seed: 42
+
+combines:
+  - {stage: A}
+  - {stage: B}
+
+grid:
+  seed: [0, 1]
+
+scan:
+  rank: [2, 4]
+```
+
+```python
+from expman import load_configs
+
+configs = load_configs("experiment.yaml")
+assert len(configs) == 8
+assert [(cfg["stage"], cfg["seed"], cfg["rank"]) for cfg in configs[:4]] == [
+    ("A", 0, 2),
+    ("A", 0, 4),
+    ("A", 1, 2),
+    ("A", 1, 4),
+]
+```
+
+上例是 2 × 2 × 2 = **8 个 Run**：外层 `combines` 最慢，内层 `scan` 最快。`grid` 的「键必须已存在」检查在它那一层做，所以 `combines` 新引入的字段可以成为 `grid` 的轴。
+
+### 共同规则
+
+- `combines`、`grid`、`scan`、`defaults` 是框架保留键，解析后从 Run 里消失：`ctx.cfg` 里找不到它们。前三个只认根节点，嵌套在别处的同名键是普通数据；`defaults` 相反，写在任意映射节点上都会生效。
+- `grid` 的稀疏副本里的键必须已存在于文档中（默认值先合并、再展开），所以覆盖 `defaults` 给出的参数是允许的；`combines` 的项与 `scan` 自己声明参数，路径不必预先存在。
+- `device` 是 Batch 级的资源列表，不允许作为展开轴。
+- 展开后按结构去重，重复的配置不会跑第二遍；去重在 `defaults` 解析之后进行，跨层生效。
+- 控制树、列表与轴取值都不能为空；`grid` / `scan` 的叶子必须是列表，`combines` 的项必须是映射。三个键都不写时返回只含一个字典的列表，集合大小为一。
+
+### 命名默认参数
+
+`defaults` 可以写在任何映射节点上，按字段路径查找项目级默认文件：
+
+```text
+models.forecasting.defaults: patchtst
+  → <项目根目录>/configs/models/forecasting/patchtst.yaml
+```
+
+```yaml
+# configs/models/forecasting/patchtst.yaml
+name: patchtst
+patch_len: 32
+d_model: 128
+```
+
+- 参数与 `defaults` 并列书写。两侧都是字典时递归合并，实验配置优先；列表整体替换，显式 `null` 覆盖默认值。
+- `defaults` 只是查找指令，不会出现在 Run 配置里；`name` 因此是普通数据字段，模型身份由默认文件自己给出。
+- 根节点的 `defaults` 对应 `configs/<name>.yaml`；列表元素使用其所在字段路径，列表索引不进入目录路径。
+- 默认文件只允许固定参数，出现 `combines`、`grid` 或 `scan` 会抛出 `ConfigError`。
+- 缺失默认文件发出 `MissingConfigWarning` 并保留显式参数继续；同一次加载对同一路径只警告一次。
+- 各个 Run 的字典及嵌套对象互相独立；加载器一次性生成全部配置，参数组合很多时需留意内存占用。
 
 完整的双模型配置见 [examples/experiment.yaml](examples/experiment.yaml)，加载示例见 [examples/load_experiments.py](examples/load_experiments.py)。
 
@@ -420,7 +508,7 @@ python examples/estimate_time.py
 
 `Batch.resume()` 从持久化 Stage 历史重建估计，并保留覆盖设置。`TimeEstimate` 提供秒数上下界、样本数、剩余 Stage 组数及覆盖设置。外部 GPU 竞争和未来失败次数会影响准确度。
 
-`device` 是整个 Batch 必填的设备列表，不展开为实验组合，也不允许使用 `!choice` 或空列表。框架不改写用户的模型构建逻辑。`ctx.cfg` 保留完整的原始设备列表。每个顶层 Stage 都在独立解释器中运行，并分配一张可见的 GPU，业务代码可统一使用 `cuda:0`；不使用 CUDA 的 Stage 不会因此产生显存占用。绑定通过启动环境中的 GPU UUID 设置，在导入用户 Stage 模块前生效。
+`device` 是整个 Batch 必填的设备列表，不展开为实验组合，也不能作为 `grid` 或 `scan` 的轴，也不能使用空列表。框架不改写用户的模型构建逻辑。`ctx.cfg` 保留完整的原始设备列表。每个顶层 Stage 都在独立解释器中运行，并分配一张可见的 GPU，业务代码可统一使用 `cuda:0`；不使用 CUDA 的 Stage 不会因此产生显存占用。绑定通过启动环境中的 GPU UUID 设置，在导入用户 Stage 模块前生效。
 
 GPU Batch 以**顶层 Stage**为调度单元，而不是以整个 Pipeline 为单元。子进程只实际执行被派发的一个 Stage；此前完成的顶层 Stage 从快照恢复。每次完成会把该 Stage 的耗时、cgroup 内存当前值/峰值、PyTorch 分配器显存当前值/峰值和声明的配置依赖通过私有 IPC 通知调度器；Recorder 事件也走同一通道，不再靠轮询 worker 目录中的结果或事件文件。
 

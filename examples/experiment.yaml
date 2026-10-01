@@ -1,11 +1,15 @@
-seed: !choice [0, 1]
 device: [0]
+seed: 0
 
 models:
-  imputation: !choice
-    - name: saits
-      hidden_size: 128
-    - name: brits
-  forecasting:
-    name: patchtst
-    patch_len: !choice [8, 16]
+  imputation: {defaults: saits, hidden_size: 128}
+  forecasting: {defaults: patchtst, patch_len: 8}
+
+grid:
+  seed: [0, 1]
+  models:
+    imputation:
+      - {defaults: saits, hidden_size: 128}
+      - {defaults: brits}
+    forecasting:
+      patch_len: [8, 16]

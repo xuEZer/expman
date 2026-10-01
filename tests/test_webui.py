@@ -67,9 +67,9 @@ def fake_devices(monkeypatch):
 
 
 def make_batch(root, *, count=2, delay=0.0):
-    cfg = {"device": [0], "seed": 0, "markers": str(root), "delay": delay}
+    cfg = {"device": [0], "seed": 0, "markers": str(root), "delay": delay, "item": 0}
     path = root / "experiments.yaml"
-    path.write_text(yaml.safe_dump(cfg) + f"item: !choice {list(range(count))}\n")
+    path.write_text(yaml.safe_dump(cfg) + f"grid:\n  item: {list(range(count))}\n")
     return Batch(Pipeline([Work]), path, output_dir=root / "batch")
 
 

@@ -25,7 +25,7 @@ class Second(Stage):
 
 def test_eta_counts_only_unmaterialized_stage_parameter_groups(tmp_path):
     cfg = tmp_path / "cfg.yaml"
-    cfg.write_text("device: [0]\nseed: 0\nitem: !choice [0, 1, 2]\n")
+    cfg.write_text("device: [0]\nseed: 0\nitem: 0\ngrid:\n  item: [0, 1, 2]\n")
     batch = Batch(Pipeline([First, Second]), cfg, output_dir=tmp_path / "batch")
     first = batch.experiments[0]
     batch._queue.remove(first.run_id)

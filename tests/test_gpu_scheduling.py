@@ -188,10 +188,11 @@ def make_batch(root, *, count=3, devices=None, **options):
         "fail_once": False,
         "wait_for_release": False,
         "delay": 0.1,
+        "item": 0,
         **options,
     }
     path = root / "experiments.yaml"
-    path.write_text(yaml.safe_dump(cfg) + f"item: !choice {list(range(count))}\n")
+    path.write_text(yaml.safe_dump(cfg) + f"grid:\n  item: {list(range(count))}\n")
     return Batch(Pipeline([GpuWork]), path, output_dir=root / "batch")
 
 
@@ -282,7 +283,8 @@ class TestGpuScheduling:
     def test_top_level_stages_run_independently_and_record_dependencies(self, tmp_path):
         path = tmp_path / "two-stages.yaml"
         path.write_text(
-            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\noffset: 10\nitem: !choice [1, 2]\n"
+            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\noffset: 10\nitem: 1\n"
+            "grid:\n  item: [1, 2]\n"
         )
         batch = Batch(
             Pipeline([Prepare, Consume]), path, output_dir=tmp_path / "two-stages"
@@ -398,7 +400,8 @@ class TestGpuScheduling:
     def test_known_stage_group_has_only_one_runnable_representative(self, tmp_path):
         path = tmp_path / "groups.yaml"
         path.write_text(
-            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\nunused: !choice [1, 2, 3]\n"
+            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\nunused: 1\n"
+            "grid:\n  unused: [1, 2, 3]\n"
         )
         batch = Batch(Pipeline([SharedWork]), path, output_dir=tmp_path / "groups")
         scheduler = GpuScheduler(batch)
@@ -410,7 +413,8 @@ class TestGpuScheduling:
     def test_stage_group_follows_declared_dependencies(self, tmp_path):
         path = tmp_path / "declared.yaml"
         path.write_text(
-            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\nitem: !choice [1, 2]\n"
+            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\nitem: 1\n"
+            "grid:\n  item: [1, 2]\n"
             "crash: false\nfail_once: false\nwait_for_release: false\ndelay: 0\n"
         )
         batch = Batch(Pipeline([GpuWork]), path, output_dir=tmp_path / "declared")
@@ -438,7 +442,7 @@ class TestGpuScheduling:
         path.write_text(
             f"device: [0]\nseed: 0\nmarkers: {tmp_path}\nitem: 0\n"
             "crash: false\nfail_once: false\nwait_for_release: false\ndelay: 0\n"
-            "unused: !choice [1, 2]\n"
+            "unused: 1\ngrid:\n  unused: [1, 2]\n"
         )
         batch = Batch(Pipeline([GpuWork]), path, output_dir=tmp_path / "undeclared")
         scheduler = GpuScheduler(batch)
@@ -451,8 +455,9 @@ class TestGpuScheduling:
         path = tmp_path / "conditional.yaml"
         path.write_text(
             "device: [0]\nseed: 0\n"
-            "Baseline: !choice [B1, B2]\nimputer: i\n"
-            "predictor: !choice [p1, p2]\n"
+            "Baseline: B1\nimputer: i\npredictor: p1\n"
+            "grid:\n"
+            "  Baseline: [B1, B2]\n  predictor: [p1, p2]\n"
         )
         batch = Batch(
             Pipeline([ConditionalWork]), path, output_dir=tmp_path / "conditional"
@@ -491,7 +496,7 @@ class TestGpuScheduling:
         path.write_text(
             f"device: [0]\nseed: 0\nmarkers: {tmp_path}\n"
             "crash: false\nfail_once: false\nwait_for_release: false\ndelay: 0\n"
-            "item: !choice [0, 1, 2, 3, 4, 5, 6, 7]\n"
+            "item: 0\ngrid:\n  item: [0, 1, 2, 3, 4, 5, 6, 7]\n"
         )
         batch = Batch(Pipeline([GpuWork, GpuWork]), path, output_dir=tmp_path / "plan")
         for experiment in batch.experiments[4:]:
@@ -521,7 +526,7 @@ class TestGpuScheduling:
         # reusable group and receives a local cache reference without a worker.
         output_dir = tmp_path / "shared-two"
         path = tmp_path / "shared.yaml"
-        path.write_text("device: [0]\nseed: 0\nunused: !choice [1, 2]\n")
+        path.write_text("device: [0]\nseed: 0\nunused: 1\ngrid:\n  unused: [1, 2]\n")
         batch = Batch(Pipeline([SharedWork]), path, output_dir=output_dir)
         seeded = Experiment(
             Pipeline([SharedWork]),
@@ -724,7 +729,7 @@ class TestGpuScheduling:
         path = tmp_path / "probes.yaml"
         path.write_text(
             f"device: [0, 1]\nseed: 0\nmarkers: {tmp_path}\noffset: 10\n"
-            "item: !choice [1, 2, 3]\n"
+            "item: 1\ngrid:\n  item: [1, 2, 3]\n"
         )
         batch = Batch(
             Pipeline([Prepare, Consume]), path, output_dir=tmp_path / "probes"
@@ -940,15 +945,15 @@ class TestDevice:
                 output_dir=tmp_path / "unused",
             )
 
-    def test_device_cannot_be_a_choice(self, tmp_path):
+    def test_device_cannot_be_an_expansion_axis(self, tmp_path):
         cfg = tmp_path / "experiment.yaml"
-        cfg.write_text("device: !choice [[0], [1]]\nseed: 0\n")
+        cfg.write_text("device: [0]\nseed: 0\ngrid:\n  device: [[0], [1]]\n")
         with pytest.raises(ConfigError):
             Batch(Pipeline([]), cfg, output_dir=tmp_path / "unused")
 
     def test_device_is_a_batch_wide_plain_list(self, tmp_path):
         cfg = tmp_path / "experiment.yaml"
-        cfg.write_text("device: [0, 1]\nseed: 0\nx: !choice [1, 2]\n")
+        cfg.write_text("device: [0, 1]\nseed: 0\nx: 1\ngrid:\n  x: [1, 2]\n")
         batch = Batch(Pipeline([]), cfg, output_dir=tmp_path / "batch")
         assert len(batch.experiments) == 2
         assert batch.devices == (0, 1)

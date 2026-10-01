@@ -1,16 +1,52 @@
-"""Expand experiment choices and resolve named defaults into independent runs."""
+"""Expand experiment variations and resolve named defaults into independent runs.
 
+An experiment file is a mapping. Three optional control keys shape it, and they
+nest from the outside in:
+
+``combines``
+    Turns the collection into whole candidates. Its value is a **list of
+    mappings**; each one is a sparse overlay merged over the file to give one
+    base document. Candidates are tried in order and never mixed with each
+    other, so it pairs fields that move together.
+
+``grid``
+    Turns each base document into a Cartesian grid. Its value is a sparse copy
+    of the data tree in which a **list** means the node takes one of these
+    values and a **mapping** keeps descending. The runs are the product of the
+    axes.
+
+``scan``
+    Turns each base document into experiments tried one axis at a time. Its
+    value is a sparse tree that declares its own parameters: every axis starts
+    at its first listed value, and each remaining value is tried alone with the
+    other axes left at theirs.
+
+Combining them multiplies the layers -- every candidate is gridded, and every
+grid point is scanned. ``defaults`` appears on any mapping node and names a
+file under ``<project root>/configs/`` to merge in as defaults. It is a lookup
+directive and never reaches the resolved run.
+
+``load_configs`` returns one dictionary per Run. The result is eager: callers
+should keep the number of combinations bounded.
+"""
+
+import json
 import warnings
-from collections.abc import Iterator
 from copy import deepcopy
-from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 from typing import Any
 
 import yaml
 from yaml.constructor import ConstructorError
-from yaml.nodes import MappingNode, SequenceNode
+from yaml.nodes import MappingNode
+
+COMBINES_KEY = "combines"
+GRID_KEY = "grid"
+SCAN_KEY = "scan"
+DEFAULTS_KEY = "defaults"
+
+_CONTROL_KEYS = (COMBINES_KEY, GRID_KEY, SCAN_KEY)
 
 
 class ConfigError(ValueError):
@@ -21,15 +57,8 @@ class MissingConfigWarning(UserWarning):
     """A named defaults file was absent; explicit parameters are still usable."""
 
 
-@dataclass(frozen=True)
-class _Choice:
-    values: tuple[Any, ...]
-
-
 class _Loader(yaml.SafeLoader):
-    def __init__(self, stream, *, allow_choices: bool) -> None:
-        super().__init__(stream)
-        self.allow_choices = allow_choices
+    """A SafeLoader that rejects merge keys, non-string keys and duplicate keys."""
 
     def construct_mapping(self, node: MappingNode, deep: bool = False) -> dict:
         result = {}
@@ -54,53 +83,33 @@ class _Loader(yaml.SafeLoader):
         return result
 
 
-def _construct_choice(loader: _Loader, node: SequenceNode) -> _Choice:
-    if not loader.allow_choices:
-        raise ConstructorError(
-            None, None, "!choice is only allowed in experiment files", node.start_mark
-        )
-    if not isinstance(node, SequenceNode) or not node.value:
-        raise ConstructorError(
-            None, None, "!choice requires a nonempty sequence", node.start_mark
-        )
-    return _Choice(tuple(loader.construct_sequence(node, deep=True)))
-
-
-_Loader.add_constructor("!choice", _construct_choice)
-
-
 def _check_cycles(value: Any, active: set[int]) -> None:
-    if not isinstance(value, (dict, list, _Choice)):
+    if not isinstance(value, (dict, list)):
         return
     identity = id(value)
     if identity in active:
         raise ConfigError("recursive YAML aliases are not supported")
     active.add(identity)
-    if isinstance(value, dict):
-        children = value.values()
-    elif isinstance(value, _Choice):
-        children = value.values
-    else:
-        children = value
+    children = value.values() if isinstance(value, dict) else value
     for child in children:
         _check_cycles(child, active)
     active.remove(identity)
 
 
-def _read_yaml(path: Path, *, allow_choices: bool) -> dict[str, Any] | _Choice:
+def _read_yaml(path: Path, *, allow_control: bool) -> dict[str, Any]:
     try:
         with path.open(encoding="utf-8") as stream:
-            loader = _Loader(stream, allow_choices=allow_choices)
+            loader = _Loader(stream)
             try:
                 data = loader.get_single_data()
             finally:
                 loader.dispose()
-        if not isinstance(data, (dict, _Choice)):
-            raise ConfigError(
-                "the document must be a mapping or a !choice of mappings at its root"
-            )
-        if isinstance(data, dict) and not allow_choices and "sweep" in data:
-            raise ConfigError("sweep is only allowed in experiment files")
+        if not isinstance(data, dict):
+            raise ConfigError("the document must be a mapping at its root")
+        if not allow_control:
+            for key in _CONTROL_KEYS:
+                if key in data:
+                    raise ConfigError(f"{key} is only allowed in experiment files")
         _check_cycles(data, set())
         return data
     except FileNotFoundError:
@@ -109,18 +118,128 @@ def _read_yaml(path: Path, *, allow_choices: bool) -> dict[str, Any] | _Choice:
         raise ConfigError(f"{path}: {error}") from error
 
 
-def _expand(value: Any) -> Iterator[Any]:
-    if isinstance(value, _Choice):
-        for candidate in value.values:
-            yield from _expand(candidate)
-    elif isinstance(value, dict):
-        for values in product(*(_expand(child) for child in value.values())):
-            yield deepcopy(dict(zip(value, values, strict=True)))
-    elif isinstance(value, list):
-        for values in product(*(_expand(child) for child in value)):
-            yield deepcopy(list(values))
-    else:
-        yield deepcopy(value)
+def _identity(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, default=str)
+
+
+def _axes(
+    tree: Any,
+    existing: Any,
+    path: tuple[str, ...],
+    label: str,
+    *,
+    known: bool = True,
+) -> list[tuple[tuple[str, ...], list]]:
+    """Flatten a sparse copy of the data tree into ``(field path, values)`` axes.
+
+    One rule applies at every level: a list is the set of values this node
+    takes, a mapping keeps descending. Anything else is a mistake.
+
+    With ``known`` set, every key must already exist in the document, so a typo
+    cannot quietly invent a field; ``scan`` declares its own parameters outright
+    and turns the check off.
+    """
+    where = f"{label}.{'.'.join(path)}" if path else label
+    if isinstance(tree, list):
+        if not tree:
+            raise ConfigError(f"{where} needs at least one alternative")
+        return [(path, list(tree))]
+    if not isinstance(tree, dict):
+        raise ConfigError(f"{where} must be a mapping or a list of alternatives")
+    if not tree:
+        raise ConfigError(f"{where} must not be empty")
+    axes: list[tuple[tuple[str, ...], list]] = []
+    for key, child in tree.items():
+        if known and (not isinstance(existing, dict) or key not in existing):
+            raise ConfigError(f"{where}.{key} is not present in the experiment file")
+        axes.extend(
+            _axes(
+                child,
+                existing[key] if known else None,
+                (*path, key),
+                label,
+                known=known,
+            )
+        )
+    return axes
+
+
+def _materialize(document: dict, patches: list[tuple[tuple[str, ...], Any]]) -> dict:
+    """Apply ``(path, value)`` patches to a deep copy of the document."""
+    result = deepcopy(document)
+    for path, value in patches:
+        node = result
+        for key in path[:-1]:
+            child = node.get(key)
+            if not isinstance(child, dict):
+                child = {}
+                node[key] = child
+            node = child
+        node[path[-1]] = deepcopy(value)
+    return result
+
+
+def _reject_device_axes(axes: list[tuple[tuple[str, ...], list]]) -> None:
+    for path, _ in axes:
+        if path and path[0] == "device":
+            raise ConfigError(
+                "device is the Batch resource list and cannot be an expansion axis"
+            )
+
+
+def _combine_variants(document: dict, candidates: Any) -> list[dict]:
+    """Base documents: each candidate merged over the file, independent of the rest."""
+    if not isinstance(candidates, list):
+        raise ConfigError(f"{COMBINES_KEY} must be a list of candidate mappings")
+    if not candidates:
+        raise ConfigError(f"{COMBINES_KEY} must list at least one candidate")
+    variants: list[dict] = []
+    for index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            raise ConfigError(f"{COMBINES_KEY}[{index}] must be a mapping")
+        variants.append(_merge(document, candidate))
+    return variants
+
+
+def _grid_variants(document: dict, tree: dict, resolved: Any) -> list[dict]:
+    """Every combination of the listed values, in declaration order."""
+    axes = _axes(tree, resolved, (), GRID_KEY)
+    _reject_device_axes(axes)
+    variants: list[dict] = []
+    for picks in product(*(values for _, values in axes)):
+        patches = [(axes[index][0], picks[index]) for index in range(len(axes))]
+        variants.append(_materialize(document, patches))
+    return variants
+
+
+def _scan_variants(document: dict, tree: dict) -> list[dict]:
+    """A reference point, then one run per remaining value with one axis moved."""
+    axes = _axes(tree, None, (), SCAN_KEY, known=False)
+    _reject_device_axes(axes)
+    # The parameters live in the scan itself. The first value of every axis
+    # together is the reference point; each remaining value is tried alone,
+    # with the other axes left at theirs.
+    reference = [(path, values[0]) for path, values in axes]
+    variants = [_materialize(document, reference)]
+    for index, (path, values) in enumerate(axes):
+        for value in values[1:]:
+            patches = list(reference)
+            patches[index] = (path, value)
+            variants.append(_materialize(document, patches))
+    return variants
+
+
+def _deduplicate(variants: list[dict]) -> list[dict]:
+    """Drop the configurations that repeat one already produced."""
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for variant in variants:
+        identity = _identity(variant)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(variant)
+    return unique
 
 
 def _merge(defaults: Any, explicit: Any) -> Any:
@@ -132,105 +251,6 @@ def _merge(defaults: Any, explicit: Any) -> Any:
             )
         return result
     return deepcopy(explicit)
-
-
-_SWEEP_KEYS = frozenset({"axes", "mode", "include_baseline"})
-
-
-def _axis_parts(text: str) -> tuple[str, ...]:
-    if not isinstance(text, str) or not text:
-        raise ConfigError("sweep axis names must be nonempty dotted paths")
-    parts = tuple(text.split("."))
-    if any(not part for part in parts):
-        raise ConfigError(f"invalid sweep axis {text!r}")
-    return parts
-
-
-def _axis_path(config: Any, text: str) -> tuple[str, ...]:
-    """Resolve an axis name, requiring the path to exist in the experiment file."""
-    parts = _axis_parts(text)
-    node = config
-    for component in parts:
-        if isinstance(node, _Choice):
-            raise ConfigError(
-                f"sweep axis {text!r} crosses a !choice; pin the choice first"
-            )
-        if not isinstance(node, dict) or component not in node:
-            raise ConfigError(
-                f"sweep axis {text!r} is not present in the experiment file"
-            )
-        node = node[component]
-    if isinstance(node, _Choice):
-        raise ConfigError(f"sweep axis {text!r} names a !choice; pin it first")
-    return parts
-
-
-def _set_axis(config: dict, parts: tuple[str, ...], value: Any) -> None:
-    node = config
-    for component in parts[:-1]:
-        node = node[component]
-    node[parts[-1]] = deepcopy(value)
-
-
-def _sweep_variants(config: dict, spec: Any) -> list[dict]:
-    """Expand a top-level ``sweep`` section into one mapping per run.
-
-    ``ofat`` (the default) varies one axis at a time from the file's own values,
-    so the run count is the sum of the axis sizes instead of their product;
-    ``grid`` takes the Cartesian product of the axes. ``include_baseline``
-    (default true) prepends the unmodified experiment file as the control run.
-    """
-    if not isinstance(spec, dict):
-        raise ConfigError("sweep must be a mapping")
-    unknown = sorted(set(spec) - _SWEEP_KEYS)
-    if unknown:
-        raise ConfigError(f"unknown sweep keys: {unknown}")
-    axes = spec.get("axes")
-    if not isinstance(axes, dict) or not axes:
-        raise ConfigError("sweep.axes must be a nonempty mapping")
-    mode = spec.get("mode", "ofat")
-    if mode not in ("ofat", "grid"):
-        raise ConfigError("sweep.mode must be 'ofat' or 'grid'")
-    include_baseline = spec.get("include_baseline", True)
-    if not isinstance(include_baseline, bool):
-        raise ConfigError("sweep.include_baseline must be a boolean")
-
-    resolved = []
-    for text, values in axes.items():
-        if (
-            isinstance(values, _Choice)
-            or not isinstance(values, (list, tuple))
-            or not values
-        ):
-            raise ConfigError(f"sweep axis {text!r} must be a nonempty list")
-        resolved.append((_axis_path(config, text), values))
-
-    variants = [deepcopy(config)] if include_baseline else []
-    if mode == "ofat":
-        for parts, values in resolved:
-            for value in values:
-                variant = deepcopy(config)
-                _set_axis(variant, parts, value)
-                variants.append(variant)
-    else:
-        for combination in product(*(values for _, values in resolved)):
-            variant = deepcopy(config)
-            for (parts, _), value in zip(resolved, combination, strict=True):
-                _set_axis(variant, parts, value)
-            variants.append(variant)
-    return variants
-
-
-def _device_configs(value: Any) -> list[dict]:
-    """Collect the raw configs that declare ``device`` for early validation."""
-    if isinstance(value, _Choice):
-        configs = []
-        for candidate in value.values:
-            configs.extend(_device_configs(candidate))
-        return configs
-    if isinstance(value, dict) and "device" in value:
-        return [value]
-    return []
 
 
 def _safe_segment(value: Any) -> bool:
@@ -258,9 +278,9 @@ class _Defaults:
     def __init__(self, experiment: Path) -> None:
         self.experiment = experiment
         self.root: Path | None = None
-        # A cached entry is what _read_yaml returned, or None when the defaults
-        # file is missing.
-        self.cache: dict[Path, dict[str, Any] | _Choice | None] = {}
+        # A cached entry is what _read_yaml returned, or None when the file is
+        # missing.
+        self.cache: dict[Path, dict[str, Any] | None] = {}
 
     def resolve(
         self,
@@ -277,107 +297,151 @@ class _Defaults:
             ]
         if not isinstance(value, dict):
             return deepcopy(value)
-        if "name" in value:
-            if self.root is None:
-                self.root = (_project_root(self.experiment) / "configs").resolve()
-            name = value["name"]
-            if not all(_safe_segment(segment) for segment in (*keys, name)):
-                raise ConfigError(
-                    f"{self.experiment}: {location}.name and its field path must use "
-                    "nonempty path components without separators, '.' or '..'"
-                )
-            target = self.root.joinpath(*keys, f"{name}.yaml").resolve()
-            if not target.is_relative_to(self.root):
-                raise ConfigError(
-                    f"{self.experiment}: {location} resolves outside {self.root}"
-                )
-            if target in ancestors:
-                raise ConfigError(
-                    f"{self.experiment}: cyclic defaults reference at {target}"
-                )
-            if target not in self.cache:
-                try:
-                    self.cache[target] = _read_yaml(target, allow_choices=False)
-                except FileNotFoundError:
-                    self.cache[target] = None
-                    warnings.warn(
-                        f"{self.experiment}: no defaults for {location}.name={name!r}: "
-                        f"{target}; keeping explicit parameters",
-                        MissingConfigWarning,
-                        stacklevel=3,
-                    )
-            defaults = self.cache[target]
+        source = value
+        if DEFAULTS_KEY in value:
+            source = {key: child for key, child in value.items() if key != DEFAULTS_KEY}
+            defaults, target = self._lookup(
+                value[DEFAULTS_KEY], keys, location, ancestors
+            )
             if defaults is not None:
-                value = _merge(defaults, value)
+                source = _merge(defaults, source)
                 ancestors = (*ancestors, target)
         return {
             key: self.resolve(child, (*keys, key), f"{location}.{key}", ancestors)
-            for key, child in value.items()
+            for key, child in source.items()
         }
+
+    def _lookup(
+        self,
+        lookup: Any,
+        keys: tuple[str, ...],
+        location: str,
+        ancestors: tuple[Path, ...],
+    ) -> tuple[dict[str, Any] | None, Path]:
+        if not _safe_segment(lookup):
+            raise ConfigError(
+                f"{self.experiment}: {location}.{DEFAULTS_KEY} must be a nonempty "
+                "name without separators, '.' or '..'"
+            )
+        if self.root is None:
+            self.root = (_project_root(self.experiment) / "configs").resolve()
+        if not all(_safe_segment(segment) for segment in keys):
+            raise ConfigError(
+                f"{self.experiment}: {location} and its field path must use "
+                "nonempty path components without separators, '.' or '..'"
+            )
+        target = self.root.joinpath(*keys, f"{lookup}.yaml").resolve()
+        if not target.is_relative_to(self.root):
+            raise ConfigError(
+                f"{self.experiment}: {location} resolves outside {self.root}"
+            )
+        if target in ancestors:
+            raise ConfigError(
+                f"{self.experiment}: cyclic defaults reference at {target}"
+            )
+        if target not in self.cache:
+            try:
+                self.cache[target] = _read_yaml(target, allow_control=False)
+            except FileNotFoundError:
+                self.cache[target] = None
+                warnings.warn(
+                    f"{self.experiment}: no defaults for {location}.{DEFAULTS_KEY}"
+                    f"={lookup!r}: {target}; keeping explicit parameters",
+                    MissingConfigWarning,
+                    stacklevel=3,
+                )
+        return self.cache[target], target
+
+
+def _expand(
+    document: dict, combines: Any, grid: Any, scan: Any, defaults: _Defaults
+) -> list[dict]:
+    """Nest the control layers outside in: combines, then grid, then scan."""
+    bases = [document] if combines is None else _combine_variants(document, combines)
+    variants: list[dict] = []
+    for base in bases:
+        layer = (
+            [base]
+            if grid is None
+            else _grid_variants(base, grid, defaults.resolve(base))
+        )
+        for item in layer:
+            if scan is None:
+                variants.append(item)
+            else:
+                variants.extend(_scan_variants(item, scan))
+    return variants
 
 
 def load_configs(path: str | Path) -> list[dict[str, Any]]:
     """Load one experiment YAML into independent, fully resolved run dictionaries.
 
-    !choice marks alternatives; independent choices form a Cartesian product in
-    YAML field/candidate order. Ordinary lists remain lists. Named nodes load
-    defaults from <project root>/configs/<field path>/<name>.yaml. Project roots
-    are located by pyproject.toml or .git above the YAML, then the working directory.
-    Explicit values win, dictionaries merge recursively, and lists/null replace
-    defaults. Defaults cannot contain !choice or sweep. Missing defaults warn once
-    per resolved file per call. Parsing errors raise ConfigError.
+    A top-level ``combines``, ``grid`` or ``scan`` section turns the document
+    into a collection. They nest from the outside in::
 
-    A top-level ``sweep`` mapping turns the file into a sensitivity scan:
+        device: [0]
+        seed: 42
 
-        sweep:
-          mode: ofat            # or grid
-          include_baseline: true
-          axes:
-            tip.rank: [2, 4]
+        combines:                    # whole candidates: 2 runs
+          - {dataset: {name: A}, model: {name: saits}}
+          - {dataset: {name: B}, model: {name: brits}}
 
-    The file's own fields are the baseline; each axis is a dotted path that must
-    already exist in the experiment file. ``ofat`` varies one axis at a time, so
-    b0/c0 stay pinned while a is scanned; ``grid`` takes the axis product.
+        grid:                        # every combination: 2 x 2 = 4 runs
+          seed: [0, 1]
+          model: {rank: [2, 4]}
 
-    The document root may also be a ``!choice`` of complete mappings, which pairs
-    sibling fields (dataset A with model a, dataset B with model b) instead of
-    taking the product of independent fields. Candidates may contain further
-    ``!choice`` nodes. A root ``!choice`` and ``sweep`` cannot be combined.
+        scan:                        # one axis at a time: 3 runs
+          model:
+            rank: [2, 4]             # (2, 1e-05), (4, 1e-05), (2, 0.001)
+            epsilon: [0.00001, 0.001]
 
-    The result is eager: callers should keep the number of combinations bounded.
+    ``combines`` takes a list of mappings merged over the file, one run each,
+    and pairs fields that move together. ``grid`` returns the product of its
+    axes in declaration order, the last axis moving fastest, and every path it
+    lists must already exist in the document. ``scan`` declares its own
+    parameters -- they need not appear in the file, and a value written there is
+    replaced -- and returns the combination of their first values as the
+    reference point, then one run per remaining value with a single axis moved.
+
+    Writing several of them multiplies the layers: every candidate is gridded,
+    and every grid point is scanned, so the innermost layer varies fastest. A
+    run whose configuration repeats one already produced once defaults are
+    resolved is not produced again.
+
+    Any mapping node may carry ``defaults: <name>``, which merges
+    ``<project root>/configs/<field path>/<name>.yaml`` underneath it. Explicit
+    values win, dictionaries merge recursively, and lists/null replace defaults.
+    Project roots are located by pyproject.toml or .git above the YAML, then the
+    working directory. Defaults files cannot contain ``combines``, ``grid`` or
+    ``scan``. Missing defaults warn once per resolved file per call. Parsing
+    errors raise ConfigError.
     """
     experiment = Path(path).expanduser().resolve()
     try:
-        data = _read_yaml(experiment, allow_choices=True)
+        document = _read_yaml(experiment, allow_control=True)
     except FileNotFoundError as error:
         raise ConfigError(f"experiment file not found: {experiment}") from error
-    root_choice = isinstance(data, _Choice)
-    if root_choice:
-        variants = [data]
-    else:
-        has_sweep = "sweep" in data
-        spec = data.pop("sweep", None)
-        variants = _sweep_variants(data, spec) if has_sweep else [data]
-    device_configs = []
-    for variant in variants:
-        device_configs.extend(_device_configs(variant))
+
+    combines = document.pop(COMBINES_KEY, None)
+    grid = document.pop(GRID_KEY, None)
+    scan = document.pop(SCAN_KEY, None)
+    if grid is not None and not isinstance(grid, dict):
+        raise ConfigError(f"{experiment}: {GRID_KEY} must be a mapping of axes")
+    if scan is not None and not isinstance(scan, dict):
+        raise ConfigError(f"{experiment}: {SCAN_KEY} must be a mapping of axes")
+
+    defaults = _Defaults(experiment)
+    variants = _expand(document, combines, grid, scan, defaults)
+
+    device_configs = [
+        variant
+        for variant in variants
+        if isinstance(variant, dict) and "device" in variant
+    ]
     if device_configs:
-        # A Batch resource list is never an experiment choice or a sweep axis.
+        # A device list is a Batch resource, never an experiment axis.
         from .devices import configured_devices
 
         configured_devices(device_configs)
-    defaults = _Defaults(experiment)
-    runs = []
-    for variant in variants:
-        for run in _expand(variant):
-            if not isinstance(run, dict):
-                raise ConfigError(
-                    f"{experiment}: every root !choice candidate must be a mapping"
-                )
-            if root_choice and "sweep" in run:
-                raise ConfigError(
-                    f"{experiment}: sweep is a top-level section and cannot appear "
-                    "inside a root !choice candidate"
-                )
-            runs.append(defaults.resolve(run))
-    return runs
+
+    return _deduplicate([defaults.resolve(variant) for variant in variants])

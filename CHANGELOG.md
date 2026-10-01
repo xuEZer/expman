@@ -4,6 +4,8 @@
 
 ### Changed
 
+- 实验配置语法整体替换：`!choice`、顶层 `sweep` 与中间过渡的顶层 `over` 全部移除，改由三个顶层控制键表达——**`combines`** 取一个映射列表，每项是一份稀疏覆盖、逐项各跑一个 Run（配对同级字段），**`grid`** 列出各轴并跑它们的乘积（笛卡尔积），**`scan`** 在自身内部声明参数（文件不必重复书写，写了也会被覆盖）、以每条轴列出的第一个取值为基准点、一次只动一条轴（单参数扫描）。三者共用同一条形状规则：**列表表示该节点取其中一个值，映射表示继续往下走**，并且**可以叠加**：嵌套关系由外向内固定为 `combines` → `grid` → `scan`，Run 集是三层的乘积、内层变化最快；原先 `scan` 的列表形式（整份方案）改由 `combines` 承担。`expand` 段、`baseline` 开关、`over.mode`、以及用 `name` 触发默认查找一并消失，且**不提供任何兼容层或迁移提示**：旧写法要么退化为普通数据字段，要么按 YAML 语法错误被拒。`name` 保持为普通数据字段，查找职责由 `defaults: <name>` 承担。
+
 - 新增命令行入口 `expman`（`run` / `resume` / `status` / `stop`）：pipeline 以 `module:attr` 定位，支持 `Pipeline` 实例、Stage 类列表或零参工厂，创建时记入 manifest 供 `resume` 自动重建；`status` 只读批目录展示各 run 进度与剩余时间区间，`stop` 向运行进程发送 SIGTERM 优雅停止（PID 记录在批目录 `expman.pid`，退出码 143），恢复仍走既有 checkpoint 通道。`Batch` 新增内部 `_pipeline_spec` 参数；库 API 行为不变。
 - CLI 细化：`run` 默认输出到 `runs/<pipeline名>_<config名>`（重名时追加 `_2`、`_3`……）且默认不显示进度（`--progress` 打开）；`--retries` 与 `--coverage` 从命令行移除，改为进程级全局设置 `expman.set(retries=..., coverage=...)`，在 pipeline 模块里调用即可，CLI 因导入该模块而生效；`runs/` 下每个 Batch 在 `runs/.batches.json` 登记从 0 开始的稳定整数 ID（按创建顺序），`stop` / `resume` / `status` 均可按 ID 快捷引用；`status` 不带参数时持续刷新 `runs/` 下全部 Batch 的总览（runs 数、运行/待定/完成/失败/停止计数、阶段进度、已用与剩余时间），直到 Ctrl+C。
 - 冷启动由“整个 Batch 串行推进单个 run”改为**探测式**：无样本的 Stage 不再无上限地单独运行，而是以设备的 1/4（`devices.PROBE_SHARE`，不低于 1 GiB 默认值、也不低于本 Batch 已观测的最大主机峰值）作为计价与硬上限并行探测；能同时启动几个由装箱算术决定。探测命中上限时与普通上限相同：以抬高的下界重估并重试。`limits.memory_limit` 移除 `cold_start` 参数，首次尝试不再无上限运行。
@@ -21,6 +23,8 @@
 - `expman._time_model.features()`：编码入口统一为 `encode()`，该薄封装已无调用方。
 
 ### Fixed
+
+- 展开去重移到 `defaults` 解析之后：展开产物不同但解析结果相同的 Run（例如一份显式参数与一份指向相同内容的默认配置）不再重复跑。
 
 - `Batch` 统一使用 GPU Stage 调度；`device` 必填且必须是非空 GPU 编号列表，根部 `seed` 也必须显式提供，不再隐式使用 `0`。
 
@@ -48,10 +52,6 @@
 
 - `Stage.config_dependencies(cfg)`：与配置树同构的分层依赖声明，`True` 表示整棵子树、映射递归到子键（序列用整数下标）、缺省或 `False` 表示不依赖；接收只读 `cfg`，可按取值选择分支。默认返回 `True`，未声明的 Stage 保守依赖完整配置。
 
-- `load_configs()` 支持顶层 `sweep` 段做参数敏感性扫描：实验文件自身的字段是主实验基线，`axes` 用点号路径声明要扫的轴，默认 `mode: ofat` 一次只动一个轴（其余轴固定为基线），`mode: grid` 改用轴值笛卡尔积，`include_baseline` 控制是否附带基线条目。轴路径必须已存在于实验文件，路径经过 `!choice` 或默认文件出现 `sweep` 都会报错。
-
-- `load_configs()` 允许以根级 `!choice` 组织配对组合：文档根可以是一组完整配置映射，候选之间让同级字段联动（数据集 A 配模型 a、数据集 B 配模型 b），候选内部仍可使用嵌套 `!choice` 与 `name` 默认。候选非映射、或候选内出现 `sweep` 都会报错。
-
 - GPU Stage 调度按同一 Stage 的近邻配置历史取有界经验分位数估计耗时、主机内存和显存峰值，避免稀疏特征回归产生无界外推；显存合约不超过物理卡容量。cgroup 或 CUDA 内存拒绝会把本次合约作为有限下界，提高后续尝试的资源分配并重试。显式零 PyTorch 显存样本不再预留显存，但 Stage 仍获得可见 GPU。
 
 - 阶段累计诊断耗时随 checkpoint 和完成快照原子保存、随恢复进度回退；共享复用保留源耗时并单独记录恢复用时。
@@ -74,7 +74,7 @@
 - `Serializer` / `PickleSerializer`、`StorageError`、`RecoveryWarning` 及运行目录互斥锁。
 - `Batch` 和 `Experiment`：配置驱动的顺序执行、每次尝试的状态隔离、默认一次队尾重试及结果汇总。
 - `ctx.cfg` 完整配置、`ctx.attempt` 尝试编号，以及关联实验、Pipeline 和 Stage 的观测事件。
-- `load_configs()`：YAML 实验集合加载、嵌套 `!choice` 展开、按 `name` 字段路径自动加载并合并默认参数。
+- `load_configs()`：YAML 实验集合加载、按 `grid` / `scan` 展开配置组合、按 `defaults` 字段路径自动加载并合并默认参数。
 - `ConfigError` 和 `MissingConfigWarning`，以及独立 Run 配置、双模型 YAML 示例与配置行为测试。
 - 同步顺序执行的 Pipeline 和泛型 Stage 基类。
 - RunContext，以及带父子执行标识的生命周期、指标和进度事件。
