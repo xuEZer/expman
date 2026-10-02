@@ -21,6 +21,7 @@ from time import monotonic, time
 from typing import cast
 from urllib.parse import parse_qs, urlparse
 
+from ..analysis import analysis_payload, fingerprint
 from ..registry import ensure_ids
 from .archive import PID_FILE, read_batch, summarize
 from .snapshot import SCHEMA
@@ -240,6 +241,10 @@ class Handler(BaseHTTPRequestHandler):
             self._raw(self.dashboard.stream.frame(""))
         elif len(parts) == 3 and parts[:2] == ["api", "batch"] and parts[2].isdigit():
             self._detail(int(parts[2]))
+        elif (
+            len(parts) == 3 and parts[:2] == ["api", "analysis"] and parts[2].isdigit()
+        ):
+            self._analysis(int(parts[2]))
         elif path == "/api/stream":
             self._stream(_batch_key(query))
         elif path == "/api/health":
@@ -261,6 +266,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             self._body(read_batch(directory, batch_id))
+        except Exception as error:
+            self._error(500, f"{type(error).__name__}: {error}")
+
+    def _analysis(self, batch_id):
+        """One batch's result analysis, computed on demand and cached."""
+        directory = self.dashboard.workspace.directory(batch_id)
+        if directory is None:
+            self._error(404, f"no batch {batch_id}")
+            return
+        try:
+            self._body(self.dashboard.analysis(batch_id, directory))
         except Exception as error:
             self._error(500, f"{type(error).__name__}: {error}")
 
@@ -354,7 +370,21 @@ class DashboardServer(ThreadingHTTPServer):
         self.workspace = workspace
         self.stream = Stream(workspace, interval)
         self.allow_stop = allow_stop
+        self.analysis_cache: dict[int, tuple[tuple, dict]] = {}
+        self.analysis_lock = threading.Lock()
         self.host, self.port = self.server_address[0], self.server_address[1]
+
+    def analysis(self, batch_id: int, directory: Path) -> dict:
+        """The analysis payload for one batch, cached until its inputs change."""
+        mark = fingerprint(directory)
+        with self.analysis_lock:
+            cached = self.analysis_cache.get(batch_id)
+            if cached is not None and cached[0] == mark:
+                return cached[1]
+        payload = analysis_payload(directory, batch_id)
+        with self.analysis_lock:
+            self.analysis_cache[batch_id] = (mark, payload)
+        return payload
 
 
 class WebUI:

@@ -398,4 +398,6 @@ GPU 派发按 Stage 的异质配置距离生成候选，再联合主机内存和
 
 **观测 vs 估计。** 页面上每个资源读数都带 `age_seconds`：它是该观测被采集到现在的秒数。显存与主机内存由调度器每个 tick 采样，读数陈旧时前端转灰，避免把冻结的数字当成实时值。所有派生量都取自调度器已经算过的结果：Batch 级剩余时间取 `_display_estimate()`（CLI 显示的同一区间），不做第二次拟合；阶段剩余时间由「剩余组数 × 该 Stage 单组耗时区间」给出，其中单组中位区间由 `estimate_parallel` 在原有计算里顺带发布到 `_schedule_view`，而不是看板自己推断。下个 tick 的计划同样由调度侧在 `_launch_plan()` 里发布成 `last_plan`，看板只读，不预演调度。仅归档批次没有实时样本，其阶段区间退化为按已到达该阶段的 run 计数近似（`approximate: True`）。
 
+**结果分析。** `analysis.py` 离线拼接一张 Run × 配置项 × 指标的宽表：`batch.pkl` 给 Run 清单、状态与累计尝试耗时，`experiments/<run_id>/config.pkl` 给自变量（`batch.pkl` 不含配置，必须逐 Run 读取），`metrics.sqlite3` 给因变量——同一指标优先取 `step=-1` 的汇总值、否则取最大 step，同名指标出现在多个 Stage 时加 `S<index>.` 前缀消歧。耗时以 `run_duration_seconds` 伪指标参与分析。局部结果是一等公民：配置不可读的 Run 记为 skipped(原因) 而不失败，失败/未完成的 Run 按状态排除并计入覆盖度（`runs_total` 含全部 manifest Run），每个指标各自计 `n`、缺值 Run 按 pairwise 跳过。分析方法刻意简单：数值项（≥3 个不同取值）给 Spearman 秩相关、绝对值即影响力；其余按取值分组，影响力取组间平方和占总平方和之比（η²）；常量项与样本不足项（有效点 < 3、类别组 < 2）跳过并显式标注，每组只有一个样本时只列均值不算 η²。指标与配置项都按影响力排序。`GET /api/analysis/<id>` 在请求线程上同步计算，按批目录的 mtime 指纹（manifest、指标库、每个 `config.pkl`）缓存；分析不导入用户代码、不做显著性检验、不主张因果。
+
 **停止按钮。** 默认开放；`--read-only` 时关闭 `POST /api/stop`。服务端先应答再读 `expman.pid` 发送 `SIGTERM`，复用既有调度器的 `except BaseException` 清理路径，退出码 143、与 `expman stop` 一致。绑定地址默认仅回环，暴露到网络需显式传 `--host`。

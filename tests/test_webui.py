@@ -11,6 +11,7 @@ import yaml
 
 from expman import Batch, Pipeline, Stage, Status, devices
 from expman._duration_model import StageDuration
+from expman.analysis import ANALYSIS_SCHEMA
 from expman.cli import _parser
 from expman.devices import DeviceMemory, HostMemory
 from expman.parallel_estimation import estimate_parallel
@@ -610,6 +611,43 @@ class TestDashboard:
             assert payload["id"] == 0
             assert payload["batch"]["name"] == "run_a"
             assert self.get(dashboard.url + "api/batch/99")[0] == 404
+        finally:
+            dashboard.close()
+
+    def test_the_analysis_endpoint_reports_partial_results(self, runs):
+        from expman.metrics import MetricStore
+
+        directory = runs / "run_a"
+        run_id = "0" * 32
+        config_dir = directory / "experiments" / run_id
+        config_dir.mkdir(parents=True)
+        write_record(config_dir / "config.pkl", {"lr": 1}, PickleSerializer())
+        MetricStore(directory / "metrics.sqlite3").log(
+            run_id, (0,), -1, 1, [(json.dumps(["score"]), 1.0)]
+        )
+        # Writing into run_a refreshed its mtime past run_b's; keep run_a the
+        # oldest so it still owns ID 0.
+        now = time()
+        os.utime(directory, (now - 10, now - 10))
+        dashboard = serve(runs, port=0, interval=1.0)
+        try:
+            status, body, _headers = self.get(dashboard.url + "api/analysis/0")
+            assert status == 200
+            payload = json.loads(body)
+            assert payload["schema"] == ANALYSIS_SCHEMA
+            coverage = payload["coverage"]
+            # The other two runs of run_a have no config.pkl on disk: they
+            # are skipped with a reason, not fatal.
+            assert coverage["runs_total"] == 3
+            assert coverage["runs_analyzed"] == 1
+            assert [item["run_id"] for item in coverage["skipped"]] == [
+                f"{index:032x}" for index in (1, 2)
+            ]
+            assert {item["name"] for item in payload["metrics"]} == {
+                "score",
+                "run_duration_seconds",
+            }
+            assert self.get(dashboard.url + "api/analysis/99")[0] == 404
         finally:
             dashboard.close()
 

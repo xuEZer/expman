@@ -9,6 +9,10 @@ const BATCH_ID = (() => {
 const state = {
   snapshot: null,
   paused: false,
+  tab: "status",
+  analysis: null,
+  analysisState: "idle",
+  analysisError: null,
   throttle: 1,
   lastPaint: 0,
   stopAllowed: false,
@@ -356,18 +360,118 @@ function events(s) {
   }).join("") + "</div>";
 }
 
-function renderBatch(s) {
-  const detail = s.batch;
-  let html = notices(s) + topBar(s, detail);
-  if (!detail) {
-    html += '<div class="card empty">批次 ' + esc(BATCH_ID) + " 不存在，或已被移出 runs/。</div>";
-    app.innerHTML = html;
-    wire();
-    return;
-  }
+/* ------------------------------------------------------- analysis tab */
+
+function loadAnalysis(force) {
+  if (state.analysisState === "loading") return;
+  if (state.analysisState === "ready" && !force) return;
+  state.analysisState = "loading";
+  render(true);
+  fetch("/api/analysis/" + BATCH_ID)
+    .then((response) => response.json().then((body) => ({ good: response.ok, body })))
+    .then(({ good, body }) => {
+      if (good && body && Array.isArray(body.metrics)) {
+        state.analysis = body;
+        state.analysisState = "ready";
+      } else {
+        state.analysisState = "error";
+        state.analysisError = (body && body.error) || "分析载荷不完整";
+      }
+      render(true);
+    })
+    .catch((error) => {
+      state.analysisState = "error";
+      state.analysisError = String(error);
+      render(true);
+    });
+}
+
+function fmtValue(value) {
+  if (value === null || value === undefined) return "null";
+  if (Array.isArray(value)) return "[" + value.map((item) => String(item)).join(", ") + "]";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function fmtNum(value) {
+  if (!ok(value)) return "–";
+  if (Math.abs(value) >= 1000) return Math.round(value).toString();
+  return Number(value.toPrecision(3)).toString();
+}
+
+function tabs() {
+  const item = (key, label) =>
+    '<button class="tab' + (state.tab === key ? " active" : "") + '" data-tab="' + key + '">' + label + "</button>";
+  return '<div class="tabs">' + item("status", "运行状态") + item("analysis", "结果分析") + "</div>";
+}
+
+function pairRow(p) {
+  const effect = p.kind === "numeric"
+    ? "ρ " + (ok(p.rho) ? (p.rho > 0 ? "+" : "") + p.rho.toFixed(2) : "–")
+    : "η² " + (ok(p.influence) ? p.influence.toFixed(2) : "–");
+  const width = ok(p.influence) ? clamp(p.influence * 100) : 0;
+  const fill = ok(p.influence) ? bar([{ from: 0, size: width, color: "var(--done)" }], null, null, "thin") : "";
+  const line = '<div class="row pair-row">' +
+    '<span class="mono">' + esc(p.field) + "</span>" +
+    '<span class="pill mono">' + (p.kind === "numeric" ? "数值" : "类别") + "</span>" +
+    "<div>" + fill + "</div>" +
+    '<span class="mono" style="text-align:right">' + effect + "</span>" +
+    '<span class="mono faint" style="text-align:right">n=' + p.n + "</span>" +
+    "</div>";
+  const groups = p.kind === "categorical" && Array.isArray(p.groups) && p.groups.length
+    ? '<div class="detail mono">' + p.groups.map((g) =>
+        esc(fmtValue(g.value)) + " → " + fmtNum(g.mean) + " ×" + g.n).join(" · ") +
+        (p.best !== null && p.best !== undefined ? " · 最佳 " + esc(fmtValue(p.best)) : "") + "</div>"
+    : "";
+  const note = p.note ? '<div class="detail">' + esc(p.note) + "</div>" : "";
+  return line + groups + note;
+}
+
+function metricCard(m) {
+  const head = '<div class="stage-head"><span class="stage-name mono">' + esc(m.name) + "</span>" +
+    '<span class="faint mono">' + (ok(m.influence_max) ? "最大影响力 " + m.influence_max.toFixed(2) : "无可比较配置项") + "</span></div>";
+  const stats = '<div class="stage-meta mono">n=' + m.n +
+    (m.missing ? " · 缺失 " + m.missing : "") +
+    (ok(m.mean) ? " · 均值 " + fmtNum(m.mean) : "") +
+    (ok(m.sd) ? " · σ " + fmtNum(m.sd) : "") +
+    (ok(m.min) && ok(m.max) ? " · 范围 " + fmtNum(m.min) + "～" + fmtNum(m.max) : "") + "</div>";
+  const body = m.pairs.length
+    ? m.pairs.map(pairRow).join("")
+    : '<div class="empty" style="margin-top:8px">没有可比较的配置项（可能全部为常量或样本不足）</div>';
+  const skipped = m.skipped_fields
+    ? '<div class="legend">另有 ' + m.skipped_fields + " 个配置项因有效样本不足未参与比较</div>"
+    : "";
+  return '<div class="card metric-card">' + head + stats +
+    '<div style="margin-top:8px">' + body + "</div>" + skipped + "</div>";
+}
+
+function analysisBody() {
+  if (state.analysisState === "loading") return '<p class="muted pad">正在分析…</p>';
+  if (state.analysisState === "error") return unavailable("结果分析", state.analysisError || "分析失败");
+  if (state.analysisState !== "ready" || !state.analysis) return '<p class="muted pad">尚未加载分析。</p>';
+  const a = state.analysis;
+  const c = a.coverage || {};
+  const excluded = Object.entries(c.excluded || {}).map(([status, count]) => status + " " + count).join(" · ");
+  let html = '<div class="top" style="padding-bottom:0">' +
+    '<span class="pill mono">Run ' + c.runs_analyzed + " / " + c.runs_total + "</span>" +
+    '<span class="pill mono">指标 ' + c.metrics_total + "</span>" +
+    (excluded ? '<span class="pill warn">排除：' + esc(excluded) + "</span>" : "") +
+    '<span class="spacer"></span><button data-act="reload-analysis">重新分析</button></div>';
+  if ((c.skipped || []).length)
+    html += '<div class="notice warn">' + c.skipped.length + " 个 Run 的配置不可读，已跳过：" +
+      c.skipped.map((item) => esc(item.run_id)).join("、") + "</div>";
+  if ((c.constant_fields || []).length)
+    html += '<div class="legend">常量配置项（所有 Run 相同，不参与比较）：' +
+      c.constant_fields.map((name) => '<span class="mono">' + esc(name) + "</span>").join("、") + "</div>";
+  html += (a.metrics || []).map(metricCard).join("") ||
+    '<div class="card empty">没有可分析的指标。</div>';
+  html += '<div class="legend">ρ = Spearman 秩相关（绝对值即影响力度量） · η² = 组间变异占指标总变异的比例 · 都只描述观测到的关系，不是因果结论</div>';
+  return html;
+}
+
+function statusBody(detail) {
   const live = detail.source === "live";
-  html += sourceNote(detail);
-  html += tiles(detail) + stages(detail);
+  let html = tiles(detail) + stages(detail);
   html += '<div class="cols"><div>' +
       section("运行中的尝试", (detail.workers || []).length + " 个 worker", live ? workers(detail) : '<div class="card empty">没有实时 worker 数据</div>') +
     "</div><div>" +
@@ -377,6 +481,21 @@ function renderBatch(s) {
       (live ? plan(detail) : unavailable("本 tick 准入计划", "没有实时调度数据")) +
       (live ? events(detail) : unavailable("调度事件", "没有实时事件")) +
     "</div>";
+  return html;
+}
+
+function renderBatch(s) {
+  const detail = s.batch;
+  let html = notices(s) + topBar(s, detail);
+  if (!detail) {
+    html += '<div class="card empty">批次 ' + esc(BATCH_ID) + " 不存在，或已被移出 runs/。</div>";
+    app.innerHTML = html;
+    wire();
+    return;
+  }
+  html += sourceNote(detail);
+  html += tabs();
+  html += state.tab === "analysis" ? analysisBody() : statusBody(detail);
   app.innerHTML = html;
   wire();
 }
@@ -392,6 +511,13 @@ function render(force) {
 }
 
 function wire() {
+  document.querySelectorAll("[data-tab]").forEach((node) => {
+    node.onclick = () => {
+      state.tab = node.dataset.tab;
+      if (state.tab === "analysis") loadAnalysis(false);
+      render(true);
+    };
+  });
   document.querySelectorAll("[data-act]").forEach((node) => {
     const act = node.dataset.act;
     if (act === "pause") node.onclick = () => { state.paused = !state.paused; render(true); };
@@ -401,6 +527,7 @@ function wire() {
       document.documentElement.dataset.theme = next;
       render(true);
     };
+    if (act === "reload-analysis") node.onclick = () => loadAnalysis(true);
     if (act === "stop") node.onclick = () => {
       if (!window.confirm("停止批次 " + BATCH_ID + " 正在运行的实验？已完成的阶段会保留，可以之后 resume。")) return;
       fetch("/api/stop/" + BATCH_ID, { method: "POST" }).then(() => setTimeout(() => location.reload(), 1500));
