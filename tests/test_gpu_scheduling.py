@@ -143,6 +143,22 @@ class Host:
         return HostMemory(64 * 1024**2, 48 * 1024**2, 0, 0)
 
 
+def _worker(**fields):
+    """A scheduler worker stand-in; every field admission reads is numeric."""
+    values = {
+        "started": 0.0,
+        "device": 0,
+        "peak_kb": 0.0,
+        "resident_kb": 0.0,
+        "host_reserve_kb": 0.0,
+        "gpu_reserve_kb": 0.0,
+        "gpu_reserved_kb": 0.0,
+        "limit": None,
+    }
+    values.update(fields)
+    return Mock(**values)
+
+
 def _captured_gpu_ceilings(batch):
     """Run the Batch, returning what ceiling each attempt was started with.
 
@@ -631,7 +647,7 @@ class TestGpuScheduling:
         batch = make_batch(tmp_path, count=1, devices=[0], delay=0)
         scheduler = GpuScheduler(batch)
         host = HostMemory(64 * 1024**2, 48 * 1024**2, 0, 0)
-        scheduler._relieve(host)
+        scheduler._relieve(Memory([0]).sample(), host)
         assert scheduler.host_gate.can_launch(host)
 
     def test_host_pressure_does_not_shed_the_only_running_attempt(self, tmp_path):
@@ -643,22 +659,113 @@ class TestGpuScheduling:
         scheduler = GpuScheduler(batch)
         short = HostMemory(1000, 5, 0, 0)
         shed = []
-        with patch.object(GpuScheduler, "_shed", side_effect=shed.append):
-            scheduler.workers["only"] = Mock(started=0.0)
-            scheduler._relieve(short)
+        with patch.object(
+            GpuScheduler, "_shed", side_effect=lambda *a: shed.append(a[0])
+        ):
+            scheduler.workers["only"] = _worker(started=0.0)
+            scheduler._relieve(None, short)
             assert shed == []
             assert not scheduler.host_gate.can_launch(short)
 
             # A second attempt is over-commitment, so the newest one goes.
-            scheduler.workers["newer"] = Mock(started=1.0)
-            scheduler._relieve(short)
+            scheduler.workers["newer"] = _worker(started=1.0)
+            scheduler._relieve(None, short)
             assert shed == ["newer"]
 
             # An unreadable host is the same shortage, not a reason to stop the
             # one attempt that is already running.
             scheduler.workers.pop("newer")
-            scheduler._relieve(None)
+            scheduler._relieve(None, None)
             assert shed == ["newer"]
+
+    def test_an_unbacked_device_reservation_sheds_the_newest_attempt(self, tmp_path):
+        # Admission re-reads the cards on every tick, so a process that claims
+        # memory after a launch is visible -- but only to the next launch.
+        # Nothing re-checked the contracts already running, so a card left
+        # without room throttled every attempt on it instead of shedding one.
+        batch = make_batch(tmp_path, count=1, devices=[0], delay=0)
+        scheduler = GpuScheduler(batch)
+        memory = {0: DeviceMemory("GPU-test-0", 8 * 1024, 0.5 * 1024)}
+        scheduler.workers["older"] = _worker(
+            started=0.0,
+            device=0,
+            gpu_reserve_kb=4 * 1024**2,
+            gpu_reserved_kb=1 * 1024**2,
+        )
+        scheduler.workers["newer"] = _worker(
+            started=1.0, device=0, gpu_reserve_kb=4 * 1024**2, gpu_reserved_kb=0.0
+        )
+        shed = []
+        with patch.object(
+            GpuScheduler, "_shed", side_effect=lambda *a: shed.append(a[0])
+        ):
+            scheduler._relieve(memory, Host().sample())
+        # The two together were promised 8 GiB on a card with 0.5 GiB left.
+        assert shed == ["newer"]
+
+    def test_attempts_inside_their_reservation_are_not_shed(self, tmp_path):
+        batch = make_batch(tmp_path, count=1, devices=[0], delay=0)
+        scheduler = GpuScheduler(batch)
+        memory = {0: DeviceMemory("GPU-test-0", 8 * 1024, 6 * 1024)}
+        scheduler.workers["older"] = _worker(
+            started=0.0,
+            device=0,
+            gpu_reserve_kb=1 * 1024**2,
+            gpu_reserved_kb=1 * 1024**2,
+        )
+        scheduler.workers["newer"] = _worker(
+            started=1.0,
+            device=0,
+            gpu_reserve_kb=1 * 1024**2,
+            gpu_reserved_kb=1 * 1024**2,
+        )
+        shed = []
+        with patch.object(
+            GpuScheduler, "_shed", side_effect=lambda *a: shed.append(a[0])
+        ):
+            scheduler._relieve(memory, Host().sample())
+        assert shed == []
+
+    def test_an_attempt_beyond_its_reservation_is_shed(self, tmp_path):
+        # An attempt that took more than it was promised is spending another
+        # attempt's allowance, so the contract on that card is not the one
+        # admission made, whatever the reading says.
+        batch = make_batch(tmp_path, count=1, devices=[0], delay=0)
+        scheduler = GpuScheduler(batch)
+        memory = {0: DeviceMemory("GPU-test-0", 8 * 1024, 0.5 * 1024)}
+        scheduler.workers["older"] = _worker(
+            started=0.0,
+            device=0,
+            gpu_reserve_kb=1 * 1024**2,
+            gpu_reserved_kb=7 * 1024**2,
+        )
+        scheduler.workers["newer"] = _worker(
+            started=1.0, device=0, gpu_reserve_kb=1 * 1024**2, gpu_reserved_kb=0.0
+        )
+        shed = []
+        with patch.object(
+            GpuScheduler, "_shed", side_effect=lambda *a: shed.append(a[0])
+        ):
+            scheduler._relieve(memory, Host().sample())
+        assert shed == ["newer"]
+
+    def test_shedding_is_paced_while_pressure_outlives_one_tick(self, tmp_path):
+        # A cancelled attempt is retried, so a shortage that outlives one tick
+        # must not spend one attempt per tick while the ended process's memory
+        # is still being released.
+        batch = make_batch(tmp_path, count=1, devices=[0], delay=0)
+        scheduler = GpuScheduler(batch)
+        short = HostMemory(1000, 5, 0, 0)
+        for run_id, started in (("older", 0.0), ("middle", 1.0), ("newer", 2.0)):
+            scheduler.workers[run_id] = _worker(started=started)
+        shed = []
+        with patch.object(
+            GpuScheduler, "_shed", side_effect=lambda *a: shed.append(a[0])
+        ):
+            scheduler._relieve(None, short)
+            scheduler._relieve(None, short)
+            scheduler._relieve(None, short)
+        assert shed == ["newer"]
 
     def test_an_unmeasured_batch_probes_within_a_host_share(self, tmp_path):
         batch = make_batch(tmp_path, count=4, devices=[0, 1], delay=0)

@@ -136,6 +136,10 @@ class GpuScheduler:
         # dashboard to read, and neither is ever an input to a decision.
         self.events = deque(maxlen=200)
         self.last_plan = None
+        # Shedding under pressure is rate limited, and the deadline is the only
+        # state it needs: the memory an ended attempt held is not visible to the
+        # reading that follows it.
+        self._relief_until = 0.0
         batch._scheduler = self
 
     def _note(self, kind, **fields):
@@ -574,25 +578,75 @@ class GpuScheduler:
             }
         return memory, host
 
-    def _relieve(self, host):
-        """Shed one worker for this tick's host-memory pressure.
+    def _device_unbacked(self, memory, device):
+        """Whether one card can no longer honour the contracts running on it.
 
-        Shedding resolves over-commitment between attempts sharing the host. With
-        one attempt running there is nothing to distribute: ending it discards a
-        cold start that no other attempt is competing with, while the worker's own
-        cgroup limit is what actually bounds the host. A shortage with one worker
-        therefore pauses launches (see ``HostGate``) and keeps the attempt.
+        Admission re-reads device memory on every tick, so an external process
+        that claims memory after a launch is visible -- but only to the next
+        launch, because nothing re-checked the contracts already running. An
+        attempt's claim is what it was promised and has not taken yet, plus
+        what it took beyond its promise and is therefore spending from another
+        attempt's allowance; both come out of what is still free. A claim above
+        the free memory is a promise this scheduler can no longer keep.
         """
-        if host is not None and not host.tight:
-            return
-        if len(self.workers) > 1:
-            # Host RAM is shared by every worker process: drop the newest attempt
-            # globally. One attempt per tick, not one decisive sweep: a healthy
-            # reading on the next tick permits greedy refilling immediately.
-            self._shed(self._newest())
+        claim = sum(
+            abs(worker.gpu_reserve_kb - (worker.gpu_reserved_kb or 0.0))
+            for worker in self.workers.values()
+            if worker.device == device
+        )
+        return claim > memory[device].free * 1024
 
-    def _newest(self):
-        return max(self.workers, key=lambda run_id: self.workers[run_id].started)
+    def _relieve(self, memory, host):
+        """Shed one attempt when reservations already handed out are unbacked.
+
+        Shedding resolves over-commitment between attempts sharing a machine.
+        With one attempt running there is nothing to distribute: ending it
+        discards a cold start no other attempt is competing with, while that
+        worker's own cgroup and PyTorch limits are what actually bound it. A
+        shortage with one worker therefore pauses launches (see ``HostGate``
+        and ``_admits_gpu``) and keeps the attempt.
+
+        The host check is admission's own arithmetic with nothing new to place:
+        if one more attempt of zero size would not fit, what the host cannot
+        honour is the reservations already running. Pressure that is not the
+        host's is looked for on each card in turn. One attempt per shedding,
+        and none while a previous one is still being released.
+        """
+        if not self.workers or perf_counter() < self._relief_until:
+            return
+        if host is None or not self._admits(host, 0.0):
+            kind, device = "host", None
+        else:
+            device = next(
+                (
+                    item
+                    for item in (memory or ())
+                    if self._device_unbacked(memory, item)
+                ),
+                None,
+            )
+            if device is None:
+                return
+            kind = "device"
+        if len(self.workers) < 2:
+            return
+        # The attempt launched last is the one whose reservation this machine
+        # has had least time to honour, and the cheapest to give back.
+        self._shed(self._newest(device), kind, device)
+        self._relief_until = perf_counter() + devices.RELIEF_COOLDOWN
+
+    def _newest(self, device=None):
+        """The attempt launched last, globally or on one card."""
+        running = self.workers
+        if device is not None:
+            on_card = {
+                run_id: worker
+                for run_id, worker in running.items()
+                if worker.device == device
+            }
+            if on_card:
+                running = on_card
+        return max(running, key=lambda run_id: running[run_id].started)
 
     def _cap_report(self, worker):
         """Return the cgroup result last reported by the worker over IPC."""
@@ -612,8 +666,8 @@ class GpuScheduler:
             )
         return capped, peak
 
-    def _shed(self, run_id):
-        """Cancel one running attempt for memory pressure on its card."""
+    def _shed(self, run_id, kind, device=None):
+        """Cancel one running attempt whose reservation this machine cannot honour."""
         worker = self.workers[run_id]
         self._note(
             "shed",
@@ -621,7 +675,12 @@ class GpuScheduler:
             stage_index=worker.stage_index,
             stage_attempt=worker.stage_attempt,
             device=worker.device,
-            detail="主机内存紧张，撤销最新的尝试",
+            reason=kind,
+            detail=(
+                "主机内存不足以兑现已分配的配额，撤销最新的尝试"
+                if kind == "host"
+                else f"设备 {device} 显存不足以兑现已分配的配额，撤销最新的尝试"
+            ),
         )
         self._finish(run_id, cancelled="MemoryPressure")
 
@@ -1212,7 +1271,7 @@ class GpuScheduler:
                 # Both readings are rechecked every tick: a stale ratio never
                 # admits work, and an unreadable one keeps every card closed.
                 memory, host = self._observe()
-                self._relieve(host)
+                self._relieve(memory, host)
                 launching = self.host_gate.can_launch(host)
                 if launching and memory is not None:
                     self._materialize_reuses()

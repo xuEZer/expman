@@ -62,6 +62,12 @@ CAPACITY_NEAR = 0.9
 # launches more gently and spends less time inside nvidia-smi, but it also delays
 # collecting a finished attempt and shedding under pressure by up to one interval.
 POLL_INTERVAL = 1.0
+# How long shedding one attempt suspends shedding the next. The memory an ended
+# attempt held is not visible to the reading that follows it, and a shortage
+# that outlives one tick would otherwise spend one attempt per tick: an attempt
+# cancelled for pressure is retried, so an unbounded sweep turns into a loop
+# that burns cold starts instead of making room.
+RELIEF_COOLDOWN = 10.0
 # Measured on RTX 3070 laptop / WSL2, one GPU, at the scheduler's own cadence:
 # median 53 ms, p99 300 ms, worst 620 ms with the GPU in desktop use; median
 # 143 ms, worst 915 ms with the host CPU saturated. A false timeout kills a live
