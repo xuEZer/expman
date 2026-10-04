@@ -101,7 +101,11 @@ class Stream:
         self.interval = interval
         self.condition = threading.Condition()
         self.generation = 0
-        self.watched: set[int] = set()
+        # Subscriptions are counted, one per reader, not flagged per batch.
+        # A page that reloads unsubscribes as it goes, and a flag would let
+        # that unsubscribe drop the batch the connection after it had just
+        # asked for.
+        self.watched: dict[int, int] = {}
         self.frames: dict[object, str] = {"": _starting_payload()}
         self.stopped = threading.Event()
         self.thread = threading.Thread(
@@ -117,12 +121,18 @@ class Stream:
             self.condition.notify_all()
 
     def watch(self, batch_id: int) -> None:
+        """Subscribe one reader to a batch's frames."""
         with self.condition:
-            self.watched.add(batch_id)
+            self.watched[batch_id] = self.watched.get(batch_id, 0) + 1
 
     def unwatch(self, batch_id: int) -> None:
+        """Release one reader's subscription, keeping the others'."""
         with self.condition:
-            self.watched.discard(batch_id)
+            remaining = self.watched.get(batch_id, 0) - 1
+            if remaining > 0:
+                self.watched[batch_id] = remaining
+            else:
+                self.watched.pop(batch_id, None)
 
     def _loop(self) -> None:
         while not self.stopped.is_set():
@@ -130,19 +140,34 @@ class Stream:
             self.stopped.wait(self.interval)
 
     def refresh(self) -> None:
-        """Rebuild every frame; a build failure becomes a degraded payload."""
+        """Rebuild every frame; a build failure becomes a degraded payload.
+
+        A frame a watched batch already has survives a tick that could not
+        read it: one unreadable tick must not look like a batch that is gone,
+        and a build that fails outright must not empty the pages already open
+        on one. Both are the difference between a dashboard that blinks and a
+        dashboard that lies.
+        """
         try:
             summaries, details = self.workspace.collect()
             base = {"schema": SCHEMA, "generated_at": time(), "batches": summaries}
             with self.condition:
                 watched = set(self.watched)
+                previous = self.frames
             frames: dict[object, str] = {"": json.dumps(base, default=str)}
             for batch_id in watched:
+                detail = details.get(batch_id)
+                if detail is None and batch_id in previous:
+                    frames[batch_id] = previous[batch_id]
+                    continue
                 frames[batch_id] = json.dumps(
-                    {**base, "batch": details.get(batch_id)}, default=str
+                    {**base, "batch": detail}, default=str
                 )
         except Exception as error:
+            with self.condition:
+                previous = dict(self.frames)
             frames = {
+                **previous,
                 "": json.dumps(
                     {
                         "schema": SCHEMA,
@@ -150,7 +175,7 @@ class Stream:
                         "batches": [],
                         "degraded": f"{type(error).__name__}: {error}",
                     }
-                )
+                ),
             }
         with self.condition:
             self.frames = frames

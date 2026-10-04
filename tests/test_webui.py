@@ -2,7 +2,7 @@ import json
 import os
 import socket
 from time import perf_counter, sleep, time
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -20,6 +20,7 @@ from expman.scheduling import GpuScheduler, Worker
 from expman.storage import PickleSerializer, write_record
 from expman.webui import SCHEMA, build_snapshot, read_batch, serve, summarize
 from expman.webui.live import LIVE_FILE, LivePublisher, live_enabled
+from expman.webui.server import Stream, Workspace
 
 POSIX = pytest.mark.skipif(os.name != "posix", reason="POSIX worker process groups")
 GIB = 1024 * 1024
@@ -667,6 +668,38 @@ class TestDashboard:
             assert len(payload["batches"]) == 2
         finally:
             dashboard.close()
+
+    def test_a_replaced_subscriber_does_not_unwatch_its_replacement(self, runs):
+        # A page that reloads unsubscribes as it goes. That unsubscribe used
+        # to drop the batch the connection after it had just asked for, so
+        # the new page waited a heartbeat without a frame and rendered as a
+        # batch that does not exist.
+        stream = Stream(Workspace(runs), interval=1.0)
+        stream.watch(0)
+        stream.watch(0)
+        stream.unwatch(0)
+        assert stream.watched == {0: 1}
+        stream.unwatch(0)
+        assert stream.watched == {}
+
+    def test_a_tick_that_cannot_read_a_batch_keeps_its_last_frame(self, runs):
+        # One unreadable tick is one stale second, not a missing batch.
+        stream = Stream(Workspace(runs), interval=1.0)
+        stream.watch(0)
+        stream.refresh()
+        assert json.loads(stream.frame(0))["batch"]["id"] == 0
+        with patch.object(Workspace, "collect", return_value=([], {})):
+            stream.refresh()
+        assert json.loads(stream.frame(0))["batch"]["id"] == 0
+
+    def test_a_failed_build_does_not_empty_the_open_pages(self, runs):
+        stream = Stream(Workspace(runs), interval=1.0)
+        stream.watch(0)
+        stream.refresh()
+        with patch.object(Workspace, "collect", side_effect=RuntimeError("boom")):
+            stream.refresh()
+        assert json.loads(stream.frame(0))["batch"]["id"] == 0
+        assert "boom" in json.loads(stream.frame(""))["degraded"]
 
     def test_a_read_only_dashboard_refuses_to_stop(self, runs):
         dashboard = serve(runs, port=0, interval=1.0, allow_stop=False)

@@ -488,7 +488,13 @@ function renderBatch(s) {
   const detail = s.batch;
   let html = notices(s) + topBar(s, detail);
   if (!detail) {
-    html += '<div class="card empty">批次 ' + esc(BATCH_ID) + " 不存在，或已被移出 runs/。</div>";
+    // A frame without a batch is a page that has not been served one yet
+    // (the list frame, a degraded build or the first tick), not a batch that
+    // is missing: only say so when there is nothing to wait for.
+    const pending = s.starting || s.degraded || Array.isArray(s.batches);
+    html += '<div class="card empty">' + (pending
+      ? "正在读取批次 " + esc(BATCH_ID) + " 的快照，稍后自动刷新…"
+      : "批次 " + esc(BATCH_ID) + " 不存在，或已被移出 runs/。") + "</div>";
     app.innerHTML = html;
     wire();
     return;
