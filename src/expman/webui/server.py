@@ -160,9 +160,7 @@ class Stream:
                 if detail is None and batch_id in previous:
                     frames[batch_id] = previous[batch_id]
                     continue
-                frames[batch_id] = json.dumps(
-                    {**base, "batch": detail}, default=str
-                )
+                frames[batch_id] = json.dumps({**base, "batch": detail}, default=str)
         except Exception as error:
             with self.condition:
                 previous = dict(self.frames)
