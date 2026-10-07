@@ -209,10 +209,7 @@ def make_batch(root, *, count=3, devices=None, **options):
     }
     path = root / "experiments.yaml"
     path.write_text(yaml.safe_dump(cfg) + f"grid:\n  item: {list(range(count))}\n")
-    # These tests inspect what a finished Batch left on disk (worker
-    # bootstrap payloads, stage snapshots, results read back from disk),
-    # so they opt out of the finalization that would delete it.
-    return Batch(Pipeline([GpuWork]), path, output_dir=root / "batch", keep_cache=True)
+    return Batch(Pipeline([GpuWork]), path, output_dir=root / "batch")
 
 
 def warm(batch, *, gpu_peak_kb=1024, peak_kb=4096):
@@ -293,7 +290,7 @@ class TestGpuScheduling:
         with sqlite3.connect(batch.output_dir / "metrics.sqlite3") as db:
             assert db.execute("SELECT count(*) FROM metrics").fetchone()[0] == 40
         assert batch.recorder.events
-        resumed = Batch.resume(Pipeline([GpuWork]), batch.output_dir, keep_cache=True)
+        resumed = Batch.resume(Pipeline([GpuWork]), batch.output_dir)
         assert [item.output for item in resumed.run(progress=False)] == [
             item.output for item in results
         ]
@@ -306,10 +303,7 @@ class TestGpuScheduling:
             "grid:\n  item: [1, 2]\n"
         )
         batch = Batch(
-            Pipeline([Prepare, Consume]),
-            path,
-            output_dir=tmp_path / "two-stages",
-            keep_cache=True,
+            Pipeline([Prepare, Consume]), path, output_dir=tmp_path / "two-stages"
         )
 
         results = batch.run(progress=False)
@@ -549,9 +543,7 @@ class TestGpuScheduling:
         output_dir = tmp_path / "shared-two"
         path = tmp_path / "shared.yaml"
         path.write_text("device: [0]\nseed: 0\nunused: 1\ngrid:\n  unused: [1, 2]\n")
-        batch = Batch(
-            Pipeline([SharedWork]), path, output_dir=output_dir, keep_cache=True
-        )
+        batch = Batch(Pipeline([SharedWork]), path, output_dir=output_dir)
         seeded = Experiment(
             Pipeline([SharedWork]),
             {"seed": 0, "unused": 0},
@@ -632,7 +624,7 @@ class TestGpuScheduling:
             pid = int((tmp_path / f"{result.run_id}.started").read_text())
             with pytest.raises(ProcessLookupError):
                 os.kill(pid, 0)
-        resumed = Batch.resume(Pipeline([GpuWork]), batch.output_dir, keep_cache=True)
+        resumed = Batch.resume(Pipeline([GpuWork]), batch.output_dir)
         results = resumed.run(progress=False)
         assert all(item.status is Status.SUCCEEDED for item in results)
         # The state attribute comes from the checkpoint, not a re-executed loop.

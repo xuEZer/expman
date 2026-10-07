@@ -23,6 +23,7 @@ from time import sleep
 
 from . import settings
 from .batch import Batch
+from .cleanup import clean as clean_intermediates
 from .estimation import TimeEstimate
 from .pipeline import Pipeline
 from .registry import RUNS_DIR, ensure_ids
@@ -169,6 +170,19 @@ def _execute(batch: Batch, *, progress: bool, resume_command: str) -> int:
             (batch.output_dir / _PID_FILE).unlink()
     for result in results:
         print(f"{result.run_id}: {result.status.value}")
+
+    # 批次正常跑完，结果已经打印出来了，这时才丢掉共享前缀缓存。
+    # 放在 CLI 而不是 Batch.run() 里的原因：AttemptResult.output 是**惰性**的
+    # （每次访问都从权威记录回读，见 experiment.py 的注释），而共享前缀成员的
+    # 记录就在 <batch>/cache/ 下——run() 一返回就删，会让本进程再也读不出结果，
+    # 也会让 Batch.results 直接抛 StorageError。
+    try:
+        report = clean_intermediates(batch.output_dir)
+    except OSError as error:
+        print(f"could not drop the shared cache: {error}", file=sys.stderr)
+    else:
+        if not report.empty:
+            print(f"dropped shared cache: {report.summary()}", flush=True)
     return 0
 
 
@@ -185,7 +199,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
         args.config,
         max_retries=int(settings.get("retries")),
         estimate_coverage=float(settings.get("coverage")),
-        keep_cache=bool(getattr(args, "keep_cache", False)),
         output_dir=output_dir,
         _pipeline_spec={"module": module_name, "attr": attr_name},
     )
@@ -215,15 +228,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
             "with Batch.resume(pipeline, ...)"
         )
     pipeline = _resolve_pipeline(f"{spec['module']}:{spec['attr']}")
-    try:
-        batch = Batch.resume(
-            pipeline,
-            directory,
-            keep_cache=bool(getattr(args, "keep_cache", False)),
-        )
-    except StorageError as error:
-        # 最常见的成因是批次已收尾清理、不再可恢复；给出行指令而不是栈回溯。
-        raise SystemExit(f"cannot resume {directory}: {error}") from None
+    batch = Batch.resume(pipeline, directory)
     return _execute(
         batch,
         progress=args.progress,
@@ -415,15 +420,6 @@ def _parser() -> argparse.ArgumentParser:
             "--progress",
             action="store_true",
             help="show live progress while running (off by default)",
-        )
-        command.add_argument(
-            "--keep-cache",
-            action="store_true",
-            help=(
-                "keep resumable intermediates (shared cache, attempt snapshots) "
-                "after the batch finishes; without it they are deleted, "
-                "which makes the finished batch non-resumable"
-            ),
         )
     run.set_defaults(handler=_cmd_run)
     resume.set_defaults(handler=_cmd_resume)

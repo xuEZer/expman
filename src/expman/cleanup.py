@@ -1,55 +1,50 @@
-"""批次收尾：清掉只服务于「中断后恢复」、且能由重跑重建的中间态。
+"""批次收尾：删掉 `<batch>/cache/`。
 
-为什么值得做：`cache/` 存的是各 Stage 的输出快照，本机 D001 实测 **105 MB**，
-而真正是结果的东西（`metrics.sqlite3`、`output.log`、`config.pkl`）只有 4 MB 量级。
+`cache/` 是跨 Run 复用的 Stage 输出前缀缓存（`snapshot.pkl` / `metadata.pkl`），
+只服务于「同一批次内多个 Run 共享上游 Stage」，跑完即无价值。实测一次 13 个 Run
+的批次里它占 **105 MB**，而批次目录里其余全部东西（`batch.pkl` / `metrics.sqlite3` /
+`config.pkl` / `output.log`）加起来只有 **4 MB** 量级——`runs/` 的体积几乎全在这里。
 
-只在**批次正常跑完**之后清理。中断或异常退出会保留现场，`resume` 照常可用——
-这正是 resume 存在的意义，不该被收尾逻辑误伤。
+**只删 cache，不删 attempt / stage 中间态。** 后者体积上几乎没有收益，却是 load-bearing
+的：`Batch.resume` 需要它（`completed.pkl` 是「成功实验的最终快照」，缺了直接报错），
+框架也把「结果从磁盘回读而不是常驻内存」当作一条设计属性。
 
-清理后批次不能再 resume：`Batch.resume` 会先看到 `CACHE_CLEANED` 并给出明确报错，
-而不是等到 `successful experiment has no final snapshot` 这种绕远的失败。
+在哪里被调用
+------------
+`cli._execute()`，批次正常跑完、结果已经打印出来之后。
+
+为什么**不**放在 `Batch.run()` 里：`AttemptResult.output` 是惰性的——每次访问都从权威
+记录重读（见 `experiment.py` 的类注释），而共享前缀成员的记录就在 `<batch>/cache/`
+下面。`run()` 一返回就删，会让本进程再也读不出结果，`Batch.results` 直接抛
+`StorageError`。放到 CLI 层后：
+
+- 进程内语义不变：`batch.run()` 返回后结果照样读得出来（框架自己的测试就是靠这个）；
+- 真正的跑批入口 `expman run` 在打印完结果后丢掉缓存，`runs/` 的体积收益照样拿到；
+- 中断 / 异常路径不会走到这里，现场原样留给 `resume` 与排查。
 """
 
 from __future__ import annotations
 
 import shutil
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 CACHE_DIR = "cache"
-EXPERIMENTS_DIR = "experiments"
-SENTINEL = "CACHE_CLEANED"
-
-# 只服务于恢复，能由重跑重建 ⇒ 删
-RUN_FILES = ("rng_initial.pkl",)
-STAGE_FILES = ("completed.pkl", "pipeline.pkl")
-ATTEMPT_FILES = ("bootstrap.pkl", "input.pkl")
-
-# 明确保留（这些是批次的记录，不是缓存）：
-#   batch.pkl / metrics.sqlite3 / timing.pkl / live.json / run.lock
-#   experiments/<run>/config.pkl
-#   experiments/<run>/attempts/<stage>/<n>/output.log
-#   experiments/<run>/stages/<i>/status.pkl
 
 
 @dataclass
 class CleanReport:
-    """清理结果。`bytes` 含 shared cache；`cache_bytes` 单独列出便于对账。"""
+    """清理结果：删掉的文件数与字节数。"""
 
     files: int = 0
     bytes: int = 0
-    cache_bytes: int = 0
 
     @property
     def empty(self) -> bool:
         return self.files == 0
 
     def summary(self) -> str:
-        return (
-            f"{self.files} 个文件 / {self.bytes / 1e6:.1f} MB"
-            f"（其中 shared cache {self.cache_bytes / 1e6:.1f} MB）"
-        )
+        return f"{self.files} 个文件 / {self.bytes / 1e6:.1f} MB"
 
 
 def _size(path: Path) -> int:
@@ -59,73 +54,18 @@ def _size(path: Path) -> int:
         return 0
 
 
-def _tree_files(root: Path) -> list[Path]:
-    try:
-        return [path for path in root.rglob("*") if path.is_file()]
-    except OSError:
-        return []
-
-
 def clean(output_dir: str | Path) -> CleanReport:
-    """删除可重算的中间态，返回删掉的文件数与字节数。
+    """删除 `<output_dir>/cache/`，返回删掉的文件数与字节数。
 
-    幂等：目录已经清过时返回空报告，不会写 sentinel。
+    幂等：缓存不存在时返回空报告。
     """
-    root = Path(output_dir)
-    report = CleanReport()
-
-    cache = root / CACHE_DIR
-    if cache.is_dir():
-        files = _tree_files(cache)
-        report.cache_bytes = sum(_size(path) for path in files)
-        report.files += len(files)
-        report.bytes += report.cache_bytes
-        shutil.rmtree(cache, ignore_errors=True)
-
-    experiments = root / EXPERIMENTS_DIR
-    if experiments.is_dir():
-        stray: list[Path] = []
-        for run_dir in experiments.iterdir():
-            if not run_dir.is_dir():
-                continue
-            stray += [run_dir / name for name in RUN_FILES]
-            for parent_name, names in (("stages", STAGE_FILES), ("attempts", None)):
-                parent = run_dir / parent_name
-                if not parent.is_dir():
-                    continue
-                if names is not None:
-                    stray += [
-                        child / name
-                        for child in parent.iterdir()
-                        if child.is_dir()
-                        for name in names
-                    ]
-                else:  # attempts/<stage>/<n>/
-                    stray += [
-                        number_dir / name
-                        for stage_dir in parent.iterdir()
-                        if stage_dir.is_dir()
-                        for number_dir in stage_dir.iterdir()
-                        if number_dir.is_dir()
-                        for name in ATTEMPT_FILES
-                    ]
-        for path in stray:
-            if path.is_file():
-                report.bytes += _size(path)
-                report.files += 1
-                with suppress(OSError):
-                    path.unlink()
-
-    if report.files:
-        (root / SENTINEL).write_text(
-            "这个批次正常跑完后清掉了可重算的中间态（shared cache 与 attempt/stage 快照），\n"
-            "所以它不能再 resume。要保留现场，重跑时加 --keep-cache。\n\n"
-            f"清理结果：{report.summary()}\n",
-            encoding="utf-8",
-        )
+    cache = Path(output_dir) / CACHE_DIR
+    if not cache.is_dir():
+        return CleanReport()
+    try:
+        files = [path for path in cache.rglob("*") if path.is_file()]
+    except OSError:
+        files = []
+    report = CleanReport(files=len(files), bytes=sum(_size(path) for path in files))
+    shutil.rmtree(cache, ignore_errors=True)
     return report
-
-
-def was_cleaned(output_dir: str | Path) -> bool:
-    """批次是否已经收尾清理过（⇒ 不可 resume）。"""
-    return (Path(output_dir) / SENTINEL).is_file()

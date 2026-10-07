@@ -10,8 +10,6 @@ from time import monotonic
 from typing import Any, TypeGuard
 from uuid import uuid4
 
-from .cleanup import clean as clean_intermediates
-from .cleanup import was_cleaned as cache_was_cleaned
 from .config import load_configs
 from .context import _nonnegative_integer
 from .devices import configured_devices
@@ -77,7 +75,6 @@ class Batch:
         *,
         max_retries: int = 1,
         estimate_coverage: float = 0.8,
-        keep_cache: bool = False,
         recorder: Recorder | None = None,
         output_dir: str | Path | None = None,
         serializer: Serializer | None = None,
@@ -117,7 +114,6 @@ class Batch:
             Path("runs") / uuid4().hex if output_dir is None else Path(output_dir)
         ).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=False)
-        self.keep_cache = bool(keep_cache)
         self._serializer = PickleSerializer() if serializer is None else serializer
         self._signature = pipeline.signature()
         self.experiments = tuple(
@@ -230,18 +226,12 @@ class Batch:
         *,
         recorder: Recorder | None = None,
         serializer: Serializer | None = None,
-        keep_cache: bool = False,
     ) -> "Batch":
         """Resume trusted local records; the original experiment YAML is not read."""
         if not isinstance(pipeline, Pipeline):
             raise TypeError("pipeline must be a Pipeline")
         self = cls.__new__(cls)
         self.output_dir = Path(output_dir).resolve()
-        if cache_was_cleaned(self.output_dir):
-            raise StorageError(
-                f"{self.output_dir} 已正常跑完并清理了恢复现场，不能再 resume；"
-                "重跑一次，或下次构造时传 keep_cache=True 保留现场"
-            )
         self._serializer = PickleSerializer() if serializer is None else serializer
         manifest = read_record(self.output_dir / "batch.pkl", self._serializer)
         if (
@@ -274,7 +264,6 @@ class Batch:
         self.recorder = InMemoryRecorder() if recorder is None else recorder
         self._state_lock = RLock()
         self._started = False
-        self.keep_cache = bool(keep_cache)
         self._stage_progress = dict(manifest.get("stage_progress", {}))
         self._stage_attempts = dict(manifest.get("stage_attempts", {}))
         self._stage_elapsed = dict(manifest.get("stage_elapsed", {}))
@@ -511,12 +500,11 @@ class Batch:
             )
             timing_thread.start()
             live = self._start_live()
-            results: tuple[ExperimentResult, ...] = ()
             try:
                 display.start()
                 from .scheduling import GpuScheduler
 
-                results = GpuScheduler(self).run()
+                return GpuScheduler(self).run()
             except BaseException as caught:
                 error = caught
                 raise
@@ -540,34 +528,6 @@ class Batch:
                     )
                 if live is not None:
                     live.close()
-                # 正常跑完（error is None）才收尾；中断/异常要留现场给 resume。
-                if error is None:
-                    try:
-                        self._finalize_cache()
-                    except Exception as cleanup_error:
-                        warnings.warn(
-                            f"could not clean batch intermediates: {cleanup_error}",
-                            RecoveryWarning,
-                            stacklevel=2,
-                        )
-            return results
-
-    def _finalize_cache(self) -> None:
-        """批次正常跑完后清掉可重算的中间态（shared cache 与 attempt 快照）。
-
-        只在 run() 的正常路径上调用；中断或异常不会走到这里，
-        现场保留给 resume。清理后 resume 会被 CACHE_CLEANED 明确拦下。
-        """
-        if self.keep_cache:
-            return
-        report = clean_intermediates(self.output_dir)
-        if report.empty:
-            return
-        print(
-            f"[expman] batch finalized: cleaned {report.summary()}; "
-            "this batch can no longer be resumed (pass keep_cache to keep it)",
-            flush=True,
-        )
 
     def _start_live(self):
         """Publish live state for the dashboard; never fail the Batch for it.
