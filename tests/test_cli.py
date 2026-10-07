@@ -8,7 +8,7 @@ import time
 import pytest
 
 import expman
-from expman import cli
+from expman import cleanup, cli
 from expman.cli import _resolve_pipeline, main
 from expman.storage import PickleSerializer, read_record
 
@@ -200,7 +200,34 @@ def test_run_records_pipeline_spec_and_resume_repeats_it(
     }
     assert capsys.readouterr().out.count("succeeded") == 1
 
-    # A completed Batch has no pending work; resuming it succeeds immediately.
+    # Finalizing deletes the resume state, so resuming now fails loudly instead of
+    # reporting a misleading success.
+    assert cleanup.was_cleaned(output)
+    with pytest.raises(SystemExit, match="cannot resume"):
+        main(["resume", str(output)])
+
+
+def test_keep_cache_keeps_a_finished_batch_resumable(tmp_path, pipeline_module, capsys):
+    config = write_config(tmp_path)
+    output = tmp_path / "batch"
+
+    exit_code = main(
+        [
+            "run",
+            f"{pipeline_module}:train",
+            str(config),
+            "-o",
+            str(output),
+            "--keep-cache",
+        ]
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out.count("succeeded") == 1
+    assert not cleanup.was_cleaned(output)
+
+    # With the resume state kept, a completed Batch still has no pending work and
+    # resuming it succeeds immediately.
     assert main(["resume", str(output)]) == 0
 
 
@@ -287,10 +314,11 @@ def test_status_overview_watches_runs_with_ids(
 
 def test_stop_and_resume_accept_batch_ids(tmp_path, pipeline_module, capsys):
     config = write_config(tmp_path)
-    main(["run", f"{pipeline_module}:train", str(config)])
+    main(["run", f"{pipeline_module}:train", str(config), "--keep-cache"])
     capsys.readouterr()
 
-    # ID 0 is the batch just created; a completed batch resumes immediately.
+    # ID 0 is the batch just created; a completed batch whose resume state
+    # was kept resumes immediately.
     assert main(["resume", "0"]) == 0
     assert main(["stop", "0"]) == 1
 
