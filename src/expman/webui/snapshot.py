@@ -41,35 +41,56 @@ def _stage_names(batch):
     return []
 
 
+def remaining_interval(lower, upper, coverage, samples, remaining_groups):
+    """The remaining-time interval every snapshot reports, from raw values."""
+    return {
+        "lower_seconds": number(lower),
+        "upper_seconds": number(upper),
+        "coverage": number(coverage),
+        "samples": samples,
+        "remaining_groups": remaining_groups,
+    }
+
+
 def _remaining(batch):
     """The Batch-level interval the CLI already displays, without fitting one."""
     try:
         estimate = batch._display_estimate()
     except Exception:
         return None
-    return {
-        "lower_seconds": number(estimate.lower_seconds),
-        "upper_seconds": number(estimate.upper_seconds),
-        "coverage": number(estimate.coverage),
-        "samples": estimate.completed_samples,
-        "remaining_groups": estimate.remaining_experiments,
-    }
+    return remaining_interval(
+        estimate.lower_seconds,
+        estimate.upper_seconds,
+        estimate.coverage,
+        estimate.completed_samples,
+        estimate.remaining_experiments,
+    )
 
 
-def _counts(batch, active, queue):
-    """Per-run state counts, reading the attempt list the Batch already holds."""
+def run_counts(entries, active, queue):
+    """Per-run state counts from ``(run_id, last_status)`` pairs.
+
+    A run named in ``active`` counts as running and one in ``queue`` as
+    pending, both before its status is read; a run without any attempt yet is
+    pending, and a status this dashboard does not recognise folds into pending
+    as well, so a record written by another version never breaks the list.
+    """
     counts = {"running": 0, "pending": 0, "succeeded": 0, "failed": 0, "cancelled": 0}
-    for experiment in batch.experiments:
-        run_id = experiment.run_id
+    for run_id, last_status in entries:
         if run_id in active:
             state = "running"
-        elif run_id in queue:
+        elif run_id in queue or last_status is None:
             state = "pending"
         else:
-            attempts = getattr(experiment, "_attempts", ())
-            state = "pending" if not attempts else str(attempts[-1].status)
+            state = str(last_status).lower()
         counts[state if state in counts else "pending"] += 1
     return counts
+
+
+def _last_attempt_status(experiment):
+    """The status of a run's latest attempt, or None before its first one."""
+    attempts = getattr(experiment, "_attempts", ())
+    return attempts[-1].status if attempts else None
 
 
 def _progress(batch, limit=400):
@@ -231,6 +252,34 @@ def stage_samples(history):
     return counts
 
 
+def stage_record(
+    index, name, known, completed, total, unit, samples, approximate=False
+):
+    """One Stage's row in a snapshot, shared by both reading paths.
+
+    ``known`` is False until the scheduler has reported the Stage at all, and
+    ``unit`` is the scheduler's unit interval, which only a live batch holds.
+    The archived path passes nothing there and marks the row approximate
+    instead, so both paths serialize the same keys.
+    """
+    unit = unit or {}
+    return {
+        "index": index,
+        "name": name,
+        "known": known,
+        "groups_total": total,
+        "groups_done": completed,
+        "groups_remaining": None
+        if not known or total is None or completed is None
+        else max(0, total - completed),
+        "unit_lower_seconds": number(unit.get("unit_lower_seconds")),
+        "unit_upper_seconds": number(unit.get("unit_upper_seconds")),
+        "unit_samples": unit.get("spans"),
+        "samples": samples,
+        "approximate": approximate,
+    }
+
+
 def _stages(completion, names, view, samples):
     """Per-Stage remaining group counts plus the unit interval to multiply them by.
 
@@ -244,28 +293,17 @@ def _stages(completion, names, view, samples):
         else {index: (completed, total) for index, completed, total in completion}
     )
     units = (view or {}).get("stages") or {}
-    stages = []
-    for stage_index in sorted(set(counts) | set(range(len(names)))):
-        known = stage_index in counts
-        completed, total = counts.get(stage_index, (None, None))
-        unit = units.get(stage_index) or units.get(str(stage_index)) or {}
-        stages.append(
-            {
-                "index": stage_index,
-                "name": names[stage_index] if stage_index < len(names) else None,
-                "known": known,
-                "groups_total": total,
-                "groups_done": completed,
-                "groups_remaining": None
-                if not known or total is None or completed is None
-                else max(0, total - completed),
-                "unit_lower_seconds": number(unit.get("unit_lower_seconds")),
-                "unit_upper_seconds": number(unit.get("unit_upper_seconds")),
-                "unit_samples": unit.get("spans"),
-                "samples": samples.get(stage_index, {}),
-            }
+    return [
+        stage_record(
+            index,
+            names[index] if index < len(names) else None,
+            index in counts,
+            *counts.get(index, (None, None)),
+            units.get(index) or units.get(str(index)),
+            samples.get(index, {}),
         )
-    return stages
+        for index in sorted(set(counts) | set(range(len(names))))
+    ]
 
 
 def _events(items, limit=40):
@@ -363,7 +401,14 @@ def _gather(batch) -> dict:
             "max_retries": batch.max_retries,
             "experiments": len(batch.experiments),
             "stages": len(names),
-            "counts": _counts(batch, window["active"], window["queue"]),
+            "counts": run_counts(
+                (
+                    (experiment.run_id, _last_attempt_status(experiment))
+                    for experiment in batch.experiments
+                ),
+                window["active"],
+                window["queue"],
+            ),
             "remaining": _remaining(batch),
         },
         "stages": stages,

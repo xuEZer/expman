@@ -25,7 +25,14 @@ from time import time
 
 from ..storage import PickleSerializer, StorageError, read_record
 from .live import LIVE_FILE
-from .snapshot import SCHEMA, number, stage_samples
+from .snapshot import (
+    SCHEMA,
+    number,
+    remaining_interval,
+    run_counts,
+    stage_record,
+    stage_samples,
+)
 
 STALE_SECONDS = 3.0
 PID_FILE = "expman.pid"
@@ -83,20 +90,20 @@ def _records(directory: Path) -> tuple[dict | None, dict | None]:
 
 
 def _counts(manifest: dict) -> dict:
-    counts = {"running": 0, "pending": 0, "succeeded": 0, "failed": 0, "cancelled": 0}
-    queue = set(manifest.get("queue") or [])
-    active = set(manifest.get("active_gpu") or {})
-    for entry in manifest.get("experiments") or []:
-        run_id = entry.get("run_id")
-        attempts = entry.get("attempts") or []
-        if run_id in active:
-            state = "running"
-        elif run_id in queue or not attempts:
-            state = "pending"
-        else:
-            state = str(attempts[-1].get("status", "")).lower()
-        counts[state if state in counts else "pending"] += 1
-    return counts
+    return run_counts(
+        (
+            (entry.get("run_id"), _last_recorded_status(entry))
+            for entry in manifest.get("experiments") or []
+        ),
+        set(manifest.get("active_gpu") or {}),
+        set(manifest.get("queue") or []),
+    )
+
+
+def _last_recorded_status(entry: dict):
+    """The status of a run's latest recorded attempt, or None before any."""
+    attempts = entry.get("attempts") or []
+    return attempts[-1].get("status", "") if attempts else None
 
 
 def _stage_name(spec: object) -> str | None:
@@ -114,8 +121,7 @@ def _stages(manifest: dict) -> list[dict]:
     scheduler's samples, which are live-only, and stay unknown here.
     """
     signature = manifest.get("pipeline") or []
-    experiments = manifest.get("experiments") or []
-    runs = len(experiments)
+    runs = len(manifest.get("experiments") or [])
     history = manifest.get("stage_history") or []
     samples = stage_samples(history)
     reached: dict[int, set] = {}
@@ -125,38 +131,32 @@ def _stages(manifest: dict) -> list[dict]:
             continue
         if entry.get("reused") or entry.get("status") == "succeeded":
             reached.setdefault(index, set()).add(run_id)
-    stages = []
-    for index in range(len(signature)):
-        completed = min(len(reached.get(index, ())), runs)
-        stages.append(
-            {
-                "index": index,
-                "name": _stage_name(signature[index]),
-                "known": True,
-                "groups_total": runs,
-                "groups_done": completed,
-                "groups_remaining": max(0, runs - completed),
-                "unit_lower_seconds": None,
-                "unit_upper_seconds": None,
-                "unit_samples": None,
-                "samples": samples.get(index, {}),
-                "approximate": True,
-            }
+    return [
+        stage_record(
+            index,
+            _stage_name(signature[index]),
+            True,
+            min(len(reached.get(index, ())), runs),
+            runs,
+            None,
+            samples.get(index, {}),
+            approximate=True,
         )
-    return stages
+        for index in range(len(signature))
+    ]
 
 
 def _remaining(timing: dict | None) -> dict | None:
     estimate = (timing or {}).get("estimate")
     if not isinstance(estimate, dict):
         return None
-    return {
-        "lower_seconds": number(estimate.get("lower_seconds")),
-        "upper_seconds": number(estimate.get("upper_seconds")),
-        "coverage": number(estimate.get("coverage")),
-        "samples": estimate.get("completed_samples"),
-        "remaining_groups": estimate.get("remaining_experiments"),
-    }
+    return remaining_interval(
+        estimate.get("lower_seconds"),
+        estimate.get("upper_seconds"),
+        estimate.get("coverage"),
+        estimate.get("completed_samples"),
+        estimate.get("remaining_experiments"),
+    )
 
 
 def _idle_schedule(counts: dict) -> dict:

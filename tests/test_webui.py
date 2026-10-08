@@ -717,6 +717,10 @@ class TestDashboard:
             os, "kill", lambda pid, sig: signals.append((pid, sig)) if sig else None
         )
         (runs / "run_a" / "expman.pid").write_text("424242")
+        # Writing into run_a refreshed its mtime past run_b's; keep run_a the
+        # oldest so it still owns ID 0.
+        now = time()
+        os.utime(runs / "run_a", (now - 10, now - 10))
         dashboard = serve(runs, port=0, interval=1.0, allow_stop=True)
         try:
             status, body, _headers = self.get(

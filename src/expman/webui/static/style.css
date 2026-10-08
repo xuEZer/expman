@@ -10,7 +10,6 @@
   --done: #1D9E75;
   --running: #EF9F27;
   --actual: #4a9bea;
-  --budget: #9a8fe8;
   --other: #6b7480;
   --danger: #E24B4A;
   --ok: #1D9E75;
@@ -28,7 +27,6 @@
   --done: #0F6E56;
   --running: #BA7517;
   --actual: #185FA5;
-  --budget: #534AB7;
   --other: #888780;
   --danger: #A32D2D;
   --ok: #0F6E56;
@@ -67,8 +65,9 @@ button.danger { color: var(--danger); border-color: var(--danger); }
 .grid { display: grid; gap: 12px; }
 .tiles { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); margin-bottom: 16px; }
 .stages { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
-.cols { display: grid; gap: 16px; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); margin-top: 18px; }
-@media (max-width: 1080px) { .cols { grid-template-columns: minmax(0, 1fr); } }
+.barbox { position: relative; padding-top: 14px; }
+.marks { position: absolute; top: 0; left: 0; right: 0; height: 12px; }
+.bmark { position: absolute; transform: translateX(-50%); font-size: 10px; color: var(--muted); white-space: nowrap; }
 
 .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
 .tile { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; }
@@ -82,7 +81,7 @@ h2.section .hint { font-size: 11px; font-weight: 400; color: var(--faint); }
 .track.thin { height: 8px; }
 .track.wide { height: 18px; }
 .seg { position: absolute; top: 0; bottom: 0; }
-.env { position: absolute; top: 0; bottom: 0; border: 1px dashed var(--budget); border-radius: 4px; }
+.env { position: absolute; top: 0; bottom: 0; border: 1px dashed var(--danger); border-radius: 4px; }
 .cap { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--danger); }
 .row { display: grid; align-items: center; gap: 10px; }
 .rows .row + .row { margin-top: 9px; }
@@ -111,7 +110,7 @@ h2.section .hint { font-size: 11px; font-weight: 400; color: var(--faint); }
 .empty { color: var(--muted); font-size: 12px; }
 
 .scroll-x { overflow-x: auto; }
-.batch-row { grid-template-columns: 34px minmax(150px, 1.6fr) 72px 132px minmax(96px, 1fr) 70px 92px 128px 62px; font-size: 12px; }
+.batch-row { grid-template-columns: 34px minmax(150px, 1.6fr) 72px minmax(96px, 1fr) 70px 92px 128px; font-size: 12px; }
 .rows .batch-row + .batch-row { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border); }
 .head-row { font-size: 11px; color: var(--faint); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
 a.name { color: var(--text); text-decoration: none; font-weight: 600; }

@@ -27,3 +27,15 @@ repos:
         language: system
         always_run: true
         pass_filenames: false
+      - id: uv-lock
+        name: Lockfile check
+        entry: uv lock --check
+        language: system
+        always_run: true
+        pass_filenames: false
+      - id: examples
+        name: Run every example script
+        entry: bash scripts/run_examples.sh
+        language: system
+        files: ^(src|examples)/
+        pass_filenames: false
