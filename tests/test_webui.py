@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 import socket
 from time import perf_counter, sleep, time
 from unittest.mock import Mock, patch
@@ -248,6 +249,97 @@ def write_live(directory, *, age=0.0, **batch):
 # --------------------------------------------------------------------------
 # The snapshot the experiment process builds for itself.
 # --------------------------------------------------------------------------
+
+
+@POSIX
+def test_every_recorded_attempt_carries_a_span(tmp_path):
+    """A finished attempt lands on the effective clock with start <= end."""
+    batch = make_batch(tmp_path)
+    batch.run(progress=False)
+
+    spans = [
+        (entry["start_seconds"], entry["end_seconds"])
+        for entry in batch._stage_history
+        if "start_seconds" in entry
+    ]
+
+    assert spans, "the scheduler must stamp every attempt it records"
+    assert all(start <= end for start, end in spans)
+    assert all(start >= 0 for start, _ in spans)
+    # No attempt may claim time the Batch itself never accumulated.
+    assert max(end for _, end in spans) <= batch.elapsed_seconds + 1.0
+
+
+@POSIX
+def test_the_snapshot_places_attempts_on_a_gantt(tmp_path):
+    batch = make_batch(tmp_path)
+    batch.run(progress=False)
+
+    snapshot = build_snapshot(batch)
+
+    rows = snapshot["gantt"]
+    assert len(rows) == len(batch._stage_history)
+    assert all(
+        row["run"] and row["start_seconds"] <= row["end_seconds"] for row in rows
+    )
+    assert [row["start_seconds"] for row in rows] == sorted(
+        row["start_seconds"] for row in rows
+    )
+    assert snapshot["batch"]["session_marks"] == []
+
+
+def test_attempts_without_a_span_are_left_off_the_axis(tmp_path):
+    """An older record has no start, so it is dropped rather than guessed."""
+    batch = make_batch(tmp_path)
+    # Reproduce the shape a pre-gantt manifest holds: duration but no clock.
+    batch._stage_history.append(
+        {
+            "run_id": batch.experiments[0].run_id,
+            "stage": 0,
+            "attempt": 1,
+            "status": Status.SUCCEEDED.value,
+            "duration": 2.0,
+            "reused": False,
+        }
+    )
+
+    snapshot = build_snapshot(batch)
+
+    assert snapshot["gantt"] == []
+
+
+def test_the_archived_path_exposes_the_folds_it_recorded(tmp_path):
+    directory = tmp_path / "batch"
+    directory.mkdir()
+    manifest = {
+        "version": 1,
+        "pipeline": [{"class": "pkg.Stage"}],
+        "max_retries": 1,
+        "experiments": [{"run_id": "a" * 32, "attempts": []}],
+        "queue": [],
+        "active_gpu": {},
+        "stage_history": [
+            {
+                "run_id": "a" * 32,
+                "stage": 0,
+                "attempt": 1,
+                "status": Status.SUCCEEDED.value,
+                "reused": False,
+                "start_seconds": 1.0,
+                "end_seconds": 5.0,
+            }
+        ],
+        "session_marks": [12.0, 4.0],
+    }
+    (directory / "batch.pkl").write_bytes(pickle.dumps(manifest))
+
+    snapshot = read_batch(directory, 0)
+
+    assert snapshot["batch"]["session_marks"] == [4.0, 12.0]
+    rows = snapshot["gantt"]
+    assert len(rows) == 1
+    assert rows[0]["start_seconds"] == 1.0
+    assert rows[0]["end_seconds"] == 5.0
 
 
 @POSIX

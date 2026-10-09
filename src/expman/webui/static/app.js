@@ -22,6 +22,9 @@ const state = {
 const KIND = { launch: "启动", finish: "结束", reuse: "复用", shed: "撤销", probe: "探测" };
 const STATUS_TEXT = { running: "运行中", stopped: "已停止", finished: "已完成", failed: "有失败" };
 const STATUS_CLASS = { running: "ok", stopped: "warn", finished: "", failed: "bad" };
+// Attempt statuses are a different vocabulary from batch statuses: a gantt
+// bar is coloured by how its own attempt ended.
+const BAR_CLASS = { succeeded: "ok", failed: "bad", cancelled: "warn" };
 const SOURCE_TEXT = {
   live: "实时",
   last: "停止前最后一次采样",
@@ -281,6 +284,63 @@ function workerRow(w) {
     "</div></div>";
 }
 
+function timeline(s) {
+  const rows = s.gantt || [];
+  const marks = (s.batch && s.batch.session_marks) || [];
+  if (!rows.length)
+    return '<div class="card empty">这批记录没有可绘制的尝试跨度（旧批次不含起止时刻，用了才会开始累积）</div>';
+  // The axis runs from the batch's start to the furthest end anyone reported,
+  // so a bar can never spill past the edge.  It is the "effective" clock: the
+  // gaps between run invocations are already excluded, which is exactly what
+  // the folds below mark.
+  const span = Math.max(
+    ...[rows.map((r) => r.end_seconds), (s.batch || {}).elapsed_seconds || 0]
+      .flat().filter(ok), 0,
+  );
+  if (!ok(span) || span <= 0)
+    return '<div class="card empty">批次才开始，还没有可画的时间线</div>';
+  // First-fit packing: each lane remembers the clock time its last bar ended,
+  // so a new run drops into the earliest lane that is already free, and only
+  // a genuinely concurrent run opens a new lane.  Lane count == peak concurrency.
+  const lanes = [];
+  rows.forEach((r) => {
+    const start = clamp(r.start_seconds);
+    let lane = lanes.findIndex((free) => free <= start + 1e-9);
+    if (lane === -1) { lane = lanes.length; lanes.push(0); }
+    lanes[lane] = r.end_seconds;
+    r._lane = lane;
+  });
+  const bars = rows.map((r) => {
+    const left = pctOf(r.start_seconds, span);
+    const raw = pctOf(r.end_seconds - r.start_seconds, span);
+    // A zero-length attempt (a reused Stage) still gets a hairline so it is
+    // visible at all; every other bar keeps its true width.
+    const width = Math.max(raw, 0.4);
+    const cls = "gantt-bar " + (BAR_CLASS[r.status] || "");
+    const label = r.reused ? esc(r.run) + " 复用" : esc(r.run);
+    return '<span class="' + cls + '" style="left:' + left + "%;width:" + width + '%" title="' +
+      esc(r.run) + " · " + esc(r.stage || "S" + r.stage_index) + " a" + esc(r.attempt) +
+      " · " + secs(r.start_seconds) + "～" + secs(r.end_seconds) + '">' + label + "</span>";
+  });
+  const body = lanes.map((_, lane) => {
+    const here = bars.filter((_, i) => rows[i]._lane === lane).join("");
+    return '<div class="gantt-lane">' + here + "</div>";
+  }).join("");
+  const folds = marks.filter((m) => m > 0 && m < span).map((m) =>
+    '<span class="gantt-fold" style="left:' + pctOf(m, span) + '%" title="此处中断过，之后恢复"></span>'
+  ).join("");
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((fraction) => {
+    const text = fraction === 0 ? "0" : compact(span * fraction);
+    const place = fraction === 0
+      ? ""
+      : fraction === 1 ? ";transform:translateX(-100%)" : ";transform:translateX(-50%)";
+    return '<span class="tl-tick" style="left:' + fraction * 100 + "%" + place + '">' + esc(text) + "</span>";
+  }).join("");
+  return '<div class="card"><div class="gantt">' + body +
+    '<div class="gantt-axis">' + ticks + folds + "</div></div></div>";
+}
+
+
 function resources(s) {
   const r = s.resources || {};
   const rows = (r.devices || []).map(deviceRow);
@@ -463,6 +523,11 @@ function statusBody(detail) {
   let html = tiles(detail) + stages(detail);
   html += section("运行中的尝试", (detail.workers || []).length + " 个 worker",
     live ? workers(detail) : '<div class="card empty">没有实时 worker 数据</div>');
+  html += section(
+    "并发时间线",
+    "每行一个并发槽 · 横轴为批次有效时长（中断已折叠）",
+    timeline(detail),
+  );
   html += live ? resources(detail) : unavailable("资源分配", "没有实时采样");
   html += live ? events(detail) : unavailable("调度事件", "没有实时事件");
   return html;

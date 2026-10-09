@@ -306,6 +306,49 @@ def _stages(completion, names, view, samples):
     ]
 
 
+def gantt_rows(history, names):
+    """Every recorded attempt as one gantt row, on the Batch effective clock.
+
+    An entry without ``start_seconds`` predates this field (or came from an
+    older batch); it is dropped rather than guessed, so the axis never shows a
+    fabricated span.
+    """
+    rows = []
+    for entry in history:
+        start = number(entry.get("start_seconds"))
+        end = number(entry.get("end_seconds"))
+        run_id = entry.get("run_id")
+        if start is None or end is None or not isinstance(run_id, str):
+            continue
+        stage_index = entry.get("stage")
+        rows.append(
+            {
+                "run": run_id[:6],
+                "stage_index": stage_index,
+                "stage": names[stage_index]
+                if isinstance(stage_index, int) and stage_index < len(names)
+                else None,
+                "attempt": entry.get("attempt"),
+                "device": entry.get("device"),
+                "start_seconds": round(start, 2),
+                "end_seconds": round(end, 2),
+                "status": entry.get("status"),
+                "reused": bool(entry.get("reused")),
+            }
+        )
+    rows.sort(key=lambda row: (row["start_seconds"], row["run"]))
+    return rows
+
+
+def session_marks(marks):
+    """Positions on the clock where a previous invocation ended and another began."""
+    return sorted(
+        value
+        for value in (number(mark) for mark in marks or ())
+        if value is not None and value >= 0
+    )
+
+
 def _events(items, limit=40):
     """The tail of the scheduler's own event log, oldest first."""
     return [
@@ -356,6 +399,7 @@ def _publish_window(batch, scheduler):
             "active": dict(batch._active_gpu),
             "progress": dict(batch._stage_progress),
             "history": list(batch._stage_history),
+            "marks": list(batch._session_marks),
             "running_info": dict(batch._gpu_running_info),
             "device_memory": dict(batch._device_memory),
             "host_memory": dict(batch._host_memory),
@@ -410,9 +454,11 @@ def _gather(batch) -> dict:
                 window["queue"],
             ),
             "remaining": _remaining(batch),
+            "session_marks": session_marks(window["marks"]),
         },
         "stages": stages,
         "workers": workers,
+        "gantt": gantt_rows(window["history"], names),
         "resources": resources,
         "schedule": {
             "pending_runs": len(window["queue"]),

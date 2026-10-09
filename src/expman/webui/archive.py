@@ -27,9 +27,11 @@ from ..storage import PickleSerializer, StorageError, read_record
 from .live import LIVE_FILE
 from .snapshot import (
     SCHEMA,
+    gantt_rows,
     number,
     remaining_interval,
     run_counts,
+    session_marks,
     stage_record,
     stage_samples,
 )
@@ -159,6 +161,10 @@ def _remaining(timing: dict | None) -> dict | None:
     )
 
 
+def _stage_names(signature: list) -> list:
+    return [_stage_name(spec) or "Stage" for spec in signature]
+
+
 def _idle_schedule(counts: dict) -> dict:
     return {
         "pending_runs": counts.get("pending", 0),
@@ -181,6 +187,7 @@ def _archived(directory: Path) -> dict:
             "batch": empty,
             "stages": [],
             "workers": [],
+            "gantt": [],
             "resources": None,
             "schedule": _idle_schedule({}),
             "events": [],
@@ -199,9 +206,14 @@ def _archived(directory: Path) -> dict:
             "stages": len(manifest.get("pipeline") or []),
             "counts": counts,
             "remaining": _remaining(timing),
+            "session_marks": session_marks(manifest.get("session_marks")),
         },
         "stages": _stages(manifest),
         "workers": [],
+        "gantt": gantt_rows(
+            manifest.get("stage_history") or [],
+            _stage_names(manifest.get("pipeline") or []),
+        ),
         "resources": None,
         "schedule": _idle_schedule(counts),
         "events": [],
