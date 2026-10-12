@@ -104,6 +104,9 @@ class Batch:
         self._stage_elapsed = {}
         self._stage_history = []
         self._gpu_history = []
+        # Positions on the effective clock where a prior invocation ended and
+        # a later one resumed, so the dashboard can fold the downtime.
+        self._session_marks = []
         self._host_memory = {}
         self._gpu_running_info = {}
         # Live-only observations for the dashboard: recorded by the scheduler
@@ -209,6 +212,7 @@ class Batch:
             "stage_elapsed": dict(self._stage_elapsed),
             "stage_history": list(self._stage_history),
             "gpu_history": list(self._gpu_history),
+            "session_marks": list(self._session_marks),
             "estimation": {
                 "version": 1,
                 "execution": "gpu",
@@ -268,6 +272,7 @@ class Batch:
         self._stage_attempts = dict(manifest.get("stage_attempts", {}))
         self._stage_elapsed = dict(manifest.get("stage_elapsed", {}))
         self._stage_history = list(manifest.get("stage_history", []))
+        self._session_marks = list(manifest.get("session_marks", []))
         experiments = []
         for entry in manifest["experiments"]:
             run_id = entry["run_id"]
@@ -490,6 +495,17 @@ class Batch:
                 raise StorageError("batch records changed; reload with Batch.resume")
             self._started = True
             error = None
+            marked = False
+            with self._state_lock:
+                if self._elapsed_seconds > 0:
+                    # This invocation resumes after earlier work, so the time
+                    # gap it skipped collapses to a single fold on the axis.
+                    self._session_marks.append(round(self._elapsed_seconds, 2))
+                    marked = True
+            if marked:
+                # Persist at once: a session that finds nothing to run never
+                # reaches _finish(), and the fold would stay in memory only.
+                self._save()
             self._session_started = monotonic()
             timing_stopped = Event()
             timing_thread = Thread(

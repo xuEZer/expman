@@ -885,6 +885,10 @@ class GpuScheduler:
                         "status": Status.SUCCEEDED.value,
                         "reused": True,
                         "dependencies": completed.get("config_dependencies"),
+                        # Reuse consumes no wall time; mark it as a
+                        # zero-length point so it still lands on the axis.
+                        "start_seconds": round(self.batch.elapsed_seconds, 2),
+                        "end_seconds": round(self.batch.elapsed_seconds, 2),
                     }
                 )
                 if stage_index == len(experiment.pipeline.stages) - 1:
@@ -1115,6 +1119,12 @@ class GpuScheduler:
         self._messages(worker)
         experiment = worker.experiment
         duration = max(0.0, finished - worker.started)
+        # The dashboard places each attempt on the Batch's effective clock,
+        # which already excludes the gaps between run invocations.  The
+        # attempt ends "now" on that clock, so its span needs no clock
+        # alignment: start is simply the end minus the measured duration.
+        span_end = self.batch.elapsed_seconds
+        span_start = max(0.0, span_end - duration)
         capped, peak_kb = self._cap_report(worker)
         result = worker.finished or StageResult(
             run_id,
@@ -1193,6 +1203,8 @@ class GpuScheduler:
                 "capped": capped,
                 "reused": worker.reused,
                 "dependencies": worker.dependencies,
+                "start_seconds": round(span_start, 2),
+                "end_seconds": round(span_end, 2),
             }
             self._append_stage_history(observation)
             self._stage_peak_models.pop((worker.stage_index, "peak_kb"), None)
