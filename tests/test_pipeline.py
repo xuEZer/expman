@@ -305,3 +305,34 @@ def test_progress_accepts_zero_total_and_unknown_total(recorder, ctx):
     ctx.report_progress(0, total=0)
     ctx.report_progress(3, unit="epoch")
     assert recorder.events[-1].total is None
+
+
+def test_stage_source_hash_is_the_module_file():
+    """The fingerprint is the module file, so every worker process agrees on it.
+
+    `inspect.getsource` cannot serve here: a `forkserver` / `spawn` worker (the
+    Linux default from Python 3.14) raises `OSError` for it, which would leave
+    the parent and the worker with different shared-cache keys.
+    """
+    from hashlib import sha256
+    from pathlib import Path
+
+    class Entry(Stage):
+        def process(self, data, ctx):
+            return data
+
+    signature = Pipeline([Entry], name="entry").signature()
+    expected = sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+    assert signature[0]["source"] == expected
+    assert signature[0]["class"].endswith(".Entry")
+
+
+def test_signature_is_stable_across_calls():
+    """Repeated calls agree, so a cached key never disagrees with a fresh one."""
+
+    class Entry(Stage):
+        def process(self, data, ctx):
+            return data
+
+    pipeline = Pipeline([Entry], name="entry")
+    assert pipeline.signature() == pipeline.signature()
