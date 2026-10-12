@@ -1,10 +1,11 @@
 """Sequential composition of user-defined stages."""
 
+import sys
 import warnings
 from collections.abc import Iterable
 from dataclasses import replace
 from hashlib import sha256
-from inspect import getsource
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
@@ -28,6 +29,30 @@ def _reuse_completed(scoped, store, completed, position, restore_seconds):
             restore_seconds=restore_seconds,
         )
     return output
+
+
+def _module_source_hash(stage: type[Stage[Any, Any]]) -> str | None:
+    """Hash the file a stage's module was loaded from.
+
+    `inspect.getsource(stage)` is the obvious choice, but it is not stable
+    across worker processes: with `forkserver` / `spawn` (the Linux default
+    from Python 3.14) the entry script runs in the child under a different
+    module name, and `getsource` raises `OSError: source code not available`
+    there. The parent would then hash the class while the worker hashed
+    nothing, and the two derived different shared-cache keys -- every lookup
+    failed with `invalid shared-cache reference`. The module file resolves to
+    the same path on both sides, so hash that instead. The granularity is
+    coarser -- editing anything in the file invalidates every stage it holds --
+    which only ever rebuilds more than strictly needed.
+    """
+    module = sys.modules.get(stage.__module__)
+    path = getattr(module, "__file__", None)
+    if not path:
+        return None
+    try:
+        return sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 class Pipeline:
@@ -61,12 +86,11 @@ class Pipeline:
     def signature(self) -> list[dict]:
         result = []
         for stage in self.stages:
-            try:
-                source = sha256(getsource(stage).encode()).hexdigest()
-            except (OSError, TypeError):
-                source = None
             result.append(
-                {"class": f"{stage.__module__}.{stage.__qualname__}", "source": source}
+                {
+                    "class": f"{stage.__module__}.{stage.__qualname__}",
+                    "source": _module_source_hash(stage),
+                }
             )
         return result
 
