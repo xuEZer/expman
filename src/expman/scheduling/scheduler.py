@@ -7,8 +7,7 @@ import subprocess
 import sys
 import warnings
 from collections import deque
-from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from pathlib import Path
 from time import perf_counter, sleep, time
 
@@ -19,93 +18,31 @@ from expman.core.dependencies import declared_paths
 from expman.core.dependencies import observation as config_observation
 from expman.core.events import Status
 from expman.core.experiment import AttemptResult, SnapshotOutput, StageResult
-from expman.estimation.duration_model import DurationModel, StageDuration
+from expman.estimation.duration_model import DurationModel
 from expman.estimation.memory_model import LocalQuantileEstimator, PeakCeiling
 from expman.estimation.time_model import encode
+from expman.scheduling._models import (
+    Candidate,
+    HostGate,
+    Plan,
+    Worker,
+    _close_stdin,
+    _kill_group,
+)
+from expman.scheduling._planning import (
+    PLAN_BEAM_WIDTH,
+    PLAN_CANDIDATES_PER_STAGE,
+    _interleave,
+    _plan_score,
+)
+from expman.scheduling._resource import (
+    _admits,
+    _admits_gpu,
+    _device_unbacked,
+    _resource_left,
+)
 from expman.scheduling.ipc import Channel
 from expman.storage.base import PickleSerializer, RecoveryWarning, write_record
-
-PLAN_CANDIDATES_PER_STAGE = 32
-PLAN_BEAM_WIDTH = 128
-
-
-class HostGate:
-    """Admission from the current host-memory observation only."""
-
-    def can_launch(self, host):
-        return not (host is None or host.tight)
-
-
-@dataclass
-class Worker:
-    process: subprocess.Popen
-    experiment: object
-    device: int | None
-    uuid: str | None
-    root: Path
-    started: float
-    stage_index: int | None = 0
-    stage_attempt: int = 1
-    channel: Channel | None = None
-    # The peak estimates admission charges this attempt for. Admission reserves
-    # these rather than the hard ceilings below, so a packed plan spends what
-    # attempts are expected to need and the ceilings stay an allowance on top.
-    host_reserve_kb: float = 0.0
-    gpu_reserve_kb: float = 0.0
-    # The device ceiling this attempt actually runs under, or zero when it was
-    # started without one. Admission charges only the growth above what it has
-    # already reserved, so an attempt with no ceiling charges its own usage.
-    gpu_cap_kb: float = 0.0
-    expected: StageDuration | None = None
-    area: float = 0.0
-    limit: object = None
-    # Sampled every tick: resident is what the worker holds now, peak is the most
-    # it has ever held. Admission reserves the gap between the two.
-    resident_kb: float = 0.0
-    peak_kb: float = 0.0
-    gpu_allocated_kb: float | None = None
-    gpu_reserved_kb: float | None = None
-    gpu_peak_allocated_kb: float | None = None
-    gpu_peak_reserved_kb: float | None = None
-    memory_events: dict = field(default_factory=dict)
-    finished: StageResult | None = None
-    dependencies: list | None = None
-    reused: bool = False
-    cap_hit: bool = False
-
-
-@dataclass(frozen=True)
-class Candidate:
-    """One ready Stage with its resource reservations for this scheduling tick."""
-
-    run_id: str
-    stage_index: int
-    host_reserve_kb: float
-    gpu_reserve_kb: float
-    gpu_cap_kb: float
-    expected: StageDuration | None
-    novelty: float
-
-
-@dataclass(frozen=True)
-class Plan:
-    """A feasible placement of ready Stage candidates on the selected cards."""
-
-    host_left_kb: float
-    gpu_left_kb: tuple[float, ...]
-    placements: tuple[tuple[Candidate, int], ...] = ()
-    novelty: float = 0.0
-
-
-def _kill_group(process):
-    with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-
-
-def _close_stdin(process):
-    """Close a worker's control pipe; workers always start with stdin=PIPE."""
-    if process.stdin is not None:
-        process.stdin.close()
 
 
 class GpuScheduler:
@@ -441,17 +378,6 @@ class GpuScheduler:
             )
         return candidates
 
-    @staticmethod
-    def _interleave(groups):
-        """Round-robin candidates so one Stage cannot consume beam search first."""
-        items = []
-        longest = max((len(group) for group in groups), default=0)
-        for index in range(longest):
-            for group in groups:
-                if index < len(group):
-                    items.append(group[index])
-        return items
-
     def _account(self):
         now = perf_counter()
         for worker in self.workers.values():
@@ -616,14 +542,14 @@ class GpuScheduler:
         """
         if not self.workers or perf_counter() < self._relief_until:
             return
-        if host is None or not self._admits(host, 0.0):
+        if host is None or not _admits(self.workers, host, 0.0):
             kind, device = "host", None
         else:
             device = next(
                 (
                     item
                     for item in (memory or ())
-                    if self._device_unbacked(memory, item)
+                    if _device_unbacked(self.workers, memory, item)
                 ),
                 None,
             )
@@ -726,21 +652,9 @@ class GpuScheduler:
             )
         return host_left, gpu_left
 
-    @staticmethod
-    def _plan_score(plan, host_capacity, gpu_capacities):
-        """Prefer plans that jointly leave the least normalized resource behind."""
-        unused = (plan.host_left_kb / host_capacity) ** 2
-        unused += sum(
-            (left / capacity) ** 2
-            for left, capacity in zip(plan.gpu_left_kb, gpu_capacities, strict=True)
-            if capacity > 0
-        )
-        # Parameter diversity only breaks materially equivalent packing choices.
-        return -unused + 1e-6 * plan.novelty
-
     def _launch_plan(self, memory, host):
         """Choose a bounded multi-resource packing plan for this scheduler tick."""
-        host_capacity, available_gpu = self._resource_left(memory, host)
+        host_capacity, available_gpu = _resource_left(self.workers, memory, host)
         devices_in_plan = tuple(memory)
         if host_capacity <= 0 or not devices_in_plan:
             return ()
@@ -761,7 +675,7 @@ class GpuScheduler:
         gpu_probe_kb = devices.probe_cap_kb(
             gpu_capacity_kb, devices.GPU_PEAK_KB_DEFAULT
         )
-        candidates = self._interleave(
+        candidates = _interleave(
             [
                 self._stage_candidates(
                     stage, gpu_capacity_kb, host_probe_kb, gpu_probe_kb
@@ -790,12 +704,12 @@ class GpuScheduler:
                     )
             plans = sorted(
                 expanded,
-                key=lambda plan: self._plan_score(plan, host_capacity, gpu_capacities),
+                key=lambda plan: _plan_score(plan, host_capacity, gpu_capacities),
                 reverse=True,
             )[:PLAN_BEAM_WIDTH]
         chosen = max(
             plans,
-            key=lambda plan: self._plan_score(plan, host_capacity, gpu_capacities),
+            key=lambda plan: _plan_score(plan, host_capacity, gpu_capacities),
         )
         # Published for the dashboard: what this tick could place and what it
         # passed over.  Recorded here because only this thread may read the
@@ -932,8 +846,8 @@ class GpuScheduler:
         host_reserve = candidate.host_reserve_kb
         gpu_reserve = candidate.gpu_reserve_kb
         duration_estimate = candidate.expected
-        gpu_fits = self._admits_gpu(memory, device, gpu_reserve)
-        if not self._admits(host, host_reserve) or not gpu_fits:
+        gpu_fits = _admits_gpu(self.workers, memory, device, gpu_reserve)
+        if not _admits(self.workers, host, host_reserve) or not gpu_fits:
             # Put the selection back at the front. Dispatching updated the
             # estimator's own state, and re-selecting the same run is idempotent,
             # so the queue keeps its remaining order while the host is short.
