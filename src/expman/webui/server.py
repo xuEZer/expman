@@ -11,8 +11,6 @@ so a cluster without internet access can still open it.
 """
 
 import json
-import os
-import signal
 import threading
 from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,8 +20,9 @@ from typing import cast
 from urllib.parse import parse_qs, urlparse
 
 from ..analysis import analysis_payload, fingerprint
+from ..process_control import request_stop
 from ..registry import ensure_ids
-from .archive import PID_FILE, read_batch, summarize
+from .archive import read_batch, summarize
 from .snapshot import SCHEMA
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
@@ -69,17 +68,10 @@ class Workspace:
 
 def stop(batch_id: int, directory: Path) -> tuple[bool, str]:
     """Ask the process that owns a batch to stop, via its PID record."""
-    try:
-        pid = int((directory / PID_FILE).read_text().strip())
-    except (OSError, ValueError):
-        return False, f"batch {batch_id} is not running (no live PID record)"
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return False, f"process {pid} is gone"
-    except PermissionError:
-        return False, f"no permission to signal process {pid}"
-    return True, f"stop signal sent to {pid}"
+    success, message = request_stop(directory)
+    if not success and "is not running" in message:
+        message = f"batch {batch_id} is not running (no live PID record)"
+    return success, message
 
 
 def _starting_payload() -> str:

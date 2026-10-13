@@ -11,6 +11,7 @@ from .storage import (
     StorageError,
     read_record,
     stage_seconds,
+    validate_snapshot,
     write_record,
 )
 
@@ -49,15 +50,7 @@ class PrefixCache:
         directory = self._directory(reference)
         self.metadata(reference, position)
         record = read_record(directory / "snapshot.pkl", self.serializer)
-        if (
-            not isinstance(record, dict)
-            or record.get("position") != position
-            or not isinstance(record.get("state"), dict)
-            or "output" not in record
-            or not isinstance(record.get("name"), str)
-            or "rng_state" not in record
-        ):
-            raise StorageError("invalid shared-cache snapshot")
+        validate_snapshot(record, position, require_rng=True)
         stage_seconds(record)
         return record
 

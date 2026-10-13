@@ -1133,7 +1133,8 @@ class TestDevice:
                 "0, GPU-first, 100, 10\n1, GPU-second, 200, 150\n"
             )
             monitor = NvidiaMemory((0, 1))
-            assert monitor.sample()[0].free_ratio == 0.1
+            observation = monitor.sample()[0]
+            assert observation.free / observation.total == 0.1
             assert "--id=0,1" in query.call_args.args[0]
             query.return_value.stdout = (
                 "0, GPU-replaced, 100, 10\n1, GPU-second, 200, 150\n"

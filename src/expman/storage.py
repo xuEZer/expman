@@ -95,6 +95,19 @@ def stage_seconds(record):
     return value
 
 
+def validate_snapshot(record, position, *, require_rng=False) -> None:
+    """Validate the common shape of a completed Stage snapshot."""
+    if (
+        not isinstance(record, dict)
+        or record.get("position") != position
+        or not isinstance(record.get("state"), dict)
+        or "output" not in record
+        or not isinstance(record.get("name"), str)
+        or (require_rng and "rng_state" not in record)
+    ):
+        raise StorageError("invalid snapshot record")
+
+
 class RunStore:
     def __init__(self, root: Path, serializer: Serializer | None = None):
         self.root = root
@@ -234,14 +247,7 @@ class RunStore:
             snapshot["_cache_ref"] = reference
             snapshot["_shared_reused"] = record["shared_reused"]
             return snapshot
-        if (
-            not isinstance(record, dict)
-            or record.get("position") != position
-            or not isinstance(record.get("state"), dict)
-            or "output" not in record
-            or not isinstance(record.get("name"), str)
-        ):
-            raise StorageError(f"invalid stage snapshot: {path}")
+        validate_snapshot(record, position)
         stage_seconds(record)
         return record
 
@@ -300,7 +306,7 @@ class RunStore:
         directory = self.stage_dir(position) / "checkpoints"
         return sorted(directory.glob("[0-9]*.pkl"), reverse=True)
 
-    def latest(self, position, *, config=None, restore_random=False) -> dict | None:
+    def latest(self, position, *, config=None) -> dict | None:
         for path in self.checkpoints(position):
             try:
                 record = read_record(path, self.serializer)
@@ -327,8 +333,6 @@ class RunStore:
                             )
                     except ValueError as error:
                         raise StorageError(str(error)) from error
-                if restore_random:
-                    self.restore_random(record)
                 return record
             except StorageError as error:
                 warnings.warn(str(error), RecoveryWarning, stacklevel=2)

@@ -17,8 +17,12 @@ def validate_coverage(value: object) -> float:
     return coverage
 
 
-def _clock(seconds: float | None, *, upper: bool) -> str:
-    if seconds is None or not math.isfinite(seconds):
+def _clock(seconds: object, *, upper: bool) -> str:
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, (int, float))
+        or not math.isfinite(seconds)
+    ):
         return "??:??:??"
     minutes = math.ceil(seconds / 60) if upper else math.floor(seconds / 60)
     days, remainder = divmod(max(0, minutes), 24 * 60)

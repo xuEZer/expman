@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 from time import time
 
+from ..process_control import PID_FILE
 from ..storage import PickleSerializer, StorageError, read_record
 from .live import LIVE_FILE
 from .snapshot import (
@@ -37,7 +38,6 @@ from .snapshot import (
 )
 
 STALE_SECONDS = 3.0
-PID_FILE = "expman.pid"
 
 
 def alive(pid: int) -> bool:

@@ -128,10 +128,6 @@ class DeviceMemory:
     total: float
     free: float
 
-    @property
-    def free_ratio(self) -> float:
-        return self.free / self.total
-
 
 def nvidia_smi() -> str:
     """Resolve nvidia-smi from PATH, then from the known WSL2 driver directory."""

@@ -25,13 +25,14 @@ from . import settings
 from .batch import Batch
 from .cleanup import clean as clean_intermediates
 from .estimation import TimeEstimate
+from .estimation import _clock as _fmt_elapsed
 from .pipeline import Pipeline
+from .process_control import PID_FILE, request_stop
 from .registry import RUNS_DIR, ensure_ids
 from .stage import Stage
 from .storage import PickleSerializer, StorageError, read_record
 from .webui import DEFAULT_PORT, serve
 
-_PID_FILE = "expman.pid"
 _STATUS_INTERVAL = 2.0
 
 
@@ -121,15 +122,6 @@ def _read_manifest(directory: Path) -> dict:
     return manifest
 
 
-def _fmt_elapsed(seconds: object) -> str:
-    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
-        return "??:??:??"
-    minutes = int(max(0.0, float(seconds)) // 60)
-    days, remainder = divmod(minutes, 24 * 60)
-    hours, minutes = divmod(remainder, 60)
-    return f"{days:02d}:{hours:02d}:{minutes:02d}"
-
-
 def _read_timing(directory: Path) -> tuple[str, str]:
     """The persisted elapsed time and remaining-time estimate, if any."""
     elapsed = "??:??:??"
@@ -141,7 +133,7 @@ def _read_timing(directory: Path) -> tuple[str, str]:
         except (StorageError, OSError):
             timing = None
         if isinstance(timing, dict) and timing.get("version") == 1:
-            elapsed = _fmt_elapsed(timing.get("elapsed_seconds"))
+            elapsed = _fmt_elapsed(timing.get("elapsed_seconds"), upper=False)
             saved = timing.get("estimate")
             if isinstance(saved, dict):
                 with suppress(TypeError, ValueError):
@@ -160,14 +152,14 @@ def _execute(batch: Batch, *, progress: bool, resume_command: str) -> int:
     with suppress(ValueError):
         signal.signal(signal.SIGTERM, stopped)
     try:
-        (batch.output_dir / _PID_FILE).write_text(str(os.getpid()))
+        (batch.output_dir / PID_FILE).write_text(str(os.getpid()))
         results = batch.run(progress=progress)
     except KeyboardInterrupt:
         print(f"Stopped; resume with: {resume_command}", file=sys.stderr)
         return 143
     finally:
         with suppress(FileNotFoundError):
-            (batch.output_dir / _PID_FILE).unlink()
+            (batch.output_dir / PID_FILE).unlink()
     for result in results:
         print(f"{result.run_id}: {result.status.value}")
 
@@ -354,26 +346,9 @@ def _live_overview() -> int:
 
 def _cmd_stop(args: argparse.Namespace) -> int:
     directory = _resolve_directory(args.directory)
-    pid_path = directory / _PID_FILE
-    try:
-        pid = int(pid_path.read_text())
-    except (FileNotFoundError, ValueError):
-        print(f"{directory} is not running (no live PID record).", file=sys.stderr)
-        return 1
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pid_path.unlink(missing_ok=True)
-        print(
-            f"process {pid} is gone; removed the stale PID record.",
-            file=sys.stderr,
-        )
-        return 1
-    except PermissionError:
-        print(f"no permission to signal process {pid}.", file=sys.stderr)
-        return 1
-    print(f"Stop signal sent to {pid}; the batch persists and exits shortly.")
-    return 0
+    success, message = request_stop(directory)
+    print(message, file=sys.stderr if not success else None)
+    return 0 if success else 1
 
 
 def _cmd_web(args: argparse.Namespace) -> int:

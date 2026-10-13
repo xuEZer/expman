@@ -99,9 +99,7 @@ class Batch:
             validate_seed(config["seed"])
         self._pipeline_spec = _validate_pipeline_spec(_pipeline_spec)
         self._active_gpu = {}
-        self._stage_progress = {}
         self._stage_attempts = {}
-        self._stage_elapsed = {}
         self._stage_history = []
         self._gpu_history = []
         # Positions on the effective clock where a prior invocation ended and

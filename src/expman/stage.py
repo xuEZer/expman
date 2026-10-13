@@ -4,16 +4,10 @@ from collections.abc import Mapping
 from inspect import Parameter, signature
 from typing import TYPE_CHECKING, Any, final
 
-from .context import RunContext, _name
+from .context import RunContext, _name, _nonnegative_integer
 
 if TYPE_CHECKING:
     from .storage import Checkpoint
-
-
-def _nonnegative_integer(value: object, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a nonnegative integer")
-    return value
 
 
 class _CfgValue:

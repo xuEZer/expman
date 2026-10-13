@@ -8,7 +8,7 @@ import unicodedata
 from numbers import Real
 from threading import Event, Thread
 
-from .estimation import UNKNOWN_CLOCK
+from .estimation import UNKNOWN_CLOCK, _clock
 
 _logger = logging.getLogger(__name__)
 _UNKNOWN = UNKNOWN_CLOCK
@@ -99,10 +99,7 @@ class BatchProgress:
                 or "Stage：0/0"
             )
             cards = f" | {cards}" if cards else ""
-            minutes = int(max(0, self.batch.elapsed_seconds) // 60)
-            days, minutes = divmod(minutes, 24 * 60)
-            hours, minutes = divmod(minutes, 60)
-            elapsed = f"{days:02d}:{hours:02d}:{minutes:02d}"
+            elapsed = _clock(self.batch.elapsed_seconds, upper=False)
             line = (
                 f"{label} | {stage_progress}{cards}"
                 f" | 已运行 {elapsed} | 预计剩余 {remaining}"

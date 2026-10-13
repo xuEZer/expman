@@ -24,9 +24,10 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _nonnegative_integer(value: int, name: str) -> None:
+def _nonnegative_integer(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
+    return value
 
 
 def _name(value: str, name: str) -> None:
