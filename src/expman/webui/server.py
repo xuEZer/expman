@@ -19,11 +19,11 @@ from time import monotonic, time
 from typing import cast
 from urllib.parse import parse_qs, urlparse
 
-from ..analysis import analysis_payload, fingerprint
-from ..process_control import request_stop
-from ..registry import ensure_ids
-from .archive import read_batch, summarize
-from .snapshot import SCHEMA
+from expman.observation.analysis import analysis_payload, fingerprint
+from expman.observation.registry import ensure_ids
+from expman.process_control import request_stop
+from expman.webui.archive import read_batch, summarize
+from expman.webui.snapshot import SCHEMA
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 STATIC_FILES = {

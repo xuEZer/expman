@@ -11,11 +11,11 @@ from time import perf_counter
 from typing import Any, Literal
 from uuid import uuid4
 
-from .events import Event, ExecutionEvent, MetricEvent, ProgressEvent, Status
-from .frozen import freeze
-from .metrics import MetricStore, flatten_metrics
-from .recorders import InMemoryRecorder, Recorder
-from .storage import Checkpoint, RunStore
+from expman.core.events import Event, ExecutionEvent, MetricEvent, ProgressEvent, Status
+from expman.core.frozen import freeze
+from expman.core.recorders import InMemoryRecorder, Recorder
+from expman.storage.base import Checkpoint, RunStore
+from expman.storage.metrics import MetricStore, flatten_metrics
 
 _logger = logging.getLogger(__name__)
 

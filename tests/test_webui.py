@@ -11,14 +11,14 @@ import pytest
 import yaml
 
 from expman import Batch, Pipeline, Stage, Status, devices
-from expman._duration_model import StageDuration
-from expman.analysis import ANALYSIS_SCHEMA
 from expman.cli import _parser
-from expman.devices import DeviceMemory, HostMemory
-from expman.parallel_estimation import estimate_parallel
-from expman.registry import ensure_ids
-from expman.scheduling import GpuScheduler, Worker
-from expman.storage import PickleSerializer, write_record
+from expman.config.devices import DeviceMemory, HostMemory
+from expman.estimation.duration_model import StageDuration
+from expman.observation.analysis import ANALYSIS_SCHEMA
+from expman.observation.registry import ensure_ids
+from expman.scheduling.parallel_estimation import estimate_parallel
+from expman.scheduling.scheduler import GpuScheduler, Worker
+from expman.storage.base import PickleSerializer, write_record
 from expman.webui import SCHEMA, build_snapshot, read_batch, serve, summarize
 from expman.webui.live import LIVE_FILE, LivePublisher, live_enabled
 from expman.webui.server import Stream, Workspace
@@ -708,7 +708,7 @@ class TestDashboard:
             dashboard.close()
 
     def test_the_analysis_endpoint_reports_partial_results(self, runs):
-        from expman.metrics import MetricStore
+        from expman.storage.metrics import MetricStore
 
         directory = runs / "run_a"
         run_id = "0" * 32

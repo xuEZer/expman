@@ -4,10 +4,10 @@ from collections.abc import Mapping
 from inspect import Parameter, signature
 from typing import TYPE_CHECKING, Any, final
 
-from .context import RunContext, _name, _nonnegative_integer
+from expman.core.context import RunContext, _name, _nonnegative_integer
 
 if TYPE_CHECKING:
-    from .storage import Checkpoint
+    from expman.storage.base import Checkpoint
 
 
 class _CfgValue:

@@ -8,7 +8,7 @@ import unicodedata
 from numbers import Real
 from threading import Event, Thread
 
-from .estimation import UNKNOWN_CLOCK, _clock
+from expman.estimation.estimate import UNKNOWN_CLOCK, _clock
 
 _logger = logging.getLogger(__name__)
 _UNKNOWN = UNKNOWN_CLOCK

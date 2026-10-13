@@ -19,7 +19,7 @@ import os
 from contextlib import suppress
 from threading import Event, Thread
 
-from .snapshot import build_snapshot
+from expman.webui.snapshot import build_snapshot
 
 LIVE_FILE = "live.json"
 LIVE_INTERVAL = 1.0

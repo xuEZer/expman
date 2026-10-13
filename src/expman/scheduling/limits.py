@@ -23,7 +23,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import devices
+import expman.config.devices as devices
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 SYSTEMD_RUN = "systemd-run"

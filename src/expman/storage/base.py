@@ -11,12 +11,12 @@ from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, BinaryIO, Protocol
 
-from .dependencies import matches, validate
+from expman.core.dependencies import matches, validate
 
 if TYPE_CHECKING:
-    from .metrics import MetricStore
-    from .prefix_cache import PrefixCache
-    from .randomness import RandomStateManager
+    from expman.core.randomness import RandomStateManager
+    from expman.storage.metrics import MetricStore
+    from expman.storage.prefix_cache import PrefixCache
 
 
 class StorageError(RuntimeError):

@@ -6,8 +6,8 @@ there, and every entry point in the process — the CLI included, which imports
 the pipeline module — picks the values up.
 """
 
-from .context import _nonnegative_integer
-from .estimation import validate_coverage
+from expman.core.context import _nonnegative_integer
+from expman.estimation.estimate import validate_coverage
 
 _SETTINGS: dict[str, float | int] = {"retries": 1, "coverage": 0.8}
 

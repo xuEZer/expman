@@ -5,8 +5,8 @@ import warnings
 from hashlib import sha256
 from uuid import uuid4
 
-from .dependencies import matches
-from .storage import (
+from expman.core.dependencies import matches
+from expman.storage.base import (
     RecoveryWarning,
     StorageError,
     read_record,

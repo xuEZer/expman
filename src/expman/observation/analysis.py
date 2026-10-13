@@ -27,7 +27,7 @@ from pathlib import Path
 from time import time
 from typing import Any
 
-from .storage import PickleSerializer, StorageError, read_record
+from expman.storage.base import PickleSerializer, StorageError, read_record
 
 ANALYSIS_SCHEMA = 1
 SUMMARY_STEP = -1  # MetricStore's sentinel for run-level summary values

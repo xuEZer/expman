@@ -10,7 +10,7 @@ from numbers import Real
 from pathlib import Path
 from typing import Any
 
-from .storage import StorageError
+from expman.storage.base import StorageError
 
 
 def flatten_metrics(metrics: Mapping[str, Any]) -> list[tuple[str, float]]:

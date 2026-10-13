@@ -440,7 +440,7 @@ def load_configs(path: str | Path) -> list[dict[str, Any]]:
     ]
     if device_configs:
         # A device list is a Batch resource, never an experiment axis.
-        from .devices import configured_devices
+        from expman.config.devices import configured_devices
 
         configured_devices(device_configs)
 

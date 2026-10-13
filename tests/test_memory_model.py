@@ -1,5 +1,9 @@
-from expman._memory_model import LOCAL_NEIGHBORS, LocalQuantileEstimator, PeakCeiling
-from expman._time_model import Encoding, encode, variable_distance
+from expman.estimation.memory_model import (
+    LOCAL_NEIGHBORS,
+    LocalQuantileEstimator,
+    PeakCeiling,
+)
+from expman.estimation.time_model import Encoding, encode, variable_distance
 
 
 def rows(values):

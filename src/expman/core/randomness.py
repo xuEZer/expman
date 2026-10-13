@@ -5,7 +5,7 @@ import random
 from copy import deepcopy
 from typing import Any
 
-from .storage import StorageError
+from expman.storage.base import StorageError
 
 
 def validate_seed(seed: int) -> int:

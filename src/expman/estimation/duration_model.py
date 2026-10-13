@@ -27,7 +27,7 @@ import math
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from ._time_model import Encoding, variable_distance
+from expman.estimation.time_model import Encoding, variable_distance
 
 # Neighborhood size as a fraction of the sample count: the bandwidth is the
 # distance of the ``n / NEIGHBORHOOD``-th nearest sample.

@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 
 from expman import Pipeline, Stage
-from expman.context import RunContext
-from expman.randomness import RandomStateManager
-from expman.storage import RunStore, read_record, write_record
+from expman.core.context import RunContext
+from expman.core.randomness import RandomStateManager
+from expman.storage.base import RunStore, read_record, write_record
 
 
 def managed_context(tmp_path: Path, cfg=None, seed=42):

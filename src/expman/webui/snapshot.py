@@ -14,7 +14,7 @@ that stalls on rendering must never hold up a launch decision.
 import math
 from time import perf_counter, time
 
-from ..events import ProgressEvent, Status
+from expman.core.events import ProgressEvent, Status
 
 SCHEMA = 1
 

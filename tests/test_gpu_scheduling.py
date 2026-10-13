@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 from expman import Batch, ConfigError, Pipeline, Stage, Status, devices, environment
-from expman.devices import (
+from expman.config.devices import (
     GPU_PEAK_KB_DEFAULT,
     HOST_RESERVE_KB,
     DeviceMemory,
@@ -21,10 +21,10 @@ from expman.devices import (
     fits_reserve,
     nvidia_smi,
 )
-from expman.experiment import Experiment
-from expman.limits import cap_kb
-from expman.scheduling import GpuScheduler, HostGate
-from expman.storage import PickleSerializer, read_record
+from expman.core.experiment import Experiment
+from expman.scheduling.limits import cap_kb
+from expman.scheduling.scheduler import GpuScheduler, HostGate
+from expman.storage.base import PickleSerializer, read_record
 
 IMPORT_DEVICE = os.environ.get("CUDA_VISIBLE_DEVICES")
 
@@ -170,11 +170,11 @@ def _captured_gpu_ceilings(batch):
 
     def captured(*args, **kwargs):
         argv = args[0] if args else kwargs.get("args", ())
-        if "expman._worker" in argv:
+        if "expman.scheduling._worker" in argv:
             ceilings.append(kwargs.get("env", {}).get("EXPMAN_GPU_LIMIT_KB"))
         return original(*args, **kwargs)
 
-    with patch("expman.scheduling.subprocess.Popen", side_effect=captured):
+    with patch("expman.scheduling.scheduler.subprocess.Popen", side_effect=captured):
         batch.run(progress=False)
     return ceilings
 
@@ -186,11 +186,11 @@ def _captured_worker_env(batch):
 
     def captured(*args, **kwargs):
         argv = args[0] if args else kwargs.get("args", ())
-        if "expman._worker" in argv:
+        if "expman.scheduling._worker" in argv:
             envs.append(kwargs.get("env", {}))
         return original(*args, **kwargs)
 
-    with patch("expman.scheduling.subprocess.Popen", side_effect=captured):
+    with patch("expman.scheduling.scheduler.subprocess.Popen", side_effect=captured):
         batch.run(progress=False)
     return envs
 
@@ -260,7 +260,7 @@ class TestGpuScheduling:
         assert envs[0]["MKL_NUM_THREADS"] == str(environment.WORKER_THREADS)
         assert envs[0]["HF_ENDPOINT"] == environment.HF_MIRROR
         # CUDA_VISIBLE_DEVICES stays the scheduler's own decision.
-        assert "expman.environment" not in envs[0]
+        assert "expman.scheduling.environment" not in envs[0]
         recorded = read_record(
             next(batch.output_dir.rglob("bootstrap.pkl")), PickleSerializer()
         )["environment"]
@@ -1105,7 +1105,7 @@ class TestDevice:
     def test_query_timeout_is_an_observation_error_with_the_default_timeout(self):
         with (
             patch(
-                "expman.devices.subprocess.run",
+                "expman.config.devices.subprocess.run",
                 side_effect=subprocess.TimeoutExpired("nvidia-smi", 3),
             ) as query,
             pytest.raises(MemoryObservationError),
@@ -1117,18 +1117,20 @@ class TestDevice:
         fallback = tmp_path / "nvidia-smi"
         fallback.write_text("#!/bin/sh\n")
         with (
-            patch("expman.devices.shutil.which", return_value=None),
-            patch("expman.devices.NVIDIA_SMI_FALLBACKS", (fallback,)),
-            patch("expman.devices.subprocess.run") as query,
+            patch("expman.config.devices.shutil.which", return_value=None),
+            patch("expman.config.devices.NVIDIA_SMI_FALLBACKS", (fallback,)),
+            patch("expman.config.devices.subprocess.run") as query,
         ):
             query.return_value.stdout = "0, GPU-first, 100, 10\n"
             NvidiaMemory((0,)).sample()
         assert query.call_args.args[0][0] == str(fallback)
-        with patch("expman.devices.shutil.which", return_value="/usr/bin/nvidia-smi"):
+        with patch(
+            "expman.config.devices.shutil.which", return_value="/usr/bin/nvidia-smi"
+        ):
             assert nvidia_smi() == "/usr/bin/nvidia-smi"
 
     def test_nvidia_memory_validates_observations_and_identities(self):
-        with patch("expman.devices.subprocess.run") as query:
+        with patch("expman.config.devices.subprocess.run") as query:
             query.return_value.stdout = (
                 "0, GPU-first, 100, 10\n1, GPU-second, 200, 150\n"
             )

@@ -6,7 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import ConfigError
+from expman.config._config import ConfigError
 
 # Device memory carries no ratio threshold: CUDA OOM is treated as evidence that
 # the Stage needs a larger next contract. Signatures come from PyTorch's own

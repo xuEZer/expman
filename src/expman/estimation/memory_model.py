@@ -14,8 +14,8 @@ exactly as the duration model measures them, so both models agree on what a
 from dataclasses import dataclass, field
 from math import ceil, isfinite
 
-from . import devices
-from ._time_model import Encoding, variable_distance
+import expman.config.devices as devices
+from expman.estimation.time_model import Encoding, variable_distance
 
 LOCAL_MIN_SAMPLES = 4
 LOCAL_NEIGHBORS = 8

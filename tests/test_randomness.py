@@ -2,8 +2,8 @@ from unittest.mock import patch
 
 import pytest
 
-from expman.randomness import RandomStateManager
-from expman.storage import StorageError
+from expman.core.randomness import RandomStateManager
+from expman.storage.base import StorageError
 
 
 @pytest.fixture

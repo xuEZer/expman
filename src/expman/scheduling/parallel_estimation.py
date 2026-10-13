@@ -2,7 +2,7 @@
 
 from time import time
 
-from .estimation import TimeEstimate
+from expman.estimation.estimate import TimeEstimate
 
 _LOWER = 0
 _UPPER = 1

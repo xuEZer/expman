@@ -2,9 +2,9 @@ import json
 
 import pytest
 
-from expman.analysis import AnalysisError, analysis_payload
-from expman.metrics import MetricStore
-from expman.storage import PickleSerializer, write_record
+from expman.observation.analysis import AnalysisError, analysis_payload
+from expman.storage.base import PickleSerializer, write_record
+from expman.storage.metrics import MetricStore
 
 
 @pytest.fixture

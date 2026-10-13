@@ -1,17 +1,33 @@
 """Composable experiment execution with optional progress reporting."""
 
-from .batch import Batch
-from .config import ConfigError, MissingConfigWarning, load_configs
-from .context import RunContext
-from .estimation import TimeEstimate
-from .events import Event, ExecutionEvent, MetricEvent, ProgressEvent, Status
-from .experiment import AttemptResult, ExperimentResult, StageResult
-from .pipeline import Pipeline
-from .randomness import seed_everything
-from .recorders import InMemoryRecorder, Recorder
-from .settings import get, set
-from .stage import Stage
-from .storage import (
+import expman.config.devices as devices
+from expman.config import (
+    ConfigError,
+    DeviceMemory,
+    MeminfoMonitor,
+    MissingConfigWarning,
+    NvidiaMemory,
+    load_configs,
+)
+from expman.core import (
+    Event,
+    ExecutionEvent,
+    MetricEvent,
+    Pipeline,
+    ProgressEvent,
+    Recorder,
+    RunContext,
+    Stage,
+    Status,
+)
+from expman.core.experiment import AttemptResult, ExperimentResult, StageResult
+from expman.core.randomness import seed_everything
+from expman.core.recorders import InMemoryRecorder
+from expman.core.settings import get, set
+from expman.estimation import TimeEstimate
+from expman.observation import cleanup
+from expman.scheduling import Batch, environment, limits
+from expman.storage import (
     Checkpoint,
     PickleSerializer,
     RecoveryWarning,
@@ -24,12 +40,15 @@ __all__ = [
     "Batch",
     "Checkpoint",
     "ConfigError",
+    "DeviceMemory",
     "Event",
     "ExecutionEvent",
     "ExperimentResult",
     "InMemoryRecorder",
+    "MeminfoMonitor",
     "MetricEvent",
     "MissingConfigWarning",
+    "NvidiaMemory",
     "Pipeline",
     "PickleSerializer",
     "ProgressEvent",
@@ -42,7 +61,11 @@ __all__ = [
     "StorageError",
     "Status",
     "TimeEstimate",
+    "cleanup",
+    "devices",
+    "environment",
     "get",
+    "limits",
     "load_configs",
     "seed_everything",
     "set",

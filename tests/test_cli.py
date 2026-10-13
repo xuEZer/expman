@@ -10,7 +10,7 @@ import pytest
 import expman
 from expman import cli
 from expman.cli import _resolve_pipeline, main
-from expman.storage import PickleSerializer, read_record
+from expman.storage.base import PickleSerializer, read_record
 
 MODULE_NAME = "cli_pipeline_under_test"
 

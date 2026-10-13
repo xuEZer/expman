@@ -1,7 +1,11 @@
 import pytest
 
-from expman._duration_model import DurationModel, StageDuration, variable_distance
-from expman._time_model import encode
+from expman.estimation.duration_model import (
+    DurationModel,
+    StageDuration,
+    variable_distance,
+)
+from expman.estimation.time_model import encode
 
 
 def build(configs, durations, *, coverage=0.8, censored=()):

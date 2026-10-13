@@ -10,18 +10,18 @@ from time import monotonic
 from typing import Any, TypeGuard
 from uuid import uuid4
 
-from .config import load_configs
-from .context import _nonnegative_integer
-from .devices import configured_devices
-from .environment import validate as _validate_environment
-from .estimation import TimeEstimate, validate_coverage
-from .events import Status
-from .experiment import AttemptResult, Experiment, ExperimentResult
-from .pipeline import Pipeline
-from .progress import BatchProgress
-from .randomness import validate_seed
-from .recorders import InMemoryRecorder, Recorder
-from .storage import (
+from expman.config._config import load_configs
+from expman.config.devices import configured_devices
+from expman.core.context import _nonnegative_integer
+from expman.core.events import Status
+from expman.core.experiment import AttemptResult, Experiment, ExperimentResult
+from expman.core.pipeline import Pipeline
+from expman.core.randomness import validate_seed
+from expman.core.recorders import InMemoryRecorder, Recorder
+from expman.estimation.estimate import TimeEstimate, validate_coverage
+from expman.scheduling.environment import validate as _validate_environment
+from expman.scheduling.progress import BatchProgress
+from expman.storage.base import (
     PickleSerializer,
     RecoveryWarning,
     RunLock,
@@ -453,7 +453,7 @@ class Batch:
         with self._state_lock:
             pending = set(self._queue)
             pending.update(self._active_gpu)
-        from .parallel_estimation import estimate_parallel
+        from expman.scheduling.parallel_estimation import estimate_parallel
 
         scheduler = self._scheduler
         estimate = (
@@ -516,7 +516,7 @@ class Batch:
             live = self._start_live()
             try:
                 display.start()
-                from .scheduling import GpuScheduler
+                from expman.scheduling.scheduler import GpuScheduler
 
                 return GpuScheduler(self).run()
             except BaseException as caught:
@@ -551,7 +551,7 @@ class Batch:
         only: a dashboard that nobody started must cost the experiment
         nothing, so any failure to set it up is reported and dropped.
         """
-        from .webui.live import LivePublisher, live_enabled
+        from expman.webui.live import LivePublisher, live_enabled
 
         if not live_enabled():
             return None

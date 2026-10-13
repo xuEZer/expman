@@ -9,11 +9,11 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from .context import RunContext, _name
-from .dependencies import stage_dependencies
-from .events import Status
-from .stage import Stage
-from .storage import Checkpoint, RecoveryWarning
+from expman.core.context import RunContext, _name
+from expman.core.dependencies import stage_dependencies
+from expman.core.events import Status
+from expman.core.stage import Stage
+from expman.storage.base import Checkpoint, RecoveryWarning
 
 
 def _reuse_completed(scoped, store, completed, position, restore_seconds):

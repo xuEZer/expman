@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from .events import Event
+from expman.core.events import Event
 
 
 class Recorder(Protocol):

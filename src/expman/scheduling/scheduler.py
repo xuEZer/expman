@@ -12,16 +12,18 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import perf_counter, sleep, time
 
-from . import devices, environment, limits
-from ._duration_model import DurationModel, StageDuration
-from ._memory_model import LocalQuantileEstimator, PeakCeiling
-from ._time_model import encode
-from .dependencies import declared_paths
-from .dependencies import observation as config_observation
-from .events import Status
-from .experiment import AttemptResult, SnapshotOutput, StageResult
-from .ipc import Channel
-from .storage import PickleSerializer, RecoveryWarning, write_record
+import expman.config.devices as devices
+import expman.scheduling.environment as environment
+import expman.scheduling.limits as limits
+from expman.core.dependencies import declared_paths
+from expman.core.dependencies import observation as config_observation
+from expman.core.events import Status
+from expman.core.experiment import AttemptResult, SnapshotOutput, StageResult
+from expman.estimation.duration_model import DurationModel, StageDuration
+from expman.estimation.memory_model import LocalQuantileEstimator, PeakCeiling
+from expman.estimation.time_model import encode
+from expman.scheduling.ipc import Channel
+from expman.storage.base import PickleSerializer, RecoveryWarning, write_record
 
 PLAN_CANDIDATES_PER_STAGE = 32
 PLAN_BEAM_WIDTH = 128
@@ -1032,7 +1034,13 @@ class GpuScheduler:
             self._account()
             with (root / "output.log").open("ab", buffering=0) as log:
                 process = subprocess.Popen(
-                    [*limit.command, sys.executable, "-m", "expman._worker", str(root)],
+                    [
+                        *limit.command,
+                        sys.executable,
+                        "-m",
+                        "expman.scheduling._worker",
+                        str(root),
+                    ],
                     env=env,
                     stdin=subprocess.PIPE,
                     stdout=log,

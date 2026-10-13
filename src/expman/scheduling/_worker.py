@@ -10,14 +10,14 @@ from contextlib import suppress
 from pathlib import Path
 from time import monotonic
 
-from .context import _error_message
-from .events import Status
-from .experiment import Experiment, StageResult
-from .gpu_memory import limit as limit_gpu_memory
-from .gpu_memory import sample as gpu_memory
-from .ipc import worker_channel
-from .limits import events, own_cgroup, usage
-from .storage import PickleSerializer, RunLock, read_record
+from expman.core.context import _error_message
+from expman.core.events import Status
+from expman.core.experiment import Experiment, StageResult
+from expman.scheduling.gpu_memory import limit as limit_gpu_memory
+from expman.scheduling.gpu_memory import sample as gpu_memory
+from expman.scheduling.ipc import worker_channel
+from expman.scheduling.limits import events, own_cgroup, usage
+from expman.storage.base import PickleSerializer, RunLock, read_record
 
 PROC_STATUS = Path("/proc/self/status")
 

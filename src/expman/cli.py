@@ -21,17 +21,17 @@ from contextlib import suppress
 from pathlib import Path
 from time import sleep
 
-from . import settings
-from .batch import Batch
-from .cleanup import clean as clean_intermediates
-from .estimation import TimeEstimate
-from .estimation import _clock as _fmt_elapsed
-from .pipeline import Pipeline
-from .process_control import PID_FILE, request_stop
-from .registry import RUNS_DIR, ensure_ids
-from .stage import Stage
-from .storage import PickleSerializer, StorageError, read_record
-from .webui import DEFAULT_PORT, serve
+import expman.core.settings as settings
+from expman.core.pipeline import Pipeline
+from expman.core.stage import Stage
+from expman.estimation.estimate import TimeEstimate
+from expman.estimation.estimate import _clock as _fmt_elapsed
+from expman.observation.cleanup import clean as clean_intermediates
+from expman.observation.registry import RUNS_DIR, ensure_ids
+from expman.process_control import PID_FILE, request_stop
+from expman.scheduling.batch import Batch
+from expman.storage.base import PickleSerializer, StorageError, read_record
+from expman.webui import DEFAULT_PORT, serve
 
 _STATUS_INTERVAL = 2.0
 

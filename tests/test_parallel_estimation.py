@@ -1,8 +1,8 @@
 import io
 
 from expman import Batch, Pipeline, Stage, Status
-from expman.progress import BatchProgress
-from expman.scheduling import GpuScheduler
+from expman.scheduling.progress import BatchProgress
+from expman.scheduling.scheduler import GpuScheduler
 
 
 class First(Stage):

@@ -178,7 +178,7 @@ def test_pipeline_snapshots_stage_sequence():
 
 
 def test_stage_can_run_independently_with_monotonic_timing(recorder, ctx):
-    with patch("expman.context.perf_counter", side_effect=[10.0, 12.5]):
+    with patch("expman.core.context.perf_counter", side_effect=[10.0, 12.5]):
         assert Add().run(1, ctx) == 2
     start, finish = recorder.events
     assert finish.duration_seconds == 2.5
@@ -215,7 +215,7 @@ def test_nested_pipeline_preserves_parent_scopes(recorder, ctx):
 
 
 def test_recorder_failure_does_not_change_success(caplog):
-    with caplog.at_level("WARNING", logger="expman.context"):
+    with caplog.at_level("WARNING", logger="expman.core.context"):
         result = Pipeline([Report, Add]).run(2, RunContext(recorder=BrokenRecorder()))
     assert result == 3
     assert caplog.records
@@ -224,7 +224,7 @@ def test_recorder_failure_does_not_change_success(caplog):
 def test_recorder_failure_does_not_mask_business_error(caplog):
     error = ValueError("business failure")
     with (
-        caplog.at_level("WARNING", logger="expman.context"),
+        caplog.at_level("WARNING", logger="expman.core.context"),
         pytest.raises(ValueError) as raised,
     ):
         Pipeline([raising(error)]).run(ctx=RunContext(recorder=BrokenRecorder()))

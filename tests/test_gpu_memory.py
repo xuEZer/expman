@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from expman.gpu_memory import limit, sample
+from expman.scheduling.gpu_memory import limit, sample
 
 
 def test_pytorch_allocator_usage_is_reported_in_kilobytes():
@@ -13,7 +13,8 @@ def test_pytorch_allocator_usage_is_reported_in_kilobytes():
         max_memory_reserved=lambda: 4096,
     )
     with patch(
-        "expman.gpu_memory.import_module", return_value=SimpleNamespace(cuda=cuda)
+        "expman.scheduling.gpu_memory.import_module",
+        return_value=SimpleNamespace(cuda=cuda),
     ):
         assert sample() == {
             "gpu_allocated_kb": 1.0,
@@ -24,7 +25,9 @@ def test_pytorch_allocator_usage_is_reported_in_kilobytes():
 
 
 def test_missing_pytorch_leaves_gpu_telemetry_unavailable():
-    with patch("expman.gpu_memory.import_module", side_effect=ModuleNotFoundError):
+    with patch(
+        "expman.scheduling.gpu_memory.import_module", side_effect=ModuleNotFoundError
+    ):
         assert sample() is None
 
 
@@ -36,7 +39,8 @@ def test_pytorch_allocator_limit_uses_the_visible_device_capacity():
         set_per_process_memory_fraction=fractions.append,
     )
     with patch(
-        "expman.gpu_memory.import_module", return_value=SimpleNamespace(cuda=cuda)
+        "expman.scheduling.gpu_memory.import_module",
+        return_value=SimpleNamespace(cuda=cuda),
     ):
         limit(4)
     assert fractions == [0.5]
