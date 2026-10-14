@@ -16,16 +16,18 @@ class Work(Stage):
     def config_dependencies(cls, cfg):
         return {"epochs": True}
 
-    def init(self, ctx):
-        self.epoch = 0
-
-    def loop(self, data, ctx, index, max_iter=Stage.cfg("epochs")):
-        sleep(0.1)
-        ctx.log_metrics({"train": {"loss": 1 / (index + 1)}}, step=index)
-        self.epoch = index + 1
+    def process(self, data, ctx):
+        epoch = ctx.checkpoint_state
+        if epoch is None:
+            epoch = 0
+        for index in ctx.resume_range(0, ctx.cfg["epochs"]):
+            sleep(0.1)
+            ctx.log_metrics({"train": {"loss": 1 / (index + 1)}}, step=index)
+            epoch = index + 1
+            ctx.checkpoint(epoch, epoch)
         return {
             "device": os.environ.get("CUDA_VISIBLE_DEVICES"),
-            "epochs": self.epoch,
+            "epochs": epoch,
         }
 
 

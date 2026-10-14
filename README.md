@@ -396,27 +396,32 @@ EXPMAN_HF_MIRROR=https://mirror.internal expman run ...              # 指定端
 
 Stage ID 是 Pipeline 中从 0 开始的位置，通过 `ctx.stage_id` 读取。返回值和状态量一起原子保存，保存成功才标记阶段完成；不可序列化的返回值或状态量会使该阶段失败并进入重试流程。
 
-### 状态量与循环
+### 显式 checkpoint
 
-定义了 `loop()` 的 Stage 由框架构建执行，用户不再定义 `process()`（两者互斥，同时定义在类定义时直接报错）：`init()` 声明状态量，框架驱动可恢复迭代并在每轮返回后自动存档，最后一次 `loop()` 调用的返回值就是 Stage 输出。
+Stage 只暴露 `process()` 一个扩展点。循环、状态形状和存档时机由用户显式控制：用 `ctx.resume_range(start, stop)` 获得可恢复的迭代器，用 `ctx.checkpoint(position, state)` 保存任意状态。
 
 ```python
 class Train(Stage):
-    def init(self, ctx):
-        self.epoch = 0
-        self.model = build_model(ctx.cfg)  # 权重是状态量，随迭代存档
+    def process(self, data, ctx):
+        state = ctx.checkpoint_state
+        if state is None:
+            state = {"epoch": 0, "model": build_model(ctx.cfg)}
 
-    def loop(self, data, ctx, index, max_iter=Stage.cfg("epochs")):
-        train_one_epoch(self.model, data)
-        self.epoch = index + 1
-        if should_stop(self.model):
-            self.break_loop()
-        return self.model
+        for epoch in ctx.resume_range(0, ctx.cfg["epochs"]):
+            train_one_epoch(state["model"], data)
+            state["epoch"] = epoch + 1
+            ctx.checkpoint(epoch + 1, state)
+            if should_stop(state["model"]):
+                break
+
+        return state["model"]
 ```
 
-`loop()` 的迭代总量 `max_iter` 在签名中声明且必须带默认值：字面量整数，或 `Stage.cfg("键名")`——后者在 Stage 运行时从 `ctx.cfg` 取值，缺键直接报错。框架每轮调用 `loop()` 时传入解析后的值，`index` 是跨续跑的扁平单调迭代位置，`data` 是上游传入的对象。`init()` 在其中创建的实例属性就是状态量，框架自动写入每个 checkpoint 和完成快照；下划线开头的属性是框架簿记，不会被捕获。dataloader、客户端等进程绑定资源不在 `init()` 中创建——资源加载由上游实现，上游阶段把资源打包进输出传递，`loop()` 内直接使用。
+`resume_range(start, stop)` 在首次执行时从 `start` 开始；若存在可读 checkpoint，则从 `max(start, checkpoint_step)` 开始，保证已完成的位置被静默跳过。`checkpoint(position, state)` 把 `state` 持久化为最新 checkpoint；非字典值会被透明包装。下一次尝试通过 `ctx.checkpoint_state` 取回同一个对象。随机状态在阶段入口自动重置到最近一次 checkpoint 的存档时刻，因此失败迭代中的随机消耗不会被继承。
 
-有可读 checkpoint 的尝试会跳过 `init()`：存档中的状态量直接作为初值灌回实例，随机状态重置到存档时刻，然后从存档的 step 继续迭代，已完成的迭代位置被静默跳过。每次 `loop()` 正常返回后，框架自动保存一份包含状态量、随机状态和该轮返回值的 checkpoint（step=index+1），只保留最新一份；最新文件损坏时 warning 并读取上一份，两份都不可用时重新执行 `init()` 并从零开始迭代。`break_loop()` 请求在下一迭代前停止，标志不持久化，恢复后由 `loop()` 重新评估；触发早停的 Stage 正常完成，输出为最后一次 `loop()` 的返回值。loop 体应当由状态量、上游对象、`index` 和全局随机状态共同决定——按索引取数或依赖已恢复的随机序列都能精确重放，但不要跨断点持有流的游标。定义 `process()` 的 Stage 保持完全自定义执行，不产生中间 checkpoint，失败后从阶段入口重跑。不经过 Experiment/Batch 的裸 `Pipeline.run()` 静默降级：`init()` 照常执行，只是没有存档与恢复。
+用户负责在 `process()` 内决定保存什么、何时保存；checkpoint 只保留最新一份。完成快照保存最后一次 `checkpoint()` 的状态（若无 checkpoint 则保存空状态）和 `process()` 的返回值。不经过 Experiment/Batch 的裸 `Pipeline.run()` 静默降级：`process()` 照常执行，只是没有持久化与恢复。
+
+进程绑定资源（dataloader、文件句柄等）不应依赖实例属性在进程重启后存活：由上游阶段打包进输出，或在 `process()` 内从显式 checkpoint 状态重建。
 
 其中模型创建和训练函数由用户实现。checkpoint 保存全部状态量和进度，与进度写入同一原子记录。
 
@@ -572,7 +577,7 @@ seed_everything(42)
 
 每个 run 将初始化后的随机状态原子写入 `experiments/<run_id>/rng_initial.pkl`。重试和恢复读取此记录，不重复设种子；随后按已有阶段快照和 checkpoint 恢复到相应位置。阶段完成快照及 checkpoint 都包含独立的 `rng_state` 字段，与业务状态量在同一文件、同一事务中保存。框架只保留最新一份 checkpoint，阶段完成时把它删掉：完成快照已经是恢复的依据，留着中间 epoch 的模型只是在占盘。
 
-复用本 run 已完成阶段时恢复该阶段结束时的随机状态；失败阶段有 checkpoint 时，框架在恢复状态量的同时把随机状态重置到存档时刻，没有 checkpoint 则从阶段入口的随机状态重跑。恢复尝试会跳过 `init()`，其随机数消耗自然不计入续跑序列；每轮 `loop()` 返回后立刻存档，因此作废的随机消耗只有失败所在的那一次迭代。
+复用本 run 已完成阶段时恢复该阶段结束时的随机状态；失败阶段有 checkpoint 时，框架把随机状态重置到存档时刻，没有 checkpoint 则从阶段入口的随机状态重跑。恢复尝试从 `ctx.resume_range()` 返回的位置继续，checkpoint 之前的随机数消耗自然不计入续跑序列；因此作废的随机消耗只有失败所在的那一次迭代。
 
 随机状态记录覆盖 Python 全局生成器（含 Gaussian 缓存）、NumPy 全局 RandomState、PyTorch CPU 及全部可见 CUDA 设备的生成器。NumPy 数组转为普通列表、PyTorch ByteTensor 转为 bytes 存储，因此仅查看快照元数据不会为了随机状态反序列化 CUDA Tensor。保存可见 CUDA 状态会初始化相关生成器，需要可用的 CUDA 环境；GPU 调度器已在子进程启动前限制设备可见范围。
 

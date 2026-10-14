@@ -42,40 +42,46 @@ class GpuWork(Stage):
             "device": True,
         }
 
-    def init(self, ctx):
-        self.saved = 0
-
-    def loop(self, data, ctx, index, max_iter=2):
+    def process(self, data, ctx):
         root = Path(ctx.cfg["markers"])
-        if index == 0:
-            (root / f"{ctx.run_id}.started").write_text(str(os.getpid()))
-            self.saved += 1
-            (root / f"{ctx.run_id}.checkpoint").touch()
-            return None
-        if ctx.cfg["crash"]:
-            os._exit(7)
-        if ctx.cfg["fail_once"] and ctx.attempt == 1:
-            raise ValueError("retry me")
-        for step in range(10):
-            ctx.log_metrics({"train": {"loss": step}}, step=step)
-        try:
-            if ctx.attempt == 1:
-                deadline = monotonic() + 5
-                while ctx.cfg["wait_for_release"] and not (root / "release").exists():
-                    if monotonic() > deadline:
-                        raise RuntimeError("test release timed out")
-                    sleep(0.01)
+        state = ctx.checkpoint_state
+        if state is None:
+            state = {"saved": 0, "step": 0}
+        for index in ctx.resume_range(0, 2):
+            state["step"] = index + 1
+            if index == 0:
+                (root / f"{ctx.run_id}.started").write_text(str(os.getpid()))
+                state["saved"] += 1
+                (root / f"{ctx.run_id}.checkpoint").touch()
+                ctx.checkpoint(index + 1, state)
+                continue
+            if ctx.cfg["crash"]:
+                os._exit(7)
+            if ctx.cfg["fail_once"] and ctx.attempt == 1:
+                raise ValueError("retry me")
+            for step in range(10):
+                ctx.log_metrics({"train": {"loss": step}}, step=step)
+            try:
+                if ctx.attempt == 1:
+                    deadline = monotonic() + 5
+                    while (
+                        ctx.cfg["wait_for_release"] and not (root / "release").exists()
+                    ):
+                        if monotonic() > deadline:
+                            raise RuntimeError("test release timed out")
+                        sleep(0.01)
                 sleep(ctx.cfg["delay"])
-            (root / f"{ctx.run_id}.finished").touch()
-            return {
-                "device": os.environ.get("CUDA_VISIBLE_DEVICES"),
-                "import_device": IMPORT_DEVICE,
-                "pid": os.getpid(),
-                "saved": self.saved,
-                "cfg_devices": list(ctx.cfg["device"]),
-            }
-        finally:
-            (root / f"{ctx.run_id}.finally").touch()
+                (root / f"{ctx.run_id}.finished").touch()
+                return {
+                    "device": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                    "import_device": IMPORT_DEVICE,
+                    "pid": os.getpid(),
+                    "saved": state["saved"],
+                    "cfg_devices": list(ctx.cfg["device"]),
+                }
+            finally:
+                (root / f"{ctx.run_id}.finally").touch()
+        return None
 
 
 class SharedWork(Stage):
@@ -83,13 +89,11 @@ class SharedWork(Stage):
     def config_dependencies(cls, cfg):
         return {}
 
-    def init(self, ctx):
-        self.producer = None
-
     def process(self, data, ctx):
-        self.producer = os.getpid()
         ctx.log_metrics({"loss": 0.25}, step=0)
-        return os.getpid()
+        pid = os.getpid()
+        ctx.checkpoint(1, {"producer": pid})
+        return pid
 
 
 class Prepare(Stage):

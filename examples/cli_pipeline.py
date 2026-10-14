@@ -15,16 +15,18 @@ class LoadValues(Stage):
 class Accumulate(Stage):
     @classmethod
     def config_dependencies(cls, cfg):
-        return {"interrupt_once": True, "max_iter": True}
+        return {"interrupt_once": True}
 
-    def init(self, ctx):
-        self.total = 0
-
-    def loop(self, data, ctx, index, max_iter=Stage.cfg("max_iter")):
-        self.total += data[index]
-        if ctx.cfg["interrupt_once"] and ctx.attempt == 1 and index == 1:
-            raise KeyboardInterrupt()
-        return self.total
+    def process(self, data, ctx):
+        total = ctx.checkpoint_state
+        if total is None:
+            total = 0
+        for index in ctx.resume_range(0, len(data)):
+            total += data[index]
+            ctx.checkpoint(index + 1, total)
+            if ctx.cfg["interrupt_once"] and ctx.attempt == 1 and index == 1:
+                raise KeyboardInterrupt()
+        return total
 
 
 train = Pipeline([LoadValues, Accumulate])

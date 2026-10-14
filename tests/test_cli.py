@@ -30,16 +30,18 @@ class LoadValues(Stage):
 class Accumulate(Stage):
     @classmethod
     def config_dependencies(cls, cfg):
-        return {"interrupt_once": True, "max_iter": True}
+        return {"interrupt_once": True}
 
-    def init(self, ctx):
-        self.total = 0
-
-    def loop(self, data, ctx, index, max_iter=Stage.cfg("max_iter")):
-        self.total += data[index]
-        if ctx.cfg["interrupt_once"] and ctx.attempt == 1 and index == 1:
-            raise KeyboardInterrupt()
-        return self.total
+    def process(self, data, ctx):
+        total = ctx.checkpoint_state
+        if total is None:
+            total = 0
+        for index in ctx.resume_range(0, len(data)):
+            total += data[index]
+            ctx.checkpoint(index + 1, total)
+            if ctx.cfg["interrupt_once"] and ctx.attempt == 1 and index == 1:
+                raise KeyboardInterrupt()
+        return total
 
 
 train = Pipeline([LoadValues, Accumulate])
@@ -79,17 +81,14 @@ from expman import Pipeline, Stage
 
 
 class Slow(Stage):
-    """Runs until break_loop; long max_iter keeps the window open for stop."""
+    """Runs until index 5; long range keeps the window open for stop."""
 
-    @classmethod
-    def config_dependencies(cls, cfg):
-        return {"max_iter": True}
-
-    def loop(self, data, ctx, index, max_iter=Stage.cfg("max_iter")):
-        sleep(0.1)
-        if index >= 5:
-            self.break_loop()
-        return index
+    def process(self, data, ctx):
+        for index in ctx.resume_range(0, 10000):
+            sleep(0.1)
+            if index >= 5:
+                return index
+        return None
 
 
 train = Pipeline([Slow])
@@ -117,11 +116,10 @@ def settings_restored():
         expman.set(retries=1, coverage=0.8)
 
 
-def write_config(tmp_path, *, interrupt_once=False, max_iter=3):
+def write_config(tmp_path, *, interrupt_once=False):
     path = tmp_path / "experiments.yaml"
     path.write_text(
         "device: [0]\nseed: 0\nvalues: [1, 2, 3]\n"
-        f"max_iter: {max_iter}\n"
         f"interrupt_once: {'true' if interrupt_once else 'false'}\n"
     )
     return path
@@ -210,7 +208,7 @@ def test_stop_terminates_and_resume_completes(tmp_path, capsys, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "path", list(sys.path))
     config = tmp_path / "experiments.yaml"
-    config.write_text("device: [0]\nseed: 0\nmax_iter: 10000\n")
+    config.write_text("device: [0]\nseed: 0\n")
     output = tmp_path / "batch"
     process = subprocess.Popen(
         [
