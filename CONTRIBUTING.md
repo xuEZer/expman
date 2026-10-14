@@ -24,7 +24,6 @@ uv run pre-commit install --install-hooks
 ruff check .
 ruff format --check .
 uv run pytest -v
-uv run python examples/basic_pipeline.py
 git diff --check
 git status --short
 ```

@@ -1,7 +1,0 @@
-# Use NVIDIA GPU indices from nvidia-smi.
-device: [0]
-seed: 0
-
-# One axis at a time: the first listed value is the reference point.
-scan:
-  epochs: [2, 3, 4]

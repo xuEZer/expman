@@ -3,7 +3,7 @@
 状态：已实现 · 日期：2026-09-19
 
 关联：[DESIGN.md](../DESIGN.md) §3/§5/§7、[README.md](../README.md)「同 Batch 连续前缀复用」、
-`src/expman/stage.py`、`src/expman/dependencies.py`、`src/expman/scheduling.py`。
+`src/expman/core/stage.py`、`src/expman/core/dependencies.py`、`src/expman/scheduling/`。
 
 ## 1. 目标
 
@@ -69,8 +69,7 @@ class Train(Stage):
 
 ## 4. 与旧机制的关系
 
-- 旧 checkpoint 若是早期运行时追踪产生的信封记录，仍可读取并按其中的依赖匹配；
-  不匹配则按损坏回退。
+- 信封格式的旧 checkpoint 不再读取，加载会按无效记录报错。
 - 旧快照缺少依赖记录时不再自动保守依赖完整配置，而是以当前声明为准。
 - 迁移成本：不重写 `config_dependencies` 的 Stage 变成整配置依赖，复用率下降但结果
   安全；需要恢复前缀复用时应显式声明读取的路径。
@@ -80,4 +79,3 @@ class Train(Stage):
 - `tests/test_gpu_scheduling.py`：声明决定 Stage 分组（未声明参数不拆组）、共享前缀
   物化、跨 Stage 前缀并集、恢复与中断语义。
 - `tests/test_parallel_estimation.py`：声明前缀决定 Stage 组数与 ETA。
-- 文档示例：`examples/shared_prefix.py` 等全部改为声明式。
