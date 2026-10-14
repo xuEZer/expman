@@ -34,29 +34,10 @@ flowchart LR
     R --> M[InMemoryRecorder]
 ```
 
-代码布局：
-
-```text
-src/expman/
-    __init__.py     公共 API
-    config.py       YAML 加载、候选组合展开与命名默认配置合并
-    batch.py        实验集合、顺序队列和有界重试
-    experiment.py   具体实验、隔离执行及尝试结果
-    storage.py      原子快照、单份 checkpoint、保存器协议与运行锁
-    frozen.py       配置的只读映射和序列
-    pipeline.py     阶段组合与顺序执行
-    stage.py        业务扩展基类
-    context.py      运行标识、执行作用域、计时与事件发送
-    events.py       生命周期、指标和进度事件
-    recorders.py    Recorder 协议与内存实现
-examples/          可运行的接入示例
-tests/             对外契约和失败行为测试
-```
-
 ## 3. Stage：业务扩展点
 
 ```python
-class Stage(Generic[InputT, OutputT], ABC):
+class Stage[InputT, OutputT]:
     def __init__(self, *, name: str | None = None): ...
     @classmethod
     def config_dependencies(cls, cfg) -> Mapping | bool: ...
@@ -65,7 +46,7 @@ class Stage(Generic[InputT, OutputT], ABC):
 ```
 
 - Stage 必须重写 `process()`（`__init__` 在实例化时校验）。重写 `config_dependencies()` 声明该 Stage 结果依赖的配置位置（见 §7）。
-- 循环、状态形状和 checkpoint 时机由用户显式控制。`ctx.resume_range(start, stop)` 返回一个迭代器：首次执行从 `start` 开始，有可读 checkpoint 时从 `max(start, checkpoint_step)` 开始。`ctx.checkpoint(position, state)` 持久化任意 `state`（非字典值会被透明包装），并把它设为最新 checkpoint。下一次尝试通过 `ctx.checkpoint_state` 取回同一个对象。
+- 循环、状态形状和 checkpoint 时机由用户显式控制。`ctx.resume_range(start, stop)` 返回一个迭代器：首次执行从 `start` 开始，有可读 checkpoint 时从 `max(start, checkpoint 记录的位置)` 开始。`ctx.checkpoint(position, state)` 持久化任意 `state`（非字典值会被透明包装），并把它设为最新 checkpoint。下一次尝试通过 `ctx.checkpoint_state` 取回同一个对象。
 - 阶段入口自动恢复随机状态：有可读 checkpoint 时重置到 checkpoint 存档时刻，否则保持阶段入口的随机状态。用户负责保证循环体按 `index` 和全局随机状态可重放；不要跨断点持有流游标。
 - `run()` 是基类提供的执行入口，执行 `process()`，通过 RunContext 统一包装生命周期监测；完成时保存返回值和最新 checkpoint 状态（无 checkpoint 则为空状态）。未接入 Experiment/Batch 时静默降级：无存档与恢复。
 - `run()` 使用 `typing.final` 标记，供静态工具检查覆盖行为；扩展契约要求用户只覆盖 `process()`。
@@ -116,7 +97,7 @@ RunContext 保存 `run_id`、尝试编号 `attempt`、只读完整配置 `cfg`�
 
 每次顶层调用省略 `ctx` 时自动创建独立 RunContext。需要检查记录或接入自己的存储时，由调用方显式创建并传入上下文。显式复用同一个上下文表示这些调用属于同一 `run_id`；每次具体执行仍获得不同的 `execution_id`。
 
-上下文本身为 frozen dataclass。配置递归包装为只读映射和序列；需要恢复的模型数据、循环位置等由 Stage 在 `init()` 中声明为状态量，框架经内部通道把最新 checkpoint 记录交给 Stage，在阶段执行入口恢复。每次尝试先创建新的上下文，再由 Stage 恢复业务状态。运行时的尝试编号、执行 ID 和 Recorder 使用本次执行的信息。
+上下文本身为 frozen dataclass。配置递归包装为只读映射和序列；需要跨尝试恢复的模型数据、循环位置等，由用户在 `process()` 中通过 `ctx.checkpoint(position, state)` 显式保存，框架把最新 checkpoint 记录交给阶段入口，经 `ctx.checkpoint_state` 取回、`ctx.resume_range()` 从已保存位置继续。每次尝试先创建新的上下文，再由 Stage 恢复业务状态。运行时的尝试编号、执行 ID 和 Recorder 使用本次执行的信息。
 
 ## 6. 观测契约
 
@@ -267,7 +248,7 @@ Stage ID 直接取局部位置 `0、1、2…`，名称只用于展示。嵌套�
 
 阶段完成快照是返回值和状态量的单个保存事务。写入临时文件、flush/fsync 后原子替换目标路径，成功后才算完成。保存失败按普通阶段失败处理；未完成的临时文件不参与恢复。状态文件自动记录 running、succeeded、failed 或 cancelled，恢复复用时记录 reused 标记，执行事件也带有该标记和 stage_id。
 
-Checkpoint 由用户通过 `ctx.checkpoint(position, state)` 显式保存，只保留最新一份成功写入的记录。恢复发生在阶段执行入口：有可读 checkpoint 时框架重置随机状态到存档时刻，并把存档状态通过 `ctx.checkpoint_state` 交给 `process()`；`resume_range()` 从 `max(start, checkpoint_step)` 开始迭代。最新 checkpoint 损坏时 warning 并尝试上一份，两份都不可用则 `checkpoint_state` 为 None，`resume_range()` 从 `start` 开始。已完成阶段快照损坏会报 StorageError，避免静默传递错误的阶段输入。
+Checkpoint 由用户通过 `ctx.checkpoint(position, state)` 显式保存，只保留最新一份成功写入的记录。恢复发生在阶段执行入口：有可读 checkpoint 时框架重置随机状态到存档时刻，并把存档状态通过 `ctx.checkpoint_state` 交给 `process()`；`resume_range()` 从 `max(start, checkpoint 记录的位置)` 开始迭代。最新 checkpoint 损坏时 warning 并尝试上一份，两份都不可用则 `checkpoint_state` 为 None，`resume_range()` 从 `start` 开始。已完成阶段快照损坏会报 StorageError，避免静默传递错误的阶段输入。
 
 Batch 清单原子记录待执行队列、当前活动成员及尝试摘要。Ctrl+C 会将当前成员放回队首并保存取消记录；进程突然结束时，resume 根据活动成员补记中断尝试，其未知耗时记为 0。已完成成员保持完成，失败预算依据已持久化的 failed 尝试数计算。快照和清单不能构成跨文件的单次事务；若进程在结果保存后、清单更新前结束，恢复会复用已保存阶段结果补完该实验。
 
@@ -368,7 +349,7 @@ Batch 的尝试耗时与剩余时间估计保持原有规则，仍计入真实�
 
 命名默认配置统一位于项目根目录的 `configs/`。项目定位按实验 YAML 的祖先目录、当前工作目录的祖先目录依次查找，取首个包含 `pyproject.toml` 文件或 `.git` 标识的目录。Git worktree 的 `.git` 文件同样有效。找不到项目标识时，命名配置加载抛出 ConfigError；没有 name 的纯配置无需定位项目。
 
-GPU 显存查询使用内部默认超时 3 秒。实测该查询在 WSL2 单卡机器上按调度节奏运行 300 次：中位 53 毫秒、p99 300 毫秒、最坏 620 毫秒；宿主机 CPU 满载时中位 143 毫秒、最坏 915 毫秒。超时取观测最坏值的约三倍，既避免误判为内存不足（会误杀运行中的尝试），又把驱动卡死时的单个 tick 限制在 3 秒。`nvidia-smi` 先从 PATH 解析，失败时回退到 WSL2 的 `/usr/lib/wsl/lib/nvidia-smi`，因为 WSL2 默认不把该目录加入 PATH。主机内存读数与显存查询在同一个调度 tick 内完成，任一路径失败、超时或返回无效数据都按主机内存不足处理：清除旧读数、发出 RuntimeWarning、置 `mem_block` 并减载一次，下一个 tick 重新查询，调度不因查询失败终止。`/proc/meminfo` 缺失、字段不全或数值超范围都会进入该路径，不使用可能造成误减载的近似值。GPU 身份改变属于不可恢复的设备一致性错误。上述参数由框架内部定义。
+GPU 显存查询使用内部默认超时 3 秒。实测该查询在 WSL2 单卡机器上按调度节奏运行 300 次：中位 53 毫秒、p99 300 毫秒、最坏 620 毫秒；宿主机 CPU 满载时中位 143 毫秒、最坏 915 毫秒。超时取观测最坏值的约三倍，既避免误判为内存不足（会误杀运行中的尝试），又把驱动卡死时的单个 tick 限制在 3 秒。`nvidia-smi` 先从 PATH 解析，失败时回退到 WSL2 的 `/usr/lib/wsl/lib/nvidia-smi`，因为 WSL2 默认不把该目录加入 PATH。主机内存读数与显存查询在同一个调度 tick 内完成，任一路径失败、超时或返回无效数据都按主机内存不足处理：清除旧读数、发出 RuntimeWarning、暂停派发（有多个尝试在跑时撤销最近启动的一个，带冷却），下一个 tick 重新查询，调度不因查询失败终止。`/proc/meminfo` 缺失、字段不全或数值超范围都会进入该路径，不使用可能造成误减载的近似值。GPU 身份改变属于不可恢复的设备一致性错误。上述参数由框架内部定义。
 
 Batch 的累计墙钟时间与最近有效剩余时间区间原子保存在 `timing.pkl`。运行期间约每 5 秒更新一次，正常结束或捕获中断时再保存；关闭 CLI 仍记录。`Batch.elapsed_seconds` 返回跨 resume 累计运行时间，排除两次运行之间的停机时间，并行实验不重复累计。突然退出只能恢复最近成功保存的累计值。GPU 恢复初期尚无可用调度数据时，直接显示保存的同覆盖率预测区间，取得有效数据后更新。旧目录缺少 timing.pkl 时无法还原历史墙钟时间，从零开始累计；原有实验耗时及并发历史仍用于重新估计。
 
