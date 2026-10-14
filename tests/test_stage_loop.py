@@ -152,8 +152,8 @@ def test_resume_range_is_empty_when_checkpoint_is_beyond_stop():
     assert list(ctx.resume_range(0, 2)) == []
 
 
-def test_resume_range_resumes_from_checkpoint_step():
-    """resume_range starts from max(start, checkpoint_step)."""
+def test_resume_range_resumes_from_the_recorded_step():
+    """resume_range starts from max(start, the recorded step)."""
     ctx = RunContext(_checkpoint_record={"step": 2})
     assert list(ctx.resume_range(0, 5)) == [2, 3, 4]
     assert list(ctx.resume_range(3, 5)) == [3, 4]

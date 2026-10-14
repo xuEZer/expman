@@ -212,12 +212,6 @@ class RunContext:
         )
 
     @property
-    def checkpoint_step(self) -> int | None:
-        """The position recorded by the latest checkpoint, or None from scratch."""
-        record = self._checkpoint_record
-        return None if record is None else record.get("step")
-
-    @property
     def checkpoint_state(self) -> Any:
         """The state carried by the latest checkpoint, or None from scratch.
 

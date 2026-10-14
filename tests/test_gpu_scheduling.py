@@ -22,6 +22,7 @@ from expman.config.devices import (
     nvidia_smi,
 )
 from expman.core.experiment import Experiment
+from expman.scheduling._resource import _admits
 from expman.scheduling.limits import cap_kb
 from expman.scheduling.scheduler import GpuScheduler, HostGate
 from expman.storage.base import PickleSerializer, read_record
@@ -414,8 +415,8 @@ class TestGpuScheduling:
         )
         host = HostMemory(64 * 1024**2, HOST_RESERVE_KB + 3 * 1024**2, 0, 0)
 
-        assert scheduler._admits(host, 1024**2)
-        assert not scheduler._admits(host, 2 * 1024**2)
+        assert _admits(scheduler.workers, host, 1024**2)
+        assert not _admits(scheduler.workers, host, 2 * 1024**2)
 
     def test_known_stage_group_has_only_one_runnable_representative(self, tmp_path):
         path = tmp_path / "groups.yaml"

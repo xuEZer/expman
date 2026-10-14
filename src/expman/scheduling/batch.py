@@ -355,15 +355,10 @@ class Batch:
         self._scheduler = None
         ids = {experiment.run_id for experiment in self.experiments}
         self._queue = deque(manifest["queue"])
-        # "active" is a legacy field: manifests written before the queue became
-        # the single source of truth carry it, and a non-null value means the
-        # record was interrupted mid-write and must not be trusted.
-        active = manifest.get("active")
         if (
             len(ids) != len(experiments)
             or len(set(self._queue)) != len(self._queue)
             or any(run_id not in ids for run_id in self._queue)
-            or active is not None
         ):
             raise StorageError("invalid persisted experiment queue")
         active_gpu = manifest.get("active_gpu", {})

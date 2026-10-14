@@ -4,7 +4,16 @@ import expman.config.devices as devices
 
 
 def _device_unbacked(workers, memory, device):
-    """Whether one card can no longer honour the contracts running on it."""
+    """Whether one card can no longer honour the contracts running on it.
+
+    Admission re-reads device memory on every tick, so an external process
+    that claims memory after a launch is visible -- but only to the next
+    launch, because nothing re-checked the contracts already running. An
+    attempt's claim is what it was promised and has not taken yet, plus
+    what it took beyond its promise and is therefore spending from another
+    attempt's allowance; both come out of what is still free. A claim above
+    the free memory is a promise this scheduler can no longer keep.
+    """
     claim = sum(
         abs(worker.gpu_reserve_kb - (worker.gpu_reserved_kb or 0.0))
         for worker in workers.values()
@@ -14,7 +23,15 @@ def _device_unbacked(workers, memory, device):
 
 
 def _admits(workers, host, expected_kb):
-    """Whether one more attempt of expected_kb fits above the host reserve."""
+    """Whether one more attempt of expected_kb fits above the host reserve.
+
+    Every running worker is charged for the gap between what it holds now and
+    its reservation, so a launch cannot spend memory that attempts already in
+    flight are still going to ask for. Its cgroup ceiling sits above that
+    reservation: the ceiling ends an attempt that overshoots rather than being
+    capacity a plan may spend twice, and a worker seen to exceed its own
+    reservation is charged for the peak it reached.
+    """
     needed = expected_kb
     for _run_id, worker in workers.items():
         reach = max(worker.peak_kb, worker.host_reserve_kb)

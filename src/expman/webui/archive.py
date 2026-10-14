@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 from time import time
 
+from expman.observation.status import last_status, run_counts
 from expman.process_control import PID_FILE
 from expman.storage.base import PickleSerializer, StorageError, read_record
 from expman.webui.live import LIVE_FILE
@@ -31,7 +32,6 @@ from expman.webui.snapshot import (
     gantt_rows,
     number,
     remaining_interval,
-    run_counts,
     session_marks,
     stage_record,
     stage_samples,
@@ -94,18 +94,12 @@ def _records(directory: Path) -> tuple[dict | None, dict | None]:
 def _counts(manifest: dict) -> dict:
     return run_counts(
         (
-            (entry.get("run_id"), _last_recorded_status(entry))
+            (entry.get("run_id"), last_status(entry))
             for entry in manifest.get("experiments") or []
         ),
         set(manifest.get("active_gpu") or {}),
         set(manifest.get("queue") or []),
     )
-
-
-def _last_recorded_status(entry: dict):
-    """The status of a run's latest recorded attempt, or None before any."""
-    attempts = entry.get("attempts") or []
-    return attempts[-1].get("status", "") if attempts else None
 
 
 def _stage_name(spec: object) -> str | None:

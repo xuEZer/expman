@@ -28,6 +28,7 @@ from expman.estimation.estimate import TimeEstimate
 from expman.estimation.estimate import _clock as _fmt_elapsed
 from expman.observation.cleanup import clean as clean_intermediates
 from expman.observation.registry import RUNS_DIR, ensure_ids
+from expman.observation.status import last_status, run_counts, run_state
 from expman.process_control import PID_FILE, request_stop
 from expman.scheduling.batch import Batch
 from expman.storage.base import PickleSerializer, StorageError, read_record
@@ -244,14 +245,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     for entry in manifest["experiments"]:
         run_id = entry.get("run_id", "?")
         attempts = entry.get("attempts", [])
-        if run_id in active:
-            state = "running"
-        elif run_id in queue:
-            state = "pending"
-        elif attempts:
-            state = str(attempts[-1]["status"]).lower()
-        else:
-            state = "unknown"
+        state = run_state(run_id, last_status(entry), active, queue)
         stage = progress.get(run_id)
         position = (
             f"stage {stage + 1}/{total_stages}"
@@ -279,22 +273,18 @@ def _overview_line(batch_id: int, directory: Path) -> str:
     experiments = manifest.get("experiments") or []
     queue = manifest.get("queue") or []
     active = manifest.get("active_gpu") or {}
-    counts = {"run": 0, "pend": 0, "done": 0, "fail": 0, "stop": 0}
-    for entry in experiments:
-        run_id = entry.get("run_id", "?")
-        attempts = entry.get("attempts") or []
-        if run_id in active:
-            counts["run"] += 1
-        elif run_id in queue or not attempts:
-            counts["pend"] += 1
-        else:
-            state = str(attempts[-1].get("status", "")).lower()
-            if "succeed" in state:
-                counts["done"] += 1
-            elif "fail" in state:
-                counts["fail"] += 1
-            else:
-                counts["stop"] += 1
+    shared = run_counts(
+        ((entry.get("run_id", "?"), last_status(entry)) for entry in experiments),
+        active,
+        queue,
+    )
+    counts = {
+        "run": shared["running"],
+        "pend": shared["pending"],
+        "done": shared["succeeded"],
+        "fail": shared["failed"],
+        "stop": shared["cancelled"],
+    }
     total_stages = len(manifest.get("pipeline") or [])
     reached = [
         value

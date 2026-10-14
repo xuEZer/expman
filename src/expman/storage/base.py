@@ -1,12 +1,10 @@
 """Atomic trusted-object storage for stage snapshots and checkpoints."""
 
-import io
 import math
 import os
 import pickle
 import tempfile
 import warnings
-from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, BinaryIO, Protocol
@@ -60,24 +58,10 @@ def write_record(path: Path, value: Any, serializer: Serializer) -> None:
             temporary.unlink(missing_ok=True)
 
 
-@dataclass
-class _CheckpointEnvelope:
-    payload: bytes
-    dependencies: list
-
-
 def read_record(path: Path, serializer: Serializer) -> Any:
     try:
         with path.open("rb") as stream:
-            record = serializer.load(stream)
-        if isinstance(record, _CheckpointEnvelope):
-            dependencies = record.dependencies
-            validate(dependencies)
-            record = serializer.load(io.BytesIO(record.payload))
-            if not isinstance(record, dict):
-                raise ValueError("invalid checkpoint payload")
-            record["config_dependencies"] = dependencies
-        return record
+            return serializer.load(stream)
     except Exception as error:
         raise StorageError(f"cannot load {path}: {error}") from error
 
@@ -144,12 +128,7 @@ class RunStore:
         if self.rng is None:
             return
         if "rng_state" not in record:
-            warnings.warn(
-                "legacy snapshot has no random state; exact random replay is unavailable",
-                RecoveryWarning,
-                stacklevel=2,
-            )
-            return
+            raise StorageError("snapshot record has no random state")
         self.rng.restore(record["rng_state"])
 
     def restore_metrics(self, attempt: int, rows: list) -> None:
@@ -343,8 +322,8 @@ class Checkpoint:
     """Save Stage state synchronously; keep only the newest written file.
 
     The framework owns one instance per managed Stage; ``state`` is the
-    Stage's attribute snapshot captured by the framework's loop driver
-    and run().
+    state the user saved through ``ctx.checkpoint()``, restored on the
+    next attempt.
     """
 
     def __init__(
@@ -359,7 +338,7 @@ class Checkpoint:
         self._pipeline_calls = {} if pipeline_calls is None else pipeline_calls
         self.dependencies = dependencies
 
-    def save(self, *, step: int, state: dict, result: Any = None) -> Path:
+    def save(self, *, step: int, state: dict) -> Path:
         if isinstance(step, bool) or not isinstance(step, int) or step < 0:
             raise ValueError("step must be a nonnegative integer")
         if not isinstance(state, dict):
@@ -375,7 +354,6 @@ class Checkpoint:
             "position": self._position,
             "step": step,
             "state": state,
-            "loop_result": result,
             "pipeline_calls": self._pipeline_calls,
             **self._store.random_snapshot(),
             "elapsed_seconds": self._store.elapsed(self._position),

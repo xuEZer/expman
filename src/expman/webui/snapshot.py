@@ -15,6 +15,7 @@ import math
 from time import perf_counter, time
 
 from expman.core.events import ProgressEvent, Status
+from expman.observation.status import run_counts
 
 SCHEMA = 1
 
@@ -65,26 +66,6 @@ def _remaining(batch):
         estimate.completed_samples,
         estimate.remaining_experiments,
     )
-
-
-def run_counts(entries, active, queue):
-    """Per-run state counts from ``(run_id, last_status)`` pairs.
-
-    A run named in ``active`` counts as running and one in ``queue`` as
-    pending, both before its status is read; a run without any attempt yet is
-    pending, and a status this dashboard does not recognise folds into pending
-    as well, so a record written by another version never breaks the list.
-    """
-    counts = {"running": 0, "pending": 0, "succeeded": 0, "failed": 0, "cancelled": 0}
-    for run_id, last_status in entries:
-        if run_id in active:
-            state = "running"
-        elif run_id in queue or last_status is None:
-            state = "pending"
-        else:
-            state = str(last_status).lower()
-        counts[state if state in counts else "pending"] += 1
-    return counts
 
 
 def _last_attempt_status(experiment):
