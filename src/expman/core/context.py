@@ -61,6 +61,7 @@ class RunContext:
     _checkpoint: Checkpoint | None = field(default=None, kw_only=True, repr=False)
     _checkpoint_record: dict | None = field(default=None, kw_only=True, repr=False)
     _pipeline_calls: dict = field(default_factory=dict, kw_only=True, repr=False)
+    _explicit_checkpoint_used: bool = field(default=False, kw_only=True, repr=False)
     attempt: int = field(default=1, kw_only=True)
     _execution_id: str | None = field(default=None, repr=False)
 
@@ -209,3 +210,65 @@ class RunContext:
                 stage_id=self.stage_id,
             )
         )
+
+    @property
+    def checkpoint_step(self) -> int | None:
+        """The position recorded by the latest checkpoint, or None from scratch."""
+        record = self._checkpoint_record
+        return None if record is None else record.get("step")
+
+    @property
+    def checkpoint_state(self) -> Any:
+        """The state carried by the latest checkpoint, or None from scratch.
+
+        A state saved through ``checkpoint()`` with a non-dictionary value is
+        unwrapped transparently; dictionary states are returned as-is.
+        """
+        record = self._checkpoint_record
+        if record is None:
+            return None
+        state = record.get("state")
+        if isinstance(state, dict) and set(state) == {"__payload__"}:
+            return state["__payload__"]
+        return state
+
+    def resume_range(self, start: int, stop: int):
+        """Iterate from ``start`` to ``stop``, resuming from the checkpoint step.
+
+        If a checkpoint exists at step ``s``, iteration begins at
+        ``max(start, s)``; otherwise it begins at ``start``.  An empty iterator
+        is returned when the checkpoint is already at or beyond ``stop``.
+        """
+        start = _nonnegative_integer(start, "resume_range start")
+        stop = _nonnegative_integer(stop, "resume_range stop")
+        if start > stop:
+            raise ValueError("resume_range start must not exceed stop")
+        record = self._checkpoint_record
+        resume_step = start
+        if record is not None:
+            step = record.get("step")
+            if step is not None:
+                resume_step = max(start, _nonnegative_integer(step, "checkpoint step"))
+        if resume_step >= stop:
+            return iter(())
+        return iter(range(resume_step, stop))
+
+    def checkpoint(self, position: int, state: Any) -> None:
+        """Persist an explicit checkpoint at ``position`` with the given ``state``.
+
+        ``state`` may be any value; non-dictionaries are wrapped internally so
+        the storage format stays uniform.  The user owns the loop and decides
+        what to save and when.
+        """
+        if self._checkpoint is None:
+            raise RuntimeError("checkpoint() requires a managed Stage context")
+        position = _nonnegative_integer(position, "checkpoint position")
+        stored_state = state if isinstance(state, dict) else {"__payload__": state}
+        self._checkpoint.save(step=position, state=stored_state)
+        # Keep the in-memory record in sync so the completed snapshot can use
+        # the latest explicit state without re-reading disk.
+        record = dict(self._checkpoint_record) if self._checkpoint_record else {}
+        record["step"] = position
+        record["state"] = stored_state
+        object.__setattr__(self, "_checkpoint_record", record)
+        object.__setattr__(self, "_explicit_checkpoint_used", True)

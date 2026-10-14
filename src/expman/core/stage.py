@@ -193,16 +193,19 @@ class Stage[InputT, OutputT]:
         self._checkpointer = ctx._checkpoint
         self._break_requested = False
         record = ctx._checkpoint_record
-        if record is not None and type(self).process is Stage.process:
-            # Loop-mode resume: init() is skipped entirely and the checkpoint
-            # provides the initial values of every state variable.
-            for key, value in record["state"].items():
-                setattr(self, key, value)
-            self._state_keys = tuple(record["state"])
-            self._loop_step = record["step"] or 0
-            self._loop_result = record.get("loop_result")
+        if record is not None:
+            # Any resume skips init(): the checkpoint (explicit or loop-mode)
+            # carries the state the user needs through ctx.checkpoint_state.
             if self._checkpointer is not None:
                 self._checkpointer.restore_random(record)
+            if type(self).process is Stage.process:
+                # Loop-mode resume: the framework also restores self attributes
+                # so the existing loop() contract keeps working.
+                for key, value in record["state"].items():
+                    setattr(self, key, value)
+                self._state_keys = tuple(record["state"])
+                self._loop_step = record["step"] or 0
+                self._loop_result = record.get("loop_result")
             return
         self._loop_result = None
         before = set(self.__dict__)
@@ -223,10 +226,19 @@ class Stage[InputT, OutputT]:
             output = self.process(data, stage_context)
             if context._store is not None:
                 checkpointer = stage_context._checkpoint
+                if stage_context._explicit_checkpoint_used:
+                    user_state = stage_context.checkpoint_state
+                    state = (
+                        user_state
+                        if isinstance(user_state, dict)
+                        else {"__payload__": user_state}
+                    )
+                else:
+                    state = self._state()
                 context._store.complete(
                     context._stage_path,
                     output,
-                    self._state(),
+                    state,
                     self.name,
                     dependencies=None
                     if checkpointer is None
