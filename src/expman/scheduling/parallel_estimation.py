@@ -78,7 +78,8 @@ def estimate_parallel(scheduler, coverage):
     already materialized in the prefix cache is absent from the work list; only
     Stage groups that still require a process contribute to the makespan.
 
-    Every task carries an interval, so the packing runs once per side. The two
+    Later Stages wait for their unfinished prefix even when another device is
+    idle. Every task carries an interval, so the packing runs once per side. The two
     makespans bound the same greedy schedule evaluated with the shortest and the
     longest duration each task admits. They are an envelope, not a joint
     confidence interval: the packing adds tasks as if their durations were
@@ -128,6 +129,7 @@ def estimate_parallel(scheduler, coverage):
     unknown = TimeEstimate(None, None, coverage, samples, len(groups))
     tasks = []
     incomplete = False
+    overdue = False
     for group, (run_id, stage_index) in groups.items():
         if group in active_groups:
             elapsed = running[run_id].get("duration", 0.0)
@@ -140,6 +142,12 @@ def estimate_parallel(scheduler, coverage):
             ]
             if not all(isinstance(value, (int, float)) and value > 0 for value in span):
                 incomplete = True
+                continue
+            if elapsed >= span[_UPPER]:
+                # The attempt is still running, so reaching the old upper bound
+                # invalidates that prediction rather than proving completion.
+                incomplete = True
+                overdue = True
                 continue
             span = [max(0.0, value - elapsed) for value in span]
         else:
@@ -155,9 +163,13 @@ def estimate_parallel(scheduler, coverage):
         _publish(
             batch,
             degraded=(
-                "尚无阶段耗时样本，无法给出完工区间"
-                if not tasks
-                else "部分阶段缺少耗时区间，本区间只覆盖已有样本的阶段"
+                "运行中阶段已达到或超出耗时预测上界，无法给出剩余时间区间"
+                if overdue
+                else (
+                    "尚无阶段耗时样本，无法给出完工区间"
+                    if not tasks
+                    else "部分阶段缺少耗时区间，本区间只覆盖已有样本的阶段"
+                )
             ),
             pending_runs=len(queue),
             running_runs=len(active),
@@ -189,23 +201,61 @@ def estimate_parallel(scheduler, coverage):
         )
         return unknown
 
+    predecessors = {}
+    for group, (run_id, stage_index) in groups.items():
+        # A shared prefix has the same predecessors for every equivalent run.
+        # Completed groups are absent, so find the nearest unfinished one.
+        for previous_index in range(stage_index - 1, -1, -1):
+            previous = scheduler._stage_group(run_id, previous_index)
+            if previous in groups:
+                predecessors[group] = previous
+                break
+
     def makespan(side):
         slots = {device: [0.0] * count for device, count in counts.items()}
         occupied = {device: 0 for device in counts}
+        durations = {group: span[side] for span, group in tasks}
+        finished = {}
         for group in active_groups:
             run_id, _stage_index = groups[group]
             device = active[run_id]
             if device not in slots:
                 continue
-            duration = next(span[side] for span, key in tasks if key == group)
+            duration = durations[group]
             slots[device][occupied[device]] = duration
             occupied[device] += 1
-        for span, group in sorted(tasks, key=lambda item: item[0][side], reverse=True):
-            if group in active_groups:
-                continue
-            device = min(slots, key=lambda item: min(slots[item]))
-            slot = min(range(len(slots[device])), key=slots[device].__getitem__)
-            slots[device][slot] += span[side]
+            finished[group] = duration
+        pending = {group for _span, group in tasks if group not in active_groups}
+        while pending:
+            choices = []
+            for group in pending:
+                previous = predecessors.get(group)
+                if previous is not None and previous not in finished:
+                    continue
+                ready_at = finished.get(previous, 0.0)
+                device, slot = min(
+                    (
+                        (device, slot)
+                        for device, times in slots.items()
+                        for slot in range(len(times))
+                    ),
+                    key=lambda item: (
+                        max(slots[item[0]][item[1]], ready_at),
+                        slots[item[0]][item[1]],
+                        item,
+                    ),
+                )
+                start = max(slots[device][slot], ready_at)
+                choices.append(
+                    (start, -durations[group], repr(group), group, device, slot)
+                )
+            # Predecessors always have a smaller Stage index, so the graph is
+            # acyclic and there is a ready group until all work is assigned.
+            start, _priority, _key, group, device, slot = min(choices)
+            finish = start + durations[group]
+            slots[device][slot] = finish
+            finished[group] = finish
+            pending.remove(group)
         return max(max(values) for values in slots.values())
 
     lower, upper = makespan(_LOWER), makespan(_UPPER)

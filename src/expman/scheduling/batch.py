@@ -156,14 +156,20 @@ class Batch:
 
     def _save_timing(self):
         with self._state_lock:
+            estimate = self._last_estimate
+            if estimate is not None and not (
+                _is_seconds(estimate.lower_seconds)
+                and _is_seconds(estimate.upper_seconds)
+            ):
+                # The on-disk contract stores finite intervals or no estimate.
+                # An explicit unknown must not leave an older interval behind.
+                estimate = None
             write_record(
                 self.output_dir / "timing.pkl",
                 {
                     "version": 1,
                     "elapsed_seconds": self.elapsed_seconds,
-                    "estimate": None
-                    if self._last_estimate is None
-                    else asdict(self._last_estimate),
+                    "estimate": None if estimate is None else asdict(estimate),
                 },
                 self._serializer,
             )
@@ -457,18 +463,20 @@ class Batch:
             else estimate_parallel(scheduler, level)
         )
         with self._state_lock:
-            if (
-                estimate.lower_seconds is not None
-                and estimate.upper_seconds is not None
-                and math.isfinite(estimate.lower_seconds)
-                and math.isfinite(estimate.upper_seconds)
+            if not (
+                _is_seconds(estimate.lower_seconds)
+                and _is_seconds(estimate.upper_seconds)
             ):
-                self._last_estimate = estimate
-            elif (
-                self._last_estimate is not None
-                and self._last_estimate.coverage == level
-            ):
-                return self._last_estimate
+                estimate = TimeEstimate(
+                    None,
+                    None,
+                    level,
+                    estimate.completed_samples,
+                    estimate.remaining_experiments,
+                )
+            # A fresh unknown invalidates an older prediction. In particular,
+            # an overdue running Stage must not keep displaying a stale zero.
+            self._last_estimate = estimate
         return estimate
 
     def run(

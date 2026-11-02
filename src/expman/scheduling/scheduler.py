@@ -1,5 +1,6 @@
 """Memory-gated per-GPU process scheduling and durable attempt collection."""
 
+import math
 import os
 import signal
 import socket
@@ -16,7 +17,7 @@ import expman.scheduling.environment as environment
 import expman.scheduling.limits as limits
 from expman.core.dependencies import declared_paths
 from expman.core.dependencies import observation as config_observation
-from expman.core.events import Status
+from expman.core.events import ProgressEvent, Status
 from expman.core.experiment import AttemptResult, SnapshotOutput, StageResult
 from expman.estimation.duration_model import DurationModel
 from expman.estimation.memory_model import LocalQuantileEstimator, PeakCeiling
@@ -165,8 +166,13 @@ class GpuScheduler:
                 return None
             active[self._stage_group(run_id, stage_index)] = (run_id, stage_index)
         groups = dict(active)
-        for run_id in queue:
-            start = self.batch._stage_progress[run_id]
+        # A running attempt still has downstream work. Keep its current group
+        # active, then include the stages that will become ready after it ends.
+        starts = {run_id: self.batch._stage_progress[run_id] for run_id in queue}
+        starts.update(
+            (run_id, details["stage_index"] + 1) for run_id, details in running.items()
+        )
+        for run_id, start in starts.items():
             experiment = next(
                 item for item in self.batch.experiments if item.run_id == run_id
             )
@@ -422,7 +428,16 @@ class GpuScheduler:
                 continue
             kind = message.get("type")
             if kind == "event":
-                self.batch.recorder.record(message["event"])
+                event = message["event"]
+                if (
+                    isinstance(event, ProgressEvent)
+                    and event.run_id == worker.experiment.run_id
+                    and event.attempt == worker.stage_attempt
+                ):
+                    # The IPC channel identifies this attempt even when a nested
+                    # Pipeline uses a child-local stage_id. Preserve the event.
+                    worker.progress = event
+                self.batch.recorder.record(event)
             elif kind == "resource":
                 self._resources(worker, message)
             elif kind == "finished" and isinstance(message.get("result"), StageResult):
@@ -440,9 +455,35 @@ class GpuScheduler:
     def _resources(worker, message):
         current, peak = message.get("host_current_kb"), message.get("host_peak_kb")
         if all(
-            isinstance(value, (int, float)) and value >= 0 for value in (current, peak)
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value >= 0
+            for value in (current, peak)
         ):
-            worker.resident_kb, worker.peak_kb = current, peak
+            worker.resident_kb = current
+            worker.peak_kb = max(worker.peak_kb, current, peak)
+        for name in ("host_usage_source", "host_usage_error"):
+            value = message.get(name)
+            if value is None or isinstance(value, str):
+                setattr(worker, name, value)
+        if "host_limit_verified" in message and worker.limit is not None:
+            observed_cap = message.get("host_limit_kb")
+            valid_cap = (
+                isinstance(observed_cap, (int, float))
+                and not isinstance(observed_cap, bool)
+                and math.isfinite(observed_cap)
+                and observed_cap >= 0
+            )
+            worker.host_limit_kb = observed_cap if valid_cap else None
+            verified = (
+                message["host_limit_verified"] is True
+                and valid_cap
+                and limits.cap_matches_request(observed_cap, worker.limit.cap_kb)
+            )
+            # cap_kb retains the requested ceiling, even if this observation
+            # cannot verify an effective per-attempt kernel limit.
+            worker.limit = replace(worker.limit, verified=verified)
         gpu = message.get("gpu")
         if isinstance(gpu, dict):
             for name in (
@@ -458,8 +499,11 @@ class GpuScheduler:
         if isinstance(events, dict):
             worker.memory_events = events
         directory = message.get("cgroup")
-        if isinstance(directory, str) and worker.limit is not None:
-            worker.limit = replace(worker.limit, cgroup=Path(directory))
+        if worker.limit is not None and "cgroup" in message:
+            worker.limit = replace(
+                worker.limit,
+                cgroup=Path(directory) if isinstance(directory, str) else None,
+            )
 
     def _observe(self):
         """Read device and host memory; a failed or timed-out query is not a reading."""
@@ -603,6 +647,9 @@ class GpuScheduler:
         gpu_capacities = tuple(
             max(0.0, available_gpu[device]) for device in devices_in_plan
         )
+        # Admission uses current headroom; scoring uses fixed card totals so
+        # work already occupying a card remains visible across scheduling ticks.
+        gpu_totals = tuple(memory[device].total * 1024 for device in devices_in_plan)
         stages = sorted(
             {self.batch._stage_progress[run_id] for run_id in self.batch._queue}
         )
@@ -646,12 +693,12 @@ class GpuScheduler:
                     )
             plans = sorted(
                 expanded,
-                key=lambda plan: _plan_score(plan, host_capacity, gpu_capacities),
+                key=lambda plan: _plan_score(plan, host_capacity, gpu_totals),
                 reverse=True,
             )[:PLAN_BEAM_WIDTH]
         chosen = max(
             plans,
-            key=lambda plan: _plan_score(plan, host_capacity, gpu_capacities),
+            key=lambda plan: _plan_score(plan, host_capacity, gpu_totals),
         )
         # Published for the dashboard: what this tick could place and what it
         # passed over.  Recorded here because only this thread may read the
@@ -866,17 +913,21 @@ class GpuScheduler:
             env.update(self._environment)
             # The unit is unique per attempt: systemd unloads a finished scope
             # asynchronously, and a retry must not collide with the previous one.
-            limit = limits.memory_limit(
-                f"expman-{run_id[:12]}-{stage_index}-{stage_attempt}",
-                host_reserve,
-            )
+            unit = f"expman-{run_id[:12]}-{stage_index}-{stage_attempt}"
+            limit = limits.memory_limit(unit, host_reserve)
+            env["EXPMAN_CGROUP_UNIT"] = unit
+            env["EXPMAN_HOST_LIMIT_KB"] = str(limit.cap_kb)
             if limit.cgroup is not None:
                 env["EXPMAN_CGROUP"] = str(limit.cgroup)
-            elif not limit.capped:
+            elif limit.mechanism == "none":
                 # No cgroup of its own: the attempt inherits this process's, whose
                 # counters cover the whole session. An empty value tells it to
                 # report its own high-water mark instead.
                 env["EXPMAN_CGROUP"] = ""
+            else:
+                # A systemd scope is not proof that a memory controller enforces
+                # its limit. The worker resolves and verifies its own group.
+                env.pop("EXPMAN_CGROUP", None)
             parent_socket, child_socket = socket.socketpair()
             parent_socket.setblocking(False)
             env["EXPMAN_IPC_FD"] = str(child_socket.fileno())
@@ -914,11 +965,6 @@ class GpuScheduler:
                 raise RuntimeError(
                     f"could not move worker {process.pid} into {limit.cgroup}"
                 )
-            if limit.mechanism == "systemd":
-                # ``systemd-run --scope`` has placed this process in a user
-                # hierarchy by now.  Discover it from proc rather than deriving
-                # a path from the scheduler's unrelated cgroup.
-                limit = replace(limit, cgroup=limits.cgroup_for_pid(process.pid))
             now = perf_counter()
             self.workers[run_id] = Worker(
                 process=process,

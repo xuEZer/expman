@@ -265,6 +265,13 @@ function workerRow(w) {
   const progress = w.progress && ok(w.progress.completed)
     ? '<div class="mono faint">进度 ' + w.progress.completed + (ok(w.progress.total) ? "/" + w.progress.total : "") + " " + esc(w.progress.unit || "") + "</div>"
     : "";
+  const sourceText = { proc: "进程观测", unavailable: "观测不可用", cgroup: "cgroup 观测" };
+  const hostObservation = host.usage_source || host.usage_error
+    ? '<div class="mono faint">内存采样 ' + esc(sourceText[host.usage_source] || host.usage_source || "观测不可用") +
+      (host.usage_error ? " · " + esc(host.usage_error) : "") + "</div>"
+    : "";
+  const hostLimit = ok(host.requested_cap_kb) && host.requested_cap_kb > 0 && !host.capped
+    ? '<div class="mono faint">内存上限未核验</div>' : "";
   return '<div class="row worker-row" style="margin-top:10px">' +
     '<span class="mono">' + esc(w.run) + "</span>" +
     "<span>" + esc(w.stage || "S" + w.stage_index) + "</span>" +
@@ -275,7 +282,7 @@ function workerRow(w) {
       '<div class="mono faint">内存 实际占用 ' + gib(host.resident_kb) + " / 分配 " + gib(host.reserved_kb) + " GiB" +
         (host.reached_cap ? ' <span class="k-fail">触顶</span>' : "") + "</div>" +
       bar([{ from: 0, size: pctOf(host.resident_kb, hostAlloc), color: "var(--actual)" }],
-        null, hostCap, "thin") +
+        null, hostCap, "thin") + hostObservation + hostLimit +
       '<div class="mono faint" style="margin-top:6px">显存 实际占用 ' + gib(gpu.reserved_kb) + " / 分配 " + gib(gpu.budget_kb) + " GiB" + "</div>" +
       bar([{ from: 0, size: pctOf(gpu.reserved_kb, gpuAlloc), color: "var(--actual)" }],
         null, gpuCap, "thin") +
@@ -286,6 +293,8 @@ function workerRow(w) {
 
 function timeline(s) {
   const rows = s.gantt || [];
+  const attempts = rows.filter((r) => !r.reused);
+  const reuses = rows.filter((r) => r.reused);
   const marks = (s.batch && s.batch.session_marks) || [];
   if (!rows.length)
     return '<div class="card empty">这批记录没有可绘制的尝试跨度（旧批次不含起止时刻，用了才会开始累积）</div>';
@@ -303,29 +312,35 @@ function timeline(s) {
   // so a new run drops into the earliest lane that is already free, and only
   // a genuinely concurrent run opens a new lane.  Lane count == peak concurrency.
   const lanes = [];
-  rows.forEach((r) => {
-    const start = clamp(r.start_seconds);
+  attempts.forEach((r) => {
+    const start = Math.max(0, r.start_seconds);
     let lane = lanes.findIndex((free) => free <= start + 1e-9);
     if (lane === -1) { lane = lanes.length; lanes.push(0); }
     lanes[lane] = r.end_seconds;
     r._lane = lane;
   });
-  const bars = rows.map((r) => {
+  const bars = attempts.map((r) => {
     const left = pctOf(r.start_seconds, span);
     const raw = pctOf(r.end_seconds - r.start_seconds, span);
-    // A zero-length attempt (a reused Stage) still gets a hairline so it is
-    // visible at all; every other bar keeps its true width.
+    // Very short attempts remain visible. Cache reuses are separate axis
+    // markers: they do not occupy a worker or add a concurrency lane.
     const width = Math.max(raw, 0.4);
     const cls = "gantt-bar " + (BAR_CLASS[r.status] || "");
-    const label = r.reused ? esc(r.run) + " 复用" : esc(r.run);
+    const label = esc(r.run);
     return '<span class="' + cls + '" style="left:' + left + "%;width:" + width + '%" title="' +
       esc(r.run) + " · " + esc(r.stage || "S" + r.stage_index) + " a" + esc(r.attempt) +
       " · " + secs(r.start_seconds) + "～" + secs(r.end_seconds) + '">' + label + "</span>";
   });
   const body = lanes.map((_, lane) => {
-    const here = bars.filter((_, i) => rows[i]._lane === lane).join("");
+    const here = bars.filter((_, i) => attempts[i]._lane === lane).join("");
     return '<div class="gantt-lane">' + here + "</div>";
   }).join("");
+  const reuseMarks = reuses.map((r) =>
+    '<span class="gantt-reuse" style="position:absolute;left:' + pctOf(r.start_seconds, span) +
+    '%;top:-8px;transform:translateX(-50%);font-size:9px;color:var(--done)" title="' +
+    esc(r.run) + " · " + esc(r.stage || "S" + r.stage_index) + " · 缓存复用 · " +
+    secs(r.start_seconds) + '">◆</span>'
+  ).join("");
   const folds = marks.filter((m) => m > 0 && m < span).map((m) =>
     '<span class="gantt-fold" style="left:' + pctOf(m, span) + '%" title="此处中断过，之后恢复"></span>'
   ).join("");
@@ -337,7 +352,8 @@ function timeline(s) {
     return '<span class="tl-tick" style="left:' + fraction * 100 + "%" + place + '">' + esc(text) + "</span>";
   }).join("");
   return '<div class="card"><div class="gantt">' + body +
-    '<div class="gantt-axis">' + ticks + folds + "</div></div></div>";
+    '<div class="gantt-axis">' + ticks + folds + reuseMarks + "</div></div>" +
+    (reuses.length ? '<div class="legend">◆ 缓存复用（不占并发槽）</div>' : "") + "</div>";
 }
 
 
@@ -383,14 +399,17 @@ function hostRow(host) {
     { at: start + pctOf(actual, total), text: gib(other + actual) + "G" },
     { at: start + pctOf(budget, total), text: gib(other + budget) + "G" },
   ];
+  const usageKnown = ok(host.expman_actual_kb);
+  const usageBar = usageKnown ? bar(
+    [{ from: 0, size: start, color: "var(--other)" }, { from: start, size: pctOf(actual, total), color: "var(--actual)" }],
+    { from: start, size: pctOf(budget, total) }, null, "wide", marks)
+    : '<div class="mono faint">内存观测不可用</div>';
   return '<div class="row" style="grid-template-columns:76px minmax(0,1fr) 92px;margin-top:12px">' +
       '<span class="muted mono">主机</span>' +
-      '<div class="' + stale.trim() + '">' + bar(
-        [{ from: 0, size: start, color: "var(--other)" }, { from: start, size: pctOf(actual, total), color: "var(--actual)" }],
-        { from: start, size: pctOf(budget, total) }, null, "wide", marks) + "</div>" +
+      '<div class="' + stale.trim() + '">' + usageBar + "</div>" +
       '<span class="mono" style="text-align:right">' + gib(host.launchable_kb) + " GiB</span>" +
     "</div>" +
-    '<div class="detail mono">实际驻留 ' + gib(actual) + " · 分配 " + gib(budget) +
+    '<div class="detail mono">实际驻留 ' + (usageKnown ? gib(actual) : "观测不可用") + " · 分配 " + gib(budget) +
       " · MemAvailable " + gib(host.available_kb) + " · 交换 " + gib(host.swap_free_kb) + "/" + gib(host.swap_total_kb) + "</div>";
 }
 

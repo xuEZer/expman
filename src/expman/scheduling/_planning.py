@@ -15,12 +15,16 @@ def _interleave(groups):
     return items
 
 
-def _plan_score(plan, host_capacity, gpu_capacities):
-    """Prefer plans that jointly leave the least normalized resource behind."""
+def _plan_score(plan, host_capacity, gpu_totals):
+    """Fill feasible capacity while balancing load against each card's total.
+
+    Normalizing by per-tick free space would reward a job for using the busiest
+    card that still fits it. Fixed totals retain both existing and planned load.
+    """
     unused = (plan.host_left_kb / host_capacity) ** 2
     unused += sum(
         (left / capacity) ** 2
-        for left, capacity in zip(plan.gpu_left_kb, gpu_capacities, strict=True)
+        for left, capacity in zip(plan.gpu_left_kb, gpu_totals, strict=True)
         if capacity > 0
     )
     # Parameter diversity only breaks materially equivalent packing choices.

@@ -12,6 +12,7 @@ that stalls on rendering must never hold up a launch decision.
 """
 
 import math
+from copy import copy
 from time import perf_counter, time
 
 from expman.core.events import ProgressEvent, Status
@@ -75,7 +76,7 @@ def _last_attempt_status(experiment):
 
 
 def _progress(batch, limit=400):
-    """Latest intra-Stage progress per run, from the tail of the recorder's log.
+    """Latest progress per run, Stage and attempt, from the recorder's tail.
 
     Only the tail is scanned: a long experiment can record hundreds of
     thousands of events, and the dashboard must not walk them every second.
@@ -87,7 +88,7 @@ def _progress(batch, limit=400):
     latest = {}
     for event in events[-limit:]:
         if isinstance(event, ProgressEvent) and isinstance(event.run_id, str):
-            latest[event.run_id] = {
+            latest[event.run_id, event.stage_id, event.attempt] = {
                 "completed": event.completed,
                 "total": event.total,
                 "unit": event.unit,
@@ -96,17 +97,45 @@ def _progress(batch, limit=400):
     return latest
 
 
-def _workers(scheduler, running_info, names, progress, now):
+def _worker_progress(worker, run_id, progress):
+    # Legacy in-memory views without an attempt-local cache can still read the
+    # recorder. A new Worker with an empty cache must not inherit old events.
+    if not hasattr(worker, "progress"):
+        return progress.get((run_id, worker.stage_index, worker.stage_attempt))
+    event = worker.progress
+    if (
+        isinstance(event, ProgressEvent)
+        and event.run_id == run_id
+        and event.attempt == worker.stage_attempt
+    ):
+        return {
+            "completed": event.completed,
+            "total": event.total,
+            "unit": event.unit,
+            "stage_id": event.stage_id,
+        }
+    return None
+
+
+def _workers(window, names, progress, now):
     """One entry per running attempt: what it holds, what it was charged, its span."""
     workers = []
-    if scheduler is None:
-        return workers
-    for run_id, worker in scheduler.workers.items():
-        info = running_info.get(run_id) or {}
-        elapsed = max(0.0, perf_counter() - worker.started)
+    session_start = max(window["marks"], default=0.0)
+    for run_id, worker in window["workers"].items():
+        info = window["running_info"].get(run_id) or {}
+        elapsed = max(0.0, window["sampled_at"] - worker.started)
         expected = worker.expected
         limit = worker.limit
+        verified = bool(getattr(limit, "verified", False))
+        host_cap = getattr(worker, "host_limit_kb", None)
+        if host_cap is None:
+            host_cap = getattr(limit, "cap_kb", None)
+        host_cap = number(host_cap) if verified else None
+        if host_cap is not None and host_cap <= 0:
+            host_cap = None
         stage_index = worker.stage_index
+        usage_source = getattr(worker, "host_usage_source", None)
+        usage_known = usage_source != "unavailable"
         workers.append(
             {
                 "run_id": run_id,
@@ -118,6 +147,10 @@ def _workers(scheduler, running_info, names, progress, now):
                 "uuid": worker.uuid,
                 "elapsed_seconds": round(elapsed, 1),
                 "started_at": round(now - elapsed, 1),
+                "start_seconds": round(
+                    max(session_start, window["elapsed"] - elapsed), 2
+                ),
+                "end_seconds": round(window["elapsed"], 2),
                 "expected": None
                 if expected is None
                 else {
@@ -127,10 +160,13 @@ def _workers(scheduler, running_info, names, progress, now):
                 },
                 "host": {
                     "reserved_kb": number(worker.host_reserve_kb),
-                    "resident_kb": number(worker.resident_kb),
-                    "peak_kb": number(worker.peak_kb),
-                    "cap_kb": number(getattr(limit, "cap_kb", None)),
-                    "capped": bool(getattr(limit, "capped", False)),
+                    "resident_kb": number(worker.resident_kb) if usage_known else None,
+                    "peak_kb": number(worker.peak_kb) if usage_known else None,
+                    "cap_kb": host_cap,
+                    "requested_cap_kb": number(getattr(limit, "cap_kb", None)),
+                    "capped": host_cap is not None,
+                    "usage_source": usage_source,
+                    "usage_error": getattr(worker, "host_usage_error", None),
                     "reached_cap": bool(worker.cap_hit),
                 },
                 "gpu": {
@@ -144,7 +180,7 @@ def _workers(scheduler, running_info, names, progress, now):
                 "dependencies": None
                 if worker.dependencies is None
                 else len(worker.dependencies),
-                "progress": progress.get(run_id),
+                "progress": _worker_progress(worker, run_id, progress),
             }
         )
     workers.sort(key=lambda item: item["started_at"])
@@ -187,7 +223,11 @@ def _resources(device_memory, host_memory, workers, plan):
         )
     host_total = number(host_memory.get("total_kb"))
     host_available = number(host_memory.get("available_kb"))
-    resident = sum(worker["host"]["resident_kb"] or 0.0 for worker in workers)
+    resident = (
+        None
+        if any(worker["host"]["resident_kb"] is None for worker in workers)
+        else sum(worker["host"]["resident_kb"] for worker in workers)
+    )
     budget = sum(worker["host"]["reserved_kb"] or 0.0 for worker in workers)
     used = (
         None
@@ -200,7 +240,9 @@ def _resources(device_memory, host_memory, workers, plan):
             "total_kb": host_total,
             "available_kb": host_available,
             "used_kb": used,
-            "other_kb": None if used is None else max(0.0, used - resident),
+            "other_kb": None
+            if used is None or resident is None
+            else max(0.0, used - resident),
             "expman_actual_kb": resident,
             "expman_budget_kb": budget,
             "launchable_kb": number(capacity.get("host_left_kb")),
@@ -287,15 +329,35 @@ def _stages(completion, names, view, samples):
     ]
 
 
-def gantt_rows(history, names):
-    """Every recorded attempt as one gantt row, on the Batch effective clock.
+def gantt_rows(history, names, workers=()):
+    """Completed and running attempts on the same Batch effective clock.
 
     An entry without ``start_seconds`` predates this field (or came from an
     older batch); it is dropped rather than guessed, so the axis never shows a
     fabricated span.
     """
+    records = list(history)
+    completed = {
+        (entry.get("run_id"), entry.get("stage"), entry.get("attempt"))
+        for entry in records
+    }
+    for worker in workers:
+        identity = (worker["run_id"], worker["stage_index"], worker["attempt"])
+        if identity not in completed:
+            records.append(
+                {
+                    "run_id": worker["run_id"],
+                    "stage": worker["stage_index"],
+                    "attempt": worker["attempt"],
+                    "device": worker["device"],
+                    "start_seconds": worker["start_seconds"],
+                    "end_seconds": worker["end_seconds"],
+                    "status": Status.RUNNING.value,
+                    "reused": False,
+                }
+            )
     rows = []
-    for entry in history:
+    for entry in records:
         start = number(entry.get("start_seconds"))
         end = number(entry.get("end_seconds"))
         run_id = entry.get("run_id")
@@ -376,6 +438,10 @@ def _publish_window(batch, scheduler):
         except Exception:
             completion = None
         return {
+            "workers": {}
+            if scheduler is None
+            else {run_id: copy(worker) for run_id, worker in scheduler.workers.items()},
+            "sampled_at": perf_counter(),
             "queue": list(batch._queue),
             "active": dict(batch._active_gpu),
             "progress": dict(batch._stage_progress),
@@ -397,7 +463,7 @@ def _gather(batch) -> dict:
     now = time()
     window = _publish_window(batch, scheduler)
     names = _stage_names(batch)
-    workers = _workers(scheduler, window["running_info"], names, _progress(batch), now)
+    workers = _workers(window, names, _progress(batch), now)
     resources = _resources(
         window["device_memory"], window["host_memory"], workers, window["plan"]
     )
@@ -439,7 +505,7 @@ def _gather(batch) -> dict:
         },
         "stages": stages,
         "workers": workers,
-        "gantt": gantt_rows(window["history"], names),
+        "gantt": gantt_rows(window["history"], names, workers),
         "resources": resources,
         "schedule": {
             "pending_runs": len(window["queue"]),

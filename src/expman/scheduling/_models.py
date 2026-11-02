@@ -7,6 +7,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from expman.core.events import ProgressEvent
 from expman.core.experiment import StageResult
 from expman.estimation.duration_model import StageDuration
 from expman.scheduling.ipc import Channel
@@ -46,12 +47,16 @@ class Worker:
     # it has ever held. Admission reserves the gap between the two.
     resident_kb: float = 0.0
     peak_kb: float = 0.0
+    host_usage_source: str | None = None
+    host_usage_error: str | None = None
+    host_limit_kb: float | None = None
     gpu_allocated_kb: float | None = None
     gpu_reserved_kb: float | None = None
     gpu_peak_allocated_kb: float | None = None
     gpu_peak_reserved_kb: float | None = None
     memory_events: dict = field(default_factory=dict)
     finished: StageResult | None = None
+    progress: ProgressEvent | None = None
     dependencies: list | None = None
     reused: bool = False
     cap_hit: bool = False

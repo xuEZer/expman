@@ -2,7 +2,9 @@ import json
 import os
 import pickle
 import socket
+from datetime import UTC, datetime
 from time import perf_counter, sleep, time
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -13,6 +15,8 @@ import yaml
 from expman import Batch, Pipeline, Stage, Status, devices
 from expman.cli import _parser
 from expman.config.devices import DeviceMemory, HostMemory
+from expman.core.context import RunContext
+from expman.core.events import ProgressEvent
 from expman.estimation.duration_model import StageDuration
 from expman.observation.analysis import ANALYSIS_SCHEMA
 from expman.observation.registry import ensure_ids
@@ -308,6 +312,104 @@ def test_attempts_without_a_span_are_left_off_the_axis(tmp_path):
     assert snapshot["gantt"] == []
 
 
+@POSIX
+def test_live_gantt_uses_the_effective_clock_and_keeps_retry_history(
+    tmp_path, monkeypatch
+):
+    batch = make_batch(tmp_path, count=1)
+    scheduler = GpuScheduler(batch)
+    run_id = batch.experiments[0].run_id
+    live_worker(batch, run_id)
+    worker = scheduler.workers[run_id]
+    monkeypatch.setattr(
+        "expman.webui.snapshot.perf_counter", lambda: worker.started + 30.0
+    )
+    # A resumed invocation has already accumulated 600 seconds. Wall-clock
+    # downtime is absent; this attempt started at effective second 670.
+    batch._elapsed_seconds = 700.0
+    batch._session_marks = [600.0]
+    previous = {
+        "run_id": run_id,
+        "stage": 0,
+        "attempt": 1,
+        "device": 0,
+        "start_seconds": 580.0,
+        "end_seconds": 600.0,
+        "status": Status.CANCELLED.value,
+        "reused": False,
+    }
+    batch._stage_history.append(previous)
+
+    snapshot = build_snapshot(batch)
+
+    rows = snapshot["gantt"]
+    assert [(row["attempt"], row["status"]) for row in rows] == [
+        (1, "cancelled"),
+        (2, "running"),
+    ]
+    assert rows[1]["start_seconds"] == 670.0
+    assert rows[1]["end_seconds"] == 700.0
+    assert snapshot["batch"]["session_marks"] == [600.0]
+
+    # The durable completion wins even if a publisher can still see the worker.
+    batch._stage_history.append(
+        {
+            **previous,
+            "attempt": 2,
+            "start_seconds": 670.0,
+            "end_seconds": 700.0,
+            "status": Status.SUCCEEDED.value,
+        }
+    )
+    completed = build_snapshot(batch)["gantt"]
+    assert len(completed) == 2
+    assert completed[-1]["status"] == "succeeded"
+    scheduler.workers.clear()
+    batch._active_gpu.clear()
+    assert build_snapshot(batch)["gantt"] == completed
+
+
+@POSIX
+@pytest.mark.parametrize(
+    ("stage_id", "attempt", "expected"), [(1, 2, None), (0, 1, None), (0, 2, 3)]
+)
+def test_legacy_worker_progress_belongs_to_its_current_stage_and_attempt(
+    tmp_path, stage_id, attempt, expected
+):
+    batch = make_batch(tmp_path, count=1)
+    GpuScheduler(batch)
+    run_id = batch.experiments[0].run_id
+    live_worker(batch, run_id)
+    worker = batch._scheduler.workers[run_id]
+    batch._scheduler.workers[run_id] = SimpleNamespace(
+        **{key: value for key, value in vars(worker).items() if key != "progress"}
+    )
+    batch.recorder.events.append(
+        ProgressEvent(
+            run_id=run_id,
+            execution_id="progress",
+            completed=3,
+            total=10,
+            unit="steps",
+            timestamp=datetime.now(UTC),
+            stage_id=stage_id,
+            attempt=attempt,
+        )
+    )
+
+    progress = build_snapshot(batch)["workers"][0]["progress"]
+
+    if expected is None:
+        assert progress is None
+    else:
+        assert progress == {
+            "completed": expected,
+            "total": 10,
+            "unit": "steps",
+            "stage_id": 0,
+        }
+
+
 def test_the_archived_path_exposes_the_folds_it_recorded(tmp_path):
     directory = tmp_path / "batch"
     directory.mkdir()
@@ -415,6 +517,58 @@ def test_a_running_attempt_reports_allocation_against_actual_use(tmp_path):
 
     assert snapshot["schedule"]["running_runs"] == 1
     assert snapshot["schedule"]["running_by_stage"][0] == 1
+
+
+@POSIX
+@pytest.mark.parametrize(
+    ("verified", "observed", "displayed"),
+    [
+        (False, 5 * GIB, None),
+        (True, 5 * GIB, 5 * GIB),
+        (True, None, 8 * GIB),
+        (True, 0, None),
+    ],
+)
+def test_host_caps_only_display_verified_enforcement(
+    tmp_path, verified, observed, displayed
+):
+    batch = make_batch(tmp_path, count=1)
+    scheduler = GpuScheduler(batch)
+    run_id = batch.experiments[0].run_id
+    live_worker(batch, run_id)
+    worker = scheduler.workers[run_id]
+    worker.limit = SimpleNamespace(cap_kb=8 * GIB, verified=verified, capped=verified)
+    worker.host_limit_kb = observed
+    worker.host_usage_source = "proc"
+    worker.host_usage_error = "cgroup usage unavailable"
+
+    host = build_snapshot(batch)["workers"][0]["host"]
+
+    assert host["cap_kb"] == displayed
+    assert host["requested_cap_kb"] == 8 * GIB
+    assert host["capped"] is (displayed is not None)
+    assert host["usage_source"] == "proc"
+    assert host["usage_error"] == "cgroup usage unavailable"
+
+
+@POSIX
+def test_unavailable_worker_usage_does_not_become_zero_in_the_host_total(tmp_path):
+    batch = make_batch(tmp_path, count=1)
+    scheduler = GpuScheduler(batch)
+    run_id = batch.experiments[0].run_id
+    live_worker(batch, run_id)
+    worker = scheduler.workers[run_id]
+    worker.resident_kb = 0.0
+    worker.peak_kb = 0.0
+    worker.host_usage_source = "unavailable"
+
+    snapshot = build_snapshot(batch)
+
+    assert snapshot["workers"][0]["host"]["resident_kb"] is None
+    assert snapshot["workers"][0]["host"]["peak_kb"] is None
+    assert snapshot["resources"]["host"]["expman_actual_kb"] is None
+    assert snapshot["resources"]["host"]["other_kb"] is None
+    assert snapshot["resources"]["host"]["expman_budget_kb"] == 8 * GIB
 
 
 @POSIX
@@ -911,3 +1065,60 @@ def test_a_sleeping_dashboard_can_be_closed_while_it_waits(tmp_path):
         dashboard.close()
     finally:
         dashboard.close()
+
+
+@POSIX
+def test_nested_progress_flows_from_worker_ipc_to_snapshot(tmp_path):
+    class Child(Stage):
+        def process(self, data, ctx):
+            ctx.report_progress(1, total=5)
+            ctx.report_progress(2, total=5)
+            return data
+
+    config = tmp_path / "nested.yaml"
+    config.write_text("device: [0]\nseed: 0\nmarkers: test\ndelay: 0\nitem: 0\n")
+    batch = Batch(Pipeline([Work, Work]), config, output_dir=tmp_path / "batch")
+    scheduler = GpuScheduler(batch)
+    run_id = batch.experiments[0].run_id
+    live_worker(batch, run_id)
+    worker = scheduler.workers[run_id]
+    worker.stage_index = 1
+    batch._gpu_running_info[run_id]["stage_index"] = 1
+    context = RunContext(run_id=run_id, stage_id=1, attempt=worker.stage_attempt)
+    Pipeline([Child]).run(ctx=context)
+    emitted = [
+        event for event in context.recorder.events if isinstance(event, ProgressEvent)
+    ]
+    assert [event.stage_id for event in emitted] == [0, 0]
+    worker.channel = Mock()
+    worker.channel.drain.return_value = [
+        {"type": "event", "event": event} for event in context.recorder.events
+    ]
+
+    scheduler._messages(worker)
+
+    assert worker.progress is emitted[-1]
+    assert any(event is emitted[-1] for event in batch.recorder.events)
+    current = build_snapshot(batch)["workers"][0]
+    assert current["stage_index"] == 1
+    assert current["progress"] == {
+        "completed": 2,
+        "total": 5,
+        "unit": "step",
+        "stage_id": 0,
+    }
+
+    # Even a new worker whose top-level ID matches the old child ID starts empty.
+    live_worker(batch, run_id)
+    fresh = scheduler.workers[run_id]
+    assert fresh.progress is None
+    assert build_snapshot(batch)["workers"][0]["progress"] is None
+    # A retry must neither inherit the cache nor accept a stale-attempt IPC event.
+    fresh.stage_index = 1
+    fresh.stage_attempt = 3
+    batch._gpu_running_info[run_id]["stage_index"] = 1
+    fresh.channel = Mock()
+    fresh.channel.drain.return_value = [{"type": "event", "event": emitted[-1]}]
+    scheduler._messages(fresh)
+    assert fresh.progress is None
+    assert build_snapshot(batch)["workers"][0]["progress"] is None

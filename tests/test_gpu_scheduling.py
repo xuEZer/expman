@@ -22,8 +22,9 @@ from expman.config.devices import (
     nvidia_smi,
 )
 from expman.core.experiment import Experiment
+from expman.scheduling._models import Candidate
 from expman.scheduling._resource import _admits
-from expman.scheduling.limits import cap_kb
+from expman.scheduling.limits import MemoryLimit, cap_kb
 from expman.scheduling.scheduler import GpuScheduler, HostGate
 from expman.storage.base import PickleSerializer, read_record
 
@@ -496,6 +497,99 @@ class TestGpuScheduling:
         assert groups[("B1", "p1")] == groups[("B1", "p2")]
         assert groups[("B2", "p1")] != groups[("B2", "p2")]
         assert groups[("B1", "p1")] != groups[("B2", "p1")]
+
+    @pytest.mark.parametrize("allocated", [False, True])
+    def test_later_gpu_work_uses_an_idle_card(self, tmp_path, allocated):
+        batch = make_batch(tmp_path, count=1, devices=[1, 2, 3, 4])
+        scheduler = GpuScheduler(batch)
+        run_id = batch.experiments[0].run_id
+        request = 10 * 1024**2
+        candidate = Candidate(run_id, 0, 1024, request, request, None, 0.0)
+        memory = {
+            device: DeviceMemory(f"GPU-{device}", 50 * 1024, 50 * 1024)
+            for device in batch.devices
+        }
+        with patch.object(scheduler, "_stage_candidates", return_value=[candidate]):
+            first = scheduler._launch_plan(memory, Host().sample())
+            assert [device for _, device in first] == [1]
+            # A later tick must account for both actual usage and promises that
+            # an existing worker has not allocated yet.
+            scheduler.workers["previous"] = _worker(
+                device=1,
+                gpu_reserve_kb=request,
+                gpu_reserved_kb=request if allocated else 0.0,
+            )
+            if allocated:
+                memory[1] = DeviceMemory("GPU-1", 50 * 1024, 40 * 1024)
+            second = scheduler._launch_plan(memory, Host().sample())
+        assert [device for _, device in second] == [2]
+
+    def test_gpu_plan_respects_available_memory_after_balancing(self, tmp_path):
+        batch = make_batch(tmp_path, count=1, devices=[1, 2])
+        scheduler = GpuScheduler(batch)
+        request = 10 * 1024**2
+        candidate = Candidate(
+            batch.experiments[0].run_id, 0, 1024, request, request, None, 0.0
+        )
+        memory = {
+            1: DeviceMemory("GPU-1", 50 * 1024, 9 * 1024),
+            2: DeviceMemory("GPU-2", 50 * 1024, 10 * 1024),
+        }
+        with patch.object(scheduler, "_stage_candidates", return_value=[candidate]):
+            plan = scheduler._launch_plan(memory, Host().sample())
+        assert [device for _, device in plan] == [2]
+
+    def test_requested_host_limit_is_not_an_enforced_limit(self):
+        worker = _worker(limit=MemoryLimit((), None, 100.0, "systemd"))
+        assert not worker.limit.capped
+        GpuScheduler._resources(
+            worker,
+            {
+                "host_current_kb": 20.0,
+                "host_peak_kb": 30.0,
+                "host_usage_source": "proc",
+                "host_usage_error": "per-attempt memory controller unavailable",
+                "host_limit_kb": None,
+                "host_limit_verified": False,
+                "cgroup": None,
+            },
+        )
+        assert worker.resident_kb == 20.0
+        assert worker.peak_kb == 30.0
+        assert worker.host_usage_source == "proc"
+        assert not worker.limit.capped
+        assert worker.limit.cap_kb == 100.0
+
+        GpuScheduler._resources(
+            worker,
+            {
+                "host_current_kb": 25.0,
+                "host_peak_kb": 25.0,
+                "host_limit_kb": 99.0,
+                "host_limit_verified": True,
+                "cgroup": "/memory/expman-worker.scope",
+            },
+        )
+        assert worker.limit.capped
+        assert worker.host_limit_kb == 99.0
+        assert worker.peak_kb == 30.0
+        assert worker.limit.cap_kb == 100.0
+        # A later unreadable controller must not leave a stale enforced badge.
+        GpuScheduler._resources(
+            worker,
+            {"host_limit_kb": None, "host_limit_verified": False, "cgroup": None},
+        )
+        assert not worker.limit.capped
+        assert worker.limit.cgroup is None
+        assert worker.limit.cap_kb == 100.0
+
+    @pytest.mark.parametrize("cap", [0.0, 105.0, float("inf"), float("nan")])
+    def test_invalid_host_limit_report_cannot_verify_a_ceiling(self, cap):
+        worker = _worker(limit=MemoryLimit((), None, 100.0, "systemd"))
+        GpuScheduler._resources(
+            worker, {"host_limit_kb": cap, "host_limit_verified": True}
+        )
+        assert not worker.limit.capped
 
     def test_tick_greedily_fills_a_card(self, tmp_path):
         batch = warm(make_batch(tmp_path, count=4, devices=[0]))

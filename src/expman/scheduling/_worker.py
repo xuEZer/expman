@@ -16,7 +16,14 @@ from expman.core.experiment import Experiment, StageResult
 from expman.scheduling.gpu_memory import limit as limit_gpu_memory
 from expman.scheduling.gpu_memory import sample as gpu_memory
 from expman.scheduling.ipc import worker_channel
-from expman.scheduling.limits import events, own_cgroup, usage
+from expman.scheduling.limits import (
+    attempt_cgroup,
+    cap_matches_request,
+    events,
+    memory_cap_kb,
+    own_cgroup,
+    usage,
+)
 from expman.storage.base import PickleSerializer, RunLock, read_record
 
 PROC_STATUS = Path("/proc/self/status")
@@ -51,11 +58,38 @@ def _own_usage():
 
 
 def _resource_snapshot(directory):
-    host = _own_usage() if directory is None else usage(directory)
+    unit = os.environ.get("EXPMAN_CGROUP_UNIT")
+    directory = attempt_cgroup(directory, unit)
+    host = None if directory is None else usage(directory)
+    source = "cgroup"
+    diagnostic = None
+    actual_cap = memory_cap_kb(directory)
+    try:
+        requested_cap = float(os.environ.get("EXPMAN_HOST_LIMIT_KB", "0"))
+    except ValueError:
+        requested_cap = 0.0
+    verified = host is not None and cap_matches_request(actual_cap, requested_cap)
+    if host is None:
+        diagnostic = (
+            "independent cgroup counters unreadable"
+            if directory is not None
+            else "no independent attempt memory cgroup"
+        )
+        host = _own_usage()
+        source = "proc" if host is not None else "unavailable"
+        directory = None
+        if host is None:
+            diagnostic += "; process RSS/HWM unavailable"
+    elif not verified and requested_cap > 0:
+        diagnostic = "kernel memory limit is missing, unlimited, or exceeds the request"
     return {
         "timestamp": monotonic(),
         "host_current_kb": None if host is None else host[0],
         "host_peak_kb": None if host is None else host[1],
+        "host_usage_source": source,
+        "host_usage_error": diagnostic,
+        "host_limit_kb": actual_cap,
+        "host_limit_verified": verified,
         "gpu": gpu_memory(),
         "memory_events": events(directory),
         "cgroup": None if directory is None else str(directory),
@@ -63,27 +97,37 @@ def _resource_snapshot(directory):
 
 
 def _resource_cgroup():
-    """The cgroup this attempt's own usage is accounted in, if it has one.
-
-    A path means the scheduler created or discovered one for this attempt. An
-    empty value means it deliberately started the attempt without one: the
-    attempt then shares the scheduler's group, whose counters describe the whole
-    session rather than this attempt, so its own high-water mark is reported
-    instead. An unset value means a systemd scope owns the hierarchy and the
-    worker discovers its own group from proc.
-    """
+    """Discover only this exact attempt's memory group, never a shared parent."""
     value = os.environ.get("EXPMAN_CGROUP")
-    if value is not None:
-        return Path(value) if value else None
-    return own_cgroup()
+    if value == "":
+        return None
+    unit = os.environ.get("EXPMAN_CGROUP_UNIT")
+    actual = attempt_cgroup(own_cgroup(), unit)
+    if value is not None and actual != Path(value):
+        return None
+    return actual
 
 
 def _report_resources(channel, stop, interval):
-    directory = _resource_cgroup()
+    last_diagnostic = None
 
     def report():
+        nonlocal last_diagnostic
+        # systemd placement may not be ready at process creation; retry discovery
+        # on every tick instead of freezing a missing/shared group forever.
+        snapshot = _resource_snapshot(_resource_cgroup())
+        diagnostic = snapshot["host_usage_error"]
+        if diagnostic and diagnostic != last_diagnostic:
+            print(
+                f"[expman] host memory: {diagnostic}; "
+                f"source={snapshot['host_usage_source']}, "
+                f"limit_verified={snapshot['host_limit_verified']}",
+                file=sys.stderr,
+                flush=True,
+            )
+        last_diagnostic = diagnostic
         try:
-            channel.send({"type": "resource", **_resource_snapshot(directory)})
+            channel.send({"type": "resource", **snapshot})
         except OSError:
             stop.set()
 
