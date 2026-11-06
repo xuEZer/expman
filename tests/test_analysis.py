@@ -12,7 +12,7 @@ def root(tmp_path):
     return tmp_path
 
 
-def make_batch(root, runs, name="batch-a"):
+def make_batch(root, runs, name="batch-a", *, active=(), queue=()):
     """Persist a synthetic batch; each run declares its own rows and metrics.
 
     ``metric_rows`` items are ``(stage, step, name, value)`` tuples; ``stage``
@@ -36,7 +36,12 @@ def make_batch(root, runs, name="batch-a"):
         experiments.append({"run_id": run["run_id"], "attempts": attempts})
     write_record(
         directory / "batch.pkl",
-        {"version": 1, "experiments": experiments, "queue": []},
+        {
+            "version": 1,
+            "experiments": experiments,
+            "queue": list(queue),
+            "active_gpu": dict.fromkeys(active, 0),
+        },
         PickleSerializer(),
     )
     store = MetricStore(directory / "metrics.sqlite3")
@@ -138,6 +143,26 @@ def test_constant_fields_are_reported_once_and_never_paired(root):
         item["field"] != "model.eps" for item in metric(payload, "score")["pairs"]
     )
     assert pair(payload, "score", "model.rank")["rho"] == pytest.approx(1.0)
+
+
+def test_coverage_uses_run_state_after_cancelled_attempts(root):
+    directory = make_batch(
+        root,
+        [
+            {"run_id": name, "status": status, "config": {"lr": 0.1}}
+            for name, status in [
+                ("training", "cancelled"),
+                ("retry", "cancelled"),
+                ("stopped", "cancelled"),
+                ("done", "succeeded"),
+            ]
+        ],
+        active=["training"],
+        queue=["retry"],
+    )
+    coverage = analysis_payload(directory, 0)["coverage"]
+    assert coverage["excluded"] == {"running": 1, "pending": 1, "cancelled": 1}
+    assert coverage["runs_total"] == 4 and coverage["runs_analyzed"] == 1
 
 
 def test_failed_runs_are_excluded_but_counted(root):

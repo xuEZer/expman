@@ -12,6 +12,7 @@ const state = {
   tab: "status",
   analysis: null,
   analysisState: "idle",
+  analysisCounts: null,
   analysisError: null,
   throttle: 1,
   lastPaint: 0,
@@ -457,7 +458,8 @@ function events(s) {
 
 function loadAnalysis(force) {
   if (state.analysisState === "loading") return;
-  if (state.analysisState === "ready" && !force) return;
+  const counts = JSON.stringify(state.snapshot?.batch?.counts || {});
+  if (state.analysisState === "ready" && !force && counts === state.analysisCounts) return;
   state.analysisState = "loading";
   render(true);
   fetch("/api/analysis/" + BATCH_ID)
@@ -465,6 +467,7 @@ function loadAnalysis(force) {
     .then(({ good, body }) => {
       if (good && body && Array.isArray(body.metrics)) {
         state.analysis = body;
+        state.analysisCounts = counts;
         state.analysisState = "ready";
       } else {
         state.analysisState = "error";
@@ -642,6 +645,7 @@ function connect() {
   source.onmessage = (message) => {
     state.connected = true;
     try { state.snapshot = JSON.parse(message.data); } catch (error) { return; }
+    if (state.tab === "analysis" && state.analysisState === "ready" && !state.paused) loadAnalysis(false);
     render();
   };
 }

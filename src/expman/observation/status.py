@@ -10,8 +10,16 @@ up.
 
 def last_status(entry: dict):
     """The status of a run's latest recorded attempt, or None before any."""
-    attempts = entry.get("attempts") or []
-    return attempts[-1].get("status", "") if attempts else None
+    attempts = entry.get("attempts")
+    if (
+        isinstance(attempts, (list, tuple))
+        and attempts
+        and isinstance(attempts[-1], dict)
+    ):
+        status = attempts[-1].get("status")
+        if isinstance(status, str):
+            return status
+    return None
 
 
 def run_state(run_id, last_status, active, queue) -> str:

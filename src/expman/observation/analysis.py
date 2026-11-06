@@ -27,6 +27,7 @@ from pathlib import Path
 from time import time
 from typing import Any
 
+from expman.observation.status import last_status, run_state
 from expman.storage.base import PickleSerializer, StorageError, read_record
 
 ANALYSIS_SCHEMA = 1
@@ -81,15 +82,6 @@ def fingerprint(directory: Path) -> tuple:
         pass
     parts.append(tuple(sorted(entries)))
     return tuple(parts)
-
-
-def _latest_status(entry: dict) -> str:
-    attempts = entry.get("attempts")
-    if isinstance(attempts, list) and attempts:
-        last = attempts[-1]
-        if isinstance(last, dict) and isinstance(last.get("status"), str):
-            return last["status"]
-    return "pending"
 
 
 def _total_seconds(entry: dict) -> float | None:
@@ -201,6 +193,8 @@ def collect_runs(directory: Path) -> Collected:
         if isinstance(entry, dict) and isinstance(entry.get("run_id"), str):
             run_ids.add(entry["run_id"])
     metrics = _read_metrics(directory, run_ids)
+    active = set(manifest.get("active_gpu") or {})
+    queue = set(manifest.get("queue") or [])
 
     runs: list[RunRow] = []
     skipped: list[dict[str, str]] = []
@@ -208,7 +202,7 @@ def collect_runs(directory: Path) -> Collected:
         if not isinstance(entry, dict) or not isinstance(entry.get("run_id"), str):
             continue
         run_id = entry["run_id"]
-        status = _latest_status(entry)
+        status = run_state(run_id, last_status(entry), active, queue)
         try:
             config = _read_config(directory, run_id)
         except AnalysisError as error:
