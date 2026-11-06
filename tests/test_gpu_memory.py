@@ -1,46 +1,45 @@
-from types import SimpleNamespace
-from unittest.mock import patch
+import os
+import subprocess
+from unittest.mock import Mock
 
-from expman.scheduling.gpu_memory import limit, sample
+import pytest
+
+from expman.scheduling import _mps, gpu_memory
 
 
-def test_pytorch_allocator_usage_is_reported_in_kilobytes():
-    cuda = SimpleNamespace(
-        is_available=lambda: True,
-        memory_allocated=lambda: 1024,
-        memory_reserved=lambda: 2048,
-        max_memory_allocated=lambda: 3072,
-        max_memory_reserved=lambda: 4096,
+@pytest.fixture
+def query(monkeypatch):
+    command = Mock()
+    monkeypatch.setattr(subprocess, "run", command)
+    return command
+
+
+def test_measure_only_this_client_not_the_server_or_other_clients(query):
+    query.return_value.stdout = f"1,22\n{os.getpid()},7\n2,151"
+    assert gpu_memory.sample("GPU-demo") == 7168
+    args = query.call_args.args[0]
+    assert (
+        "--query-compute-apps=pid,used_gpu_memory" in args and "--id=GPU-demo" in args
     )
-    with patch(
-        "expman.scheduling.gpu_memory.import_module",
-        return_value=SimpleNamespace(cuda=cuda),
-    ):
-        assert sample() == {
-            "gpu_allocated_kb": 1.0,
-            "gpu_reserved_kb": 2.0,
-            "gpu_peak_allocated_kb": 3.0,
-            "gpu_peak_reserved_kb": 4.0,
-        }
 
 
-def test_missing_pytorch_leaves_gpu_telemetry_unavailable():
-    with patch(
-        "expman.scheduling.gpu_memory.import_module", side_effect=ModuleNotFoundError
-    ):
-        assert sample() is None
+@pytest.mark.parametrize("rows", ["", "1,2", "{pid},[N/A]", "{pid},nan"])
+def test_missing_measurement_is_unknown(query, rows):
+    query.return_value.stdout = rows.format(pid=os.getpid())
+    assert gpu_memory.sample("GPU-demo") is None
 
 
-def test_pytorch_allocator_limit_uses_the_visible_device_capacity():
-    fractions = []
-    cuda = SimpleNamespace(
-        is_available=lambda: True,
-        get_device_properties=lambda index: SimpleNamespace(total_memory=8 * 1024),
-        set_per_process_memory_fraction=fractions.append,
-    )
-    with patch(
-        "expman.scheduling.gpu_memory.import_module",
-        return_value=SimpleNamespace(cuda=cuda),
-    ):
-        limit(4)
-    assert fractions == [0.5]
+def test_timeout_is_not_a_zero_reading(query):
+    query.side_effect = subprocess.TimeoutExpired("nvidia-smi", 3)
+    assert gpu_memory.sample("GPU-demo") is None
+
+
+def test_mps_verification_requires_our_pid_on_our_device(query, monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-abcd1234")
+    monkeypatch.setattr(_mps, "_retain_primary_context", lambda: None)
+    for row in ("", "1 1 2 GPU-abcd", f"{os.getpid()} 1 2 GPU-other"):
+        query.return_value.stdout = row
+        with pytest.raises(RuntimeError, match="did not register"):
+            _mps.verify_client()
+    query.return_value.stdout = f"{os.getpid()} 1 2 GPU-abcd"
+    _mps.verify_client()

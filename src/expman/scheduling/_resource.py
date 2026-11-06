@@ -6,16 +6,14 @@ import expman.config.devices as devices
 def _device_unbacked(workers, memory, device):
     """Whether one card can no longer honour the contracts running on it.
 
-    Admission re-reads device memory on every tick, so an external process
-    that claims memory after a launch is visible -- but only to the next
-    launch, because nothing re-checked the contracts already running. An
-    attempt's claim is what it was promised and has not taken yet, plus
-    what it took beyond its promise and is therefore spending from another
-    attempt's allowance; both come out of what is still free. A claim above
-    the free memory is a promise this scheduler can no longer keep.
+    Free memory already reflects current use, including use above a reservation.
+    Only promised growth is charged against it. An unreadable counter blocks new
+    placements on the card but does not identify a victim to shed.
     """
+    if any(w.gpu_used_kb is None for w in workers.values() if w.device == device):
+        return False
     claim = sum(
-        abs(worker.gpu_reserve_kb - (worker.gpu_reserved_kb or 0.0))
+        max(0, worker.gpu_reserve_kb - (worker.gpu_used_kb or 0.0))
         for worker in workers.values()
         if worker.device == device
     )
@@ -40,12 +38,12 @@ def _admits(workers, host, expected_kb):
 
 
 def _admits_gpu(workers, memory, device, reserve_kb):
-    """Reserve only each worker's future PyTorch allocator growth."""
+    """Reserve only each worker's future process-group VRAM growth."""
     needed = reserve_kb
     for worker in workers.values():
         if worker.device != device:
             continue
-        needed += max(0.0, worker.gpu_reserve_kb - (worker.gpu_reserved_kb or 0))
+        needed += max(0.0, worker.gpu_reserve_kb - (worker.gpu_used_kb or 0))
     return memory.free * 1024 >= needed
 
 
@@ -58,7 +56,7 @@ def _resource_left(workers, memory, host):
     gpu_left = {}
     for device, observation in memory.items():
         gpu_left[device] = observation.free * 1024 - sum(
-            max(0.0, worker.gpu_reserve_kb - (worker.gpu_reserved_kb or 0))
+            max(0.0, worker.gpu_reserve_kb - (worker.gpu_used_kb or 0))
             for worker in workers.values()
             if worker.device == device
         )

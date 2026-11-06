@@ -13,8 +13,7 @@ from time import monotonic
 from expman.core.context import _error_message
 from expman.core.events import Status
 from expman.core.experiment import Experiment, StageResult
-from expman.scheduling.gpu_memory import limit as limit_gpu_memory
-from expman.scheduling.gpu_memory import sample as gpu_memory
+from expman.scheduling import _mps, gpu_memory
 from expman.scheduling.ipc import worker_channel
 from expman.scheduling.limits import (
     attempt_cgroup,
@@ -84,13 +83,15 @@ def _resource_snapshot(directory):
         diagnostic = "kernel memory limit is missing, unlimited, or exceeds the request"
     return {
         "timestamp": monotonic(),
+        "gpu_used_kb": gpu_memory.sample(os.environ["CUDA_VISIBLE_DEVICES"])
+        if "CUDA_MPS_PINNED_DEVICE_MEM_LIMIT" in os.environ
+        else None,
         "host_current_kb": None if host is None else host[0],
         "host_peak_kb": None if host is None else host[1],
         "host_usage_source": source,
         "host_usage_error": diagnostic,
         "host_limit_kb": actual_cap,
         "host_limit_verified": verified,
-        "gpu": gpu_memory(),
         "memory_events": events(directory),
         "cgroup": None if directory is None else str(directory),
     }
@@ -131,6 +132,7 @@ def _report_resources(channel, stop, interval):
         except OSError:
             stop.set()
 
+    report()
     while not stop.wait(interval):
         report()
     report()
@@ -148,6 +150,19 @@ def main():
     threading.Thread(target=_watch_parent, daemon=True).start()
     root = Path(sys.argv[1])
     channel = worker_channel(os.environ["EXPMAN_IPC_FD"])
+    try:
+        server_pid = _mps.verify_client()
+    except Exception as error:
+        print(f"[expman] MPS startup: {error}", file=sys.stderr, flush=True)
+        channel.send(
+            {
+                "type": "startup_failed",
+                "error_type": type(error).__qualname__,
+                "error_message": str(error),
+            }
+        )
+        return
+    channel.send({"type": "mps_ready", "server": server_pid, "pid": os.getpid()})
     resource_stopped = threading.Event()
     resource_thread = threading.Thread(
         target=_report_resources,
@@ -155,9 +170,6 @@ def main():
         daemon=True,
     )
     resource_thread.start()
-    if "EXPMAN_GPU_LIMIT_KB" in os.environ:
-        with suppress(ValueError):
-            limit_gpu_memory(float(os.environ["EXPMAN_GPU_LIMIT_KB"]))
     metadata = read_record(root / "bootstrap.pkl", PickleSerializer())
     sys.path[:] = metadata["sys_path"]
     script = metadata["main_script"]
@@ -219,7 +231,6 @@ def main():
                             completed is not None
                             and completed.get("_shared_reused", False)
                         ),
-                        "resources": _resource_snapshot(_resource_cgroup()),
                     }
                 )
     finally:

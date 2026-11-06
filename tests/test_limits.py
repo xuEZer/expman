@@ -84,7 +84,6 @@ def test_hybrid_prefers_real_v1_memory_controller_and_rejects_shared_group(
     assert _worker._resource_cgroup() is None
     with (
         patch.object(_worker, "_own_usage", return_value=(3993208.0, 3993208.0)),
-        patch.object(_worker, "gpu_memory", return_value={}),
     ):
         snapshot = _worker._resource_snapshot(_worker._resource_cgroup())
     assert snapshot["host_current_kb"] == 3993208.0
@@ -107,8 +106,7 @@ def test_v1_dedicated_group_is_measured_and_limit_verified(monkeypatch, tmp_path
     monkeypatch.setenv("EXPMAN_HOST_LIMIT_KB", "16")
     monkeypatch.delenv("EXPMAN_CGROUP", raising=False)
     assert _worker._resource_cgroup() == group
-    with patch.object(_worker, "gpu_memory", return_value={}):
-        snapshot = _worker._resource_snapshot(group)
+    snapshot = _worker._resource_snapshot(group)
     assert snapshot["host_current_kb"] == 4
     assert snapshot["host_peak_kb"] == 8
     assert snapshot["host_limit_kb"] == 16
@@ -169,8 +167,7 @@ def test_direct_group_is_verified_from_actual_counter_and_limit(tmp_path):
 
 def test_an_attempt_without_its_own_cgroup_reports_process_usage(monkeypatch):
     monkeypatch.setenv("EXPMAN_CGROUP", "")
-    with patch.object(_worker, "gpu_memory", return_value={}):
-        snapshot = _worker._resource_snapshot(_worker._resource_cgroup())
+    snapshot = _worker._resource_snapshot(_worker._resource_cgroup())
     assert snapshot["host_current_kb"] > 0
     assert snapshot["host_peak_kb"] >= snapshot["host_current_kb"]
     assert snapshot["host_usage_source"] == "proc"
@@ -216,7 +213,6 @@ def test_unreadable_cgroup_falls_back_to_process_with_diagnostics(
     with (
         patch.object(_worker, "usage", return_value=None),
         patch.object(_worker, "_own_usage", return_value=(123.0, 456.0)),
-        patch.object(_worker, "gpu_memory", return_value={}),
     ):
         snapshot = _worker._resource_snapshot(group)
     assert snapshot["host_current_kb"] == 123
@@ -233,8 +229,7 @@ def test_unlimited_group_is_explicitly_not_capped(
     group = memory_group(tmp_path / "expman-test", version=version, cap=unlimited)
     monkeypatch.setenv("EXPMAN_CGROUP_UNIT", "expman-test")
     monkeypatch.setenv("EXPMAN_HOST_LIMIT_KB", "16")
-    with patch.object(_worker, "gpu_memory", return_value={}):
-        snapshot = _worker._resource_snapshot(group)
+    snapshot = _worker._resource_snapshot(group)
     assert snapshot["host_limit_kb"] == 0
     assert not snapshot["host_limit_verified"]
 
@@ -243,8 +238,7 @@ def test_larger_than_requested_limit_is_not_claimed_as_enforced(monkeypatch, tmp
     group = memory_group(tmp_path / "expman-test", cap=1024 * 1024)
     monkeypatch.setenv("EXPMAN_CGROUP_UNIT", "expman-test")
     monkeypatch.setenv("EXPMAN_HOST_LIMIT_KB", "16")
-    with patch.object(_worker, "gpu_memory", return_value={}):
-        snapshot = _worker._resource_snapshot(group)
+    snapshot = _worker._resource_snapshot(group)
     assert snapshot["host_limit_kb"] == 1024
     assert not snapshot["host_limit_verified"]
 
@@ -252,7 +246,6 @@ def test_larger_than_requested_limit_is_not_claimed_as_enforced(monkeypatch, tmp
 def test_no_readable_accounting_is_reported_as_unavailable():
     with (
         patch.object(_worker, "_own_usage", return_value=None),
-        patch.object(_worker, "gpu_memory", return_value={}),
     ):
         snapshot = _worker._resource_snapshot(None)
     assert snapshot["host_current_kb"] is None

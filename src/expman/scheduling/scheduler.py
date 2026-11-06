@@ -30,6 +30,7 @@ from expman.scheduling._models import (
     _close_stdin,
     _kill_group,
 )
+from expman.scheduling._mps import MpsService
 from expman.scheduling._planning import (
     PLAN_BEAM_WIDTH,
     PLAN_CANDIDATES_PER_STAGE,
@@ -57,6 +58,7 @@ class GpuScheduler:
         # Resolved once per run: a bad EXPMAN_THREADS fails here, before any
         # attempt has been started or any output written.
         self._environment = environment.overlay()
+        self.mps = MpsService()
         self.workers = {}
         self.last_tick = perf_counter()
         # Peak host memory per attempt: admission charges the configuration-based
@@ -233,14 +235,25 @@ class GpuScheduler:
                 encoding,
                 indices,
                 default,
-                include_zero=field == "gpu_peak_kb",
+                include_zero=False,
             )
             for entry in self.batch._stage_history:
                 if entry.get("stage") != stage_index or entry.get("reused"):
                     continue
+                value = entry.get(field)
+                if field == "gpu_process_peak_kb":
+                    if entry.get("gpu_capped"):
+                        value = max(
+                            value or 0.0, entry.get("gpu_retry_floor_kb") or 0.0
+                        )
+                        if not value:
+                            continue
+                    elif entry.get("status") != Status.SUCCEEDED.value:
+                        # Shedding can interrupt a process before it initializes CUDA.
+                        continue
                 model.record(
                     entry.get("run_id"),
-                    entry.get(field),
+                    value,
                     capped=entry.get(
                         "capped" if field == "peak_kb" else "gpu_capped", False
                     ),
@@ -369,7 +382,7 @@ class GpuScheduler:
                 run_id, stage_index, "peak_kb", host_probe_kb
             )
             gpu_estimate = self._stage_peak(
-                run_id, stage_index, "gpu_peak_kb", gpu_probe_kb
+                run_id, stage_index, "gpu_process_peak_kb", gpu_probe_kb
             )
             candidates.append(
                 Candidate(
@@ -377,7 +390,7 @@ class GpuScheduler:
                     stage_index,
                     host_estimate,
                     min(gpu_estimate, gpu_capacity_kb),
-                    min(gpu_estimate * devices.CAPACITY_FACTOR, gpu_capacity_kb),
+                    min(limits.cap_kb(gpu_estimate), gpu_capacity_kb),
                     self._stage_duration(run_id, stage_index),
                     1.0 - rank / denominator,
                 )
@@ -411,10 +424,8 @@ class GpuScheduler:
                     "stage_index": worker.stage_index,
                     "resident_kb": worker.resident_kb,
                     "peak_kb": worker.peak_kb,
-                    "gpu_allocated_kb": worker.gpu_allocated_kb,
-                    "gpu_reserved_kb": worker.gpu_reserved_kb,
-                    "gpu_peak_allocated_kb": worker.gpu_peak_allocated_kb,
-                    "gpu_peak_reserved_kb": worker.gpu_peak_reserved_kb,
+                    "gpu_used_kb": worker.gpu_used_kb,
+                    "gpu_process_peak_kb": worker.gpu_process_peak_kb,
                 }
                 for run_id, worker in self.workers.items()
             }
@@ -438,6 +449,18 @@ class GpuScheduler:
                     # Pipeline uses a child-local stage_id. Preserve the event.
                     worker.progress = event
                 self.batch.recorder.record(event)
+            elif kind == "mps_ready":
+                worker.mps_client = (message["server"], message["pid"])
+            elif kind == "startup_failed":
+                worker.finished = StageResult(
+                    worker.experiment.run_id,
+                    worker.stage_index,
+                    worker.stage_attempt,
+                    Status.FAILED,
+                    0.0,
+                    message["error_type"],
+                    message["error_message"],
+                )
             elif kind == "resource":
                 self._resources(worker, message)
             elif kind == "finished" and isinstance(message.get("result"), StageResult):
@@ -453,6 +476,13 @@ class GpuScheduler:
 
     @staticmethod
     def _resources(worker, message):
+        if "gpu_used_kb" in message:
+            used = message["gpu_used_kb"]
+            if isinstance(used, (int, float)) and math.isfinite(used) and used >= 0:
+                worker.gpu_used_kb = used
+                worker.gpu_process_peak_kb = max(worker.gpu_process_peak_kb or 0, used)
+            else:
+                worker.gpu_used_kb = None
         current, peak = message.get("host_current_kb"), message.get("host_peak_kb")
         if all(
             isinstance(value, (int, float))
@@ -484,17 +514,6 @@ class GpuScheduler:
             # cap_kb retains the requested ceiling, even if this observation
             # cannot verify an effective per-attempt kernel limit.
             worker.limit = replace(worker.limit, verified=verified)
-        gpu = message.get("gpu")
-        if isinstance(gpu, dict):
-            for name in (
-                "gpu_allocated_kb",
-                "gpu_reserved_kb",
-                "gpu_peak_allocated_kb",
-                "gpu_peak_reserved_kb",
-            ):
-                value = gpu.get(name)
-                if isinstance(value, (int, float)) and value >= 0:
-                    setattr(worker, name, value)
         events = message.get("memory_events")
         if isinstance(events, dict):
             worker.memory_events = events
@@ -556,7 +575,7 @@ class GpuScheduler:
         Shedding resolves over-commitment between attempts sharing a machine.
         With one attempt running there is nothing to distribute: ending it
         discards a cold start no other attempt is competing with, while that
-        worker's own cgroup and PyTorch limits are what actually bound it. A
+        worker's own cgroup and MPS client limit govern it. A
         shortage with one worker therefore pauses launches (see ``HostGate``
         and ``_admits_gpu``) and keeps the attempt.
 
@@ -575,7 +594,8 @@ class GpuScheduler:
                 (
                     item
                     for item in (memory or ())
-                    if _device_unbacked(self.workers, memory, item)
+                    if sum(w.device == item for w in self.workers.values()) > 1
+                    and _device_unbacked(self.workers, memory, item)
                 ),
                 None,
             )
@@ -611,7 +631,7 @@ class GpuScheduler:
             or limits.refused(exit_events)
         )
         peak = worker.peak_kb
-        if not capped and worker.limit is not None:
+        if not capped and worker.limit is not None and worker.limit.capped:
             # A peak that reached the limit, or a SIGKILL with no recorded cause,
             # is this attempt's cap rather than an unrelated crash: the counters on
             # the kill path can miss the window, and the remedy is the same.
@@ -641,8 +661,21 @@ class GpuScheduler:
     def _launch_plan(self, memory, host):
         """Choose a bounded multi-resource packing plan for this scheduler tick."""
         host_capacity, available_gpu = _resource_left(self.workers, memory, host)
-        devices_in_plan = tuple(memory)
+        unknown = {w.device for w in self.workers.values() if w.gpu_used_kb is None}
+        devices_in_plan = tuple(device for device in memory if device not in unknown)
+        for device in unknown.intersection(available_gpu):
+            available_gpu[device] = 0.0
         if host_capacity <= 0 or not devices_in_plan:
+            self.last_plan = {
+                "at": time(),
+                "ready": len(self.batch._queue),
+                "capacity": {
+                    "host_left_kb": host_capacity,
+                    "gpu_left_kb": available_gpu,
+                },
+                "placements": [],
+                "launched": [],
+            }
             return ()
         gpu_capacities = tuple(
             max(0.0, available_gpu[device]) for device in devices_in_plan
@@ -935,9 +968,9 @@ class GpuScheduler:
             # An unmeasured Stage probes at the share priced into its candidate;
             # a measured Stage is capped at its estimate plus room to grow. Both
             # feed whatever they reach back to the estimator either way.
-            applied_gpu_kb = candidate.gpu_cap_kb
-            if applied_gpu_kb > 0:
-                env["EXPMAN_GPU_LIMIT_KB"] = str(applied_gpu_kb)
+            cap_mib = max(1, int(candidate.gpu_cap_kb // 1024))
+            applied_gpu_kb = cap_mib * 1024
+            env.update(self.mps.environment(memory.uuid, cap_mib))
             self._account()
             with (root / "output.log").open("ab", buffering=0) as log:
                 process = subprocess.Popen(
@@ -992,7 +1025,7 @@ class GpuScheduler:
                 detail=(
                     f"host {host_reserve / 1024:.0f}M gpu {gpu_reserve / 1024:.0f}M"
                     + (
-                        f" 上限 {applied_gpu_kb / 1024:.0f}M"
+                        f" MPS 请求上限 {applied_gpu_kb / 1024:.0f}M"
                         if applied_gpu_kb > 0
                         else ""
                     )
@@ -1023,6 +1056,10 @@ class GpuScheduler:
         worker = self.workers[run_id]
         self._account()
         finished = perf_counter()
+        if cancelled and worker.process.poll() is None:
+            self._messages(worker)
+            if worker.mps_client is not None:
+                self.mps.terminate_client(*worker.mps_client)
         _kill_group(worker.process)  # Also reap experiment-owned helper processes.
         worker.process.wait()
         _close_stdin(worker.process)
@@ -1045,7 +1082,13 @@ class GpuScheduler:
             cancelled or "WorkerExit",
             f"worker exited with code {worker.process.returncode}",
         )
-        if capped and cancelled is None and result.status is not Status.SUCCEEDED:
+        cuda_out_of_memory = devices.cuda_out_of_memory(
+            result.error_type, result.error_message
+        )
+        gpu_capped = cuda_out_of_memory and result.status is not Status.SUCCEEDED
+        if cancelled is not None or gpu_capped:
+            capped = False
+        if capped and result.status is not Status.SUCCEEDED:
             # The limit, not the experiment, ended this attempt: it is retried with
             # a raised peak estimate instead of spending the failure budget, and it
             # carries the peak it reached as a lower bound for that estimate. An
@@ -1062,25 +1105,12 @@ class GpuScheduler:
                     else "attempt was killed while running without a memory limit"
                 ),
             )
-        cuda_out_of_memory = devices.cuda_out_of_memory(
-            result.error_type, result.error_message
-        )
-        gpu_capped = cuda_out_of_memory
-        if gpu_capped and cancelled is None and result.status is not Status.SUCCEEDED:
-            # CUDA uses the same error for a process allocator limit and an
-            # external allocation refusal. Both mean this Stage needs a larger
-            # contract on its next attempt; resource admission will decide when
-            # that expanded contract fits again.
+        if gpu_capped:
             result = replace(
                 result,
                 status=Status.CANCELLED,
                 error_type="GpuMemoryLimit",
-                error_message=(
-                    "attempt reached its PyTorch memory limit of "
-                    f"{worker.gpu_cap_kb / 1024:.0f} MiB"
-                    if worker.gpu_cap_kb > 0
-                    else "attempt ran out of device memory without a limit"
-                ),
+                error_message=result.error_message,
             )
         with self.batch._state_lock:
             stage_key = f"{run_id}:{worker.stage_index}"
@@ -1097,18 +1127,14 @@ class GpuScheduler:
                 "stage_duration_seconds": result.duration_seconds,
                 "status": result.status.value,
                 "peak_kb": peak_kb,
-                # An OOM proves the demand exceeded the attempted contract even
-                # when PyTorch could not report its final allocator counters. An
-                # attempt that had no contract proves nothing beyond what it did
-                # report, so only that is recorded.
-                "gpu_peak_kb": max(
-                    worker.gpu_peak_reserved_kb or 0.0,
-                    (
-                        max(worker.gpu_cap_kb, devices.GPU_PEAK_KB_DEFAULT)
-                        if gpu_capped and worker.gpu_cap_kb > 0
-                        else 0.0
-                    ),
-                ),
+                # Old allocator peaks have a different scope. A distinct key
+                # lets resumed batches retain history without fitting to it.
+                "gpu_process_peak_kb": worker.gpu_process_peak_kb,
+                "gpu_retry_floor_kb": (worker.gpu_cap_kb or devices.GPU_PEAK_KB_DEFAULT)
+                if gpu_capped
+                else None,
+                "gpu_limit_kb": worker.gpu_cap_kb,
+                "gpu_limit_verified": worker.gpu_limit_verified,
                 "gpu_capped": gpu_capped,
                 "capped": capped,
                 "reused": worker.reused,
@@ -1118,7 +1144,9 @@ class GpuScheduler:
             }
             self._append_stage_history(observation)
             self._stage_peak_models.pop((worker.stage_index, "peak_kb"), None)
-            self._stage_peak_models.pop((worker.stage_index, "gpu_peak_kb"), None)
+            self._stage_peak_models.pop(
+                (worker.stage_index, "gpu_process_peak_kb"), None
+            )
             self._stage_duration_models.pop(worker.stage_index, None)
             self.batch._active_gpu.pop(run_id)
             self.batch._gpu_running_info.pop(run_id, None)
@@ -1197,7 +1225,10 @@ class GpuScheduler:
                 launching = self.host_gate.can_launch(host)
                 if launching and memory is not None:
                     self._materialize_reuses()
-                    self._launch_available(memory, host)
+                    if self.batch._queue and self.mps.ready(
+                        item.uuid for item in memory.values()
+                    ):
+                        self._launch_available(memory, host)
                 sleep(devices.POLL_INTERVAL)
             return self.batch.results
         except BaseException:
@@ -1214,3 +1245,5 @@ class GpuScheduler:
                         stacklevel=2,
                     )
             raise
+        finally:
+            self.mps.close()

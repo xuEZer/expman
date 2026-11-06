@@ -86,6 +86,13 @@ class GpuWork(Stage):
         return None
 
 
+class CudaOomOnce(Stage):
+    def process(self, data, ctx):
+        if ctx.attempt == 1:
+            raise RuntimeError("CUDA out of memory")
+        return 1
+
+
 class SharedWork(Stage):
     @classmethod
     def config_dependencies(cls, cfg):
@@ -158,7 +165,9 @@ def _worker(**fields):
         "resident_kb": 0.0,
         "host_reserve_kb": 0.0,
         "gpu_reserve_kb": 0.0,
-        "gpu_reserved_kb": 0.0,
+        "gpu_used_kb": 0.0,
+        "gpu_cap_kb": float("inf"),
+        "finished": None,
         "limit": None,
     }
     values.update(fields)
@@ -166,21 +175,17 @@ def _worker(**fields):
 
 
 def _captured_gpu_ceilings(batch):
-    """Run the Batch, returning what ceiling each attempt was started with.
-
-    ``subprocess.run`` reaches the same ``Popen`` this patches, so only the
-    worker launches are captured; every other call is forwarded untouched.
-    """
+    """Capture the parent-enforced threshold for each launched attempt."""
     ceilings = []
-    original = subprocess.Popen
+    original = GpuScheduler._launch
 
-    def captured(*args, **kwargs):
-        argv = args[0] if args else kwargs.get("args", ())
-        if "expman.scheduling._worker" in argv:
-            ceilings.append(kwargs.get("env", {}).get("EXPMAN_GPU_LIMIT_KB"))
-        return original(*args, **kwargs)
+    def launch(scheduler, device, memory, host, candidate):
+        launched = original(scheduler, device, memory, host, candidate)
+        if launched:
+            ceilings.append(scheduler.workers[candidate.run_id].gpu_cap_kb)
+        return launched
 
-    with patch("expman.scheduling.scheduler.subprocess.Popen", side_effect=captured):
+    with patch.object(GpuScheduler, "_launch", launch):
         batch.run(progress=False)
     return ceilings
 
@@ -218,7 +223,7 @@ def make_batch(root, *, count=3, devices=None, **options):
     return Batch(Pipeline([GpuWork]), path, output_dir=root / "batch")
 
 
-def warm(batch, *, gpu_peak_kb=1024, peak_kb=4096):
+def warm(batch, *, gpu_process_peak_kb=1024, peak_kb=4096):
     """Give every Stage the completed sample a previous run would have left.
 
     An unmeasured Stage probes at a bounded share of the device, and a Stage
@@ -234,7 +239,7 @@ def warm(batch, *, gpu_peak_kb=1024, peak_kb=4096):
                     "stage": stage_index,
                     "status": Status.SUCCEEDED.value,
                     "peak_kb": float(peak_kb),
-                    "gpu_peak_kb": float(gpu_peak_kb),
+                    "gpu_process_peak_kb": float(gpu_process_peak_kb),
                     "gpu_capped": False,
                     "capped": False,
                     "reused": False,
@@ -338,14 +343,14 @@ class TestGpuScheduling:
         assert predicted is not None
         assert 0 < predicted.lower <= predicted.center <= predicted.upper
 
-    def test_completed_zero_gpu_sample_needs_no_vram_reservation(self, tmp_path):
+    def test_old_zero_sample_cannot_price_an_mps_context(self, tmp_path):
         batch = make_batch(tmp_path, count=2, devices=[0])
         scheduler = GpuScheduler(batch)
         batch._stage_history.append(
             {
                 "run_id": batch.experiments[0].run_id,
                 "stage": 0,
-                "gpu_peak_kb": 0.0,
+                "gpu_process_peak_kb": 0.0,
                 "status": Status.SUCCEEDED.value,
                 "capped": False,
                 "gpu_capped": False,
@@ -355,9 +360,12 @@ class TestGpuScheduling:
 
         assert (
             scheduler._stage_peak(
-                batch.experiments[1].run_id, 0, "gpu_peak_kb", GPU_PEAK_KB_DEFAULT
+                batch.experiments[1].run_id,
+                0,
+                "gpu_process_peak_kb",
+                GPU_PEAK_KB_DEFAULT,
             )
-            == 0.0
+            == GPU_PEAK_KB_DEFAULT
         )
 
     def test_gpu_reservations_and_ceilings_never_exceed_card_capacity(self, tmp_path):
@@ -391,12 +399,10 @@ class TestGpuScheduling:
             cap_kb(item.host_reserve_kb) > item.host_reserve_kb for item in candidates
         )
 
-    def test_gpu_admission_charges_the_reserve_under_the_allocator_ceiling(
-        self, tmp_path
-    ):
+    def test_gpu_admission_charges_the_reserve_under_the_mps_limit(self, tmp_path):
         batch = make_batch(tmp_path, count=2, devices=[0])
         scheduler = GpuScheduler(batch)
-        capacity_kb = 1024
+        capacity_kb = 2 * 1024**2
 
         with patch.object(scheduler, "_stage_peak", return_value=capacity_kb // 2):
             candidates = scheduler._stage_candidates(0, capacity_kb)
@@ -517,7 +523,7 @@ class TestGpuScheduling:
             scheduler.workers["previous"] = _worker(
                 device=1,
                 gpu_reserve_kb=request,
-                gpu_reserved_kb=request if allocated else 0.0,
+                gpu_used_kb=request if allocated else 0.0,
             )
             if allocated:
                 memory[1] = DeviceMemory("GPU-1", 50 * 1024, 40 * 1024)
@@ -777,6 +783,63 @@ class TestGpuScheduling:
             scheduler._relieve(None, None)
             assert shed == ["newer"]
 
+    def test_cuda_oom_takes_priority_over_nearby_host_threshold(self, tmp_path):
+        batch = Batch(
+            Pipeline([CudaOomOnce]),
+            {"device": [0], "seed": 0},
+            output_dir=tmp_path / "cuda-oom",
+        )
+        with patch.object(GpuScheduler, "_cap_report", return_value=(True, 8192)):
+            result = batch.run(progress=False)[0]
+        assert result.status is Status.SUCCEEDED
+        first = batch._stage_history[0]
+        assert first["gpu_capped"] and not first["capped"]
+        assert first["gpu_process_peak_kb"] == 0
+        assert first["gpu_retry_floor_kb"] > 0
+
+    def test_nearing_unverified_host_limit_does_not_mask_a_worker_crash(self, tmp_path):
+        scheduler = GpuScheduler(make_batch(tmp_path, count=1))
+        worker = _worker(
+            limit=MemoryLimit((), None, 100.0, "none"),
+            peak_kb=99.0,
+            memory_events={},
+            cap_hit=False,
+        )
+        worker.process.returncode = 7
+        assert scheduler._cap_report(worker) == (False, 99.0)
+
+    def test_sampling_above_cap_does_not_kill_an_mps_client(self, tmp_path):
+        scheduler = GpuScheduler(make_batch(tmp_path, count=1))
+        scheduler.workers["owner"] = _worker(gpu_used_kb=2048, gpu_cap_kb=1024)
+        with patch.object(scheduler, "_finish") as finish:
+            scheduler._relieve(Memory([0]).sample(), Host().sample())
+        finish.assert_not_called()
+
+    def test_unknown_gpu_usage_blocks_only_that_card(self, tmp_path):
+        scheduler = GpuScheduler(make_batch(tmp_path, count=1))
+        scheduler.workers["unknown"] = _worker(
+            device=0, stage_index=-1, gpu_used_kb=None
+        )
+        placements = scheduler._launch_plan(Memory([0, 1]).sample(), Host().sample())
+        assert [device for _, device in placements] == [1]
+        assert scheduler.last_plan["capacity"]["gpu_left_kb"][0] == 0
+        assert not scheduler._launch_plan(Memory([0]).sample(), Host().sample())
+        assert not scheduler.last_plan["placements"]
+
+    def test_old_allocator_peak_does_not_price_process_memory(self, tmp_path):
+        batch = make_batch(tmp_path, count=1)
+        rid = batch.experiments[0].run_id
+        batch._stage_history.append(
+            {
+                "run_id": rid,
+                "stage": 0,
+                "gpu_peak_kb": 0,
+                "status": Status.SUCCEEDED.value,
+            }
+        )
+        scheduler = GpuScheduler(batch)
+        assert scheduler._stage_peak(rid, 0, "gpu_process_peak_kb", 8192) == 8192
+
     def test_an_unbacked_device_reservation_sheds_the_newest_attempt(self, tmp_path):
         # Admission re-reads the cards on every tick, so a process that claims
         # memory after a launch is visible -- but only to the next launch.
@@ -789,10 +852,10 @@ class TestGpuScheduling:
             started=0.0,
             device=0,
             gpu_reserve_kb=4 * 1024**2,
-            gpu_reserved_kb=1 * 1024**2,
+            gpu_used_kb=1 * 1024**2,
         )
         scheduler.workers["newer"] = _worker(
-            started=1.0, device=0, gpu_reserve_kb=4 * 1024**2, gpu_reserved_kb=0.0
+            started=1.0, device=0, gpu_reserve_kb=4 * 1024**2, gpu_used_kb=0.0
         )
         shed = []
         with patch.object(
@@ -810,13 +873,13 @@ class TestGpuScheduling:
             started=0.0,
             device=0,
             gpu_reserve_kb=1 * 1024**2,
-            gpu_reserved_kb=1 * 1024**2,
+            gpu_used_kb=1 * 1024**2,
         )
         scheduler.workers["newer"] = _worker(
             started=1.0,
             device=0,
             gpu_reserve_kb=1 * 1024**2,
-            gpu_reserved_kb=1 * 1024**2,
+            gpu_used_kb=1 * 1024**2,
         )
         shed = []
         with patch.object(
@@ -836,10 +899,10 @@ class TestGpuScheduling:
             started=0.0,
             device=0,
             gpu_reserve_kb=1 * 1024**2,
-            gpu_reserved_kb=7 * 1024**2,
+            gpu_used_kb=7 * 1024**2,
         )
         scheduler.workers["newer"] = _worker(
-            started=1.0, device=0, gpu_reserve_kb=1 * 1024**2, gpu_reserved_kb=0.0
+            started=1.0, device=0, gpu_reserve_kb=1 * 1024**2, gpu_used_kb=0.0
         )
         shed = []
         with patch.object(
@@ -922,7 +985,9 @@ class TestGpuScheduling:
             card_kb,
         )
         assert len(ceilings) == 2
-        assert [float(item) for item in ceilings] == [pytest.approx(expected)] * 2
+        assert [float(item) for item in ceilings] == [
+            pytest.approx(int(expected // 1024) * 1024)
+        ] * 2
 
     def test_a_measured_stage_is_capped_on_device_memory(self, tmp_path):
         batch = warm(make_batch(tmp_path, count=1, devices=[0], delay=0))

@@ -122,13 +122,12 @@ def live_worker(batch, run_id, *, device=0, elapsed=30.0):
         host_reserve_kb=8 * GIB,
         gpu_reserve_kb=6 * GIB,
         gpu_cap_kb=7 * GIB,
+        mps_client=(1, 2),
         expected=StageDuration(center=90.0, lower=60.0, upper=150.0),
         resident_kb=3 * GIB,
         peak_kb=4 * GIB,
-        gpu_allocated_kb=1 * GIB,
-        gpu_reserved_kb=2 * GIB,
-        gpu_peak_allocated_kb=1 * GIB,
-        gpu_peak_reserved_kb=3 * GIB,
+        gpu_used_kb=2 * GIB,
+        gpu_process_peak_kb=3 * GIB,
     )
     batch._active_gpu[run_id] = device
     batch._gpu_running_info[run_id] = {
@@ -142,10 +141,8 @@ def live_worker(batch, run_id, *, device=0, elapsed=30.0):
         "stage_index": 0,
         "resident_kb": 3 * GIB,
         "peak_kb": 4 * GIB,
-        "gpu_allocated_kb": 1 * GIB,
-        "gpu_reserved_kb": 2 * GIB,
-        "gpu_peak_allocated_kb": 1 * GIB,
-        "gpu_peak_reserved_kb": 3 * GIB,
+        "gpu_used_kb": 2 * GIB,
+        "gpu_process_peak_kb": 3 * GIB,
     }
     batch._device_memory = {
         device: {
@@ -502,14 +499,14 @@ def test_a_running_attempt_reports_allocation_against_actual_use(tmp_path):
     assert worker["host"]["reserved_kb"] == 8 * GIB
     assert worker["host"]["resident_kb"] == 3 * GIB
     assert worker["gpu"]["budget_kb"] == 6 * GIB
-    assert worker["gpu"]["reserved_kb"] == 2 * GIB
+    assert worker["gpu"]["used_kb"] == 2 * GIB
     assert worker["gpu"]["cap_kb"] == 7 * GIB
 
     card = snapshot["resources"]["devices"][0]
     assert card["expman_actual_kb"] == 2 * GIB
-    assert card["expman_allocated_kb"] == 1 * GIB
     assert card["expman_budget_kb"] == 6 * GIB
     assert card["other_kb"] == pytest.approx(6 * GIB)
+    assert worker["gpu"]["peak_used_kb"] == 3 * GIB
     host = snapshot["resources"]["host"]
     assert host["expman_actual_kb"] == 3 * GIB
     assert host["expman_budget_kb"] == 8 * GIB

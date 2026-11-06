@@ -36,10 +36,10 @@ class Worker:
     # attempts are expected to need and the ceilings stay an allowance on top.
     host_reserve_kb: float = 0.0
     gpu_reserve_kb: float = 0.0
-    # The device ceiling this attempt actually runs under, or zero when it was
-    # started without one. Admission charges only the growth above what it has
-    # already reserved, so an attempt with no ceiling charges its own usage.
+    # Actual MiB-granularity request sent in the MPS client environment.
     gpu_cap_kb: float = 0.0
+    mps_client: tuple[int, int] | None = None
+
     expected: StageDuration | None = None
     area: float = 0.0
     limit: object = None
@@ -50,16 +50,18 @@ class Worker:
     host_usage_source: str | None = None
     host_usage_error: str | None = None
     host_limit_kb: float | None = None
-    gpu_allocated_kb: float | None = None
-    gpu_reserved_kb: float | None = None
-    gpu_peak_allocated_kb: float | None = None
-    gpu_peak_reserved_kb: float | None = None
+    gpu_used_kb: float | None = None
+    gpu_process_peak_kb: float | None = None
     memory_events: dict = field(default_factory=dict)
     finished: StageResult | None = None
     progress: ProgressEvent | None = None
     dependencies: list | None = None
     reused: bool = False
     cap_hit: bool = False
+
+    @property
+    def gpu_limit_verified(self) -> bool:
+        return self.mps_client is not None
 
 
 @dataclass(frozen=True)

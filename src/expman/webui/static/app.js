@@ -254,13 +254,20 @@ function workerRow(w) {
   // host_reserve_kb, VRAM = gpu_reserve_kb); the blue fill is actual usage
   // over that reservation, so its length is how much of the budget is used.
   const hostAlloc = host.reserved_kb || 0;
+  const driverUsage = "used_kb" in gpu;
+  const gpuUsed = driverUsage ? gpu.used_kb : gpu.reserved_kb;
+  const mps = "requested_cap_kb" in gpu;
+  const gpuThreshold = mps ? gpu.cap_kb : driverUsage ? gpu.threshold_kb : gpu.cap_kb;
+  const gpuLimit = mps
+    ? (ok(gpu.cap_kb) ? " · MPS 上限 " + gib(gpu.cap_kb) : " · MPS 待核验 " + gib(gpu.requested_cap_kb)) + " GiB"
+    : driverUsage ? " · 采样阈值 " + gib(gpuThreshold) + " GiB" : "";
   const gpuAlloc = gpu.budget_kb || 0;
   // A hard cap only has a place on this scale while it sits at or below the
   // reservation; anything larger would clamp to the right edge and mislead.
   const hostCap = ok(host.cap_kb) && hostAlloc > 0 && host.cap_kb <= hostAlloc
     ? pctOf(host.cap_kb, hostAlloc) : null;
-  const gpuCap = ok(gpu.cap_kb) && gpuAlloc > 0 && gpu.cap_kb <= gpuAlloc
-    ? pctOf(gpu.cap_kb, gpuAlloc) : null;
+  const gpuCap = ok(gpuThreshold) && gpuAlloc > 0 && gpuThreshold <= gpuAlloc
+    ? pctOf(gpuThreshold, gpuAlloc) : null;
   const expected = w.expected ? span(w.expected.lower_seconds, w.expected.upper_seconds) : "–";
   const progress = w.progress && ok(w.progress.completed)
     ? '<div class="mono faint">进度 ' + w.progress.completed + (ok(w.progress.total) ? "/" + w.progress.total : "") + " " + esc(w.progress.unit || "") + "</div>"
@@ -283,8 +290,8 @@ function workerRow(w) {
         (host.reached_cap ? ' <span class="k-fail">触顶</span>' : "") + "</div>" +
       bar([{ from: 0, size: pctOf(host.resident_kb, hostAlloc), color: "var(--actual)" }],
         null, hostCap, "thin") + hostObservation + hostLimit +
-      '<div class="mono faint" style="margin-top:6px">显存 实际占用 ' + gib(gpu.reserved_kb) + " / 分配 " + gib(gpu.budget_kb) + " GiB" + "</div>" +
-      bar([{ from: 0, size: pctOf(gpu.reserved_kb, gpuAlloc), color: "var(--actual)" }],
+      '<div class="mono faint" style="margin-top:6px">显存 ' + (mps ? "NVIDIA 客户端 " : driverUsage ? "NVIDIA 进程组 " : "PyTorch 保留 ") + (ok(gpuUsed) ? gib(gpuUsed) : "观测不可用") + " / 分配 " + gib(gpu.budget_kb) + " GiB" + gpuLimit + "</div>" +
+      bar([{ from: 0, size: pctOf(gpuUsed, gpuAlloc), color: "var(--actual)" }],
         null, gpuCap, "thin") +
       '<div class="mono faint" style="margin-top:6px">预计 ' + expected + "</div>" +
       progress +
@@ -376,14 +383,17 @@ function deviceRow(card) {
     { at: start + pctOf(actual, total), text: gib(other + actual) + "G" },
     { at: start + pctOf(budget, total), text: gib(other + budget) + "G" },
   ];
+  const known = ok(card.expman_actual_kb) && ok(card.other_kb);
+  const usageBar = known ? bar(
+    [{ from: 0, size: start, color: "var(--other)" }, { from: start, size: pctOf(actual, total), color: "var(--actual)" }],
+    { from: start, size: pctOf(budget, total) }, null, "wide", marks)
+    : '<div class="mono faint">显存观测不可用</div>';
   return '<div class="row" style="grid-template-columns:76px minmax(0,1fr) 92px">' +
       '<span class="muted mono">GPU ' + esc(card.index) + "</span>" +
-      '<div class="' + stale.trim() + '">' + bar(
-        [{ from: 0, size: start, color: "var(--other)" }, { from: start, size: pctOf(actual, total), color: "var(--actual)" }],
-        { from: start, size: pctOf(budget, total) }, null, "wide", marks) + "</div>" +
+      '<div class="' + stale.trim() + '">' + usageBar + "</div>" +
       '<span class="mono" style="text-align:right">' + gib(card.launchable_kb) + " GiB</span>" +
     "</div>" +
-    '<div class="detail mono">实际 ' + gib(actual) + " · 分配 " + gib(budget) +
+    '<div class="detail mono">实际 ' + (known ? gib(actual) : "观测不可用") + " · 分配 " + gib(budget) +
       (ok(card.launchable_kb) ? "" : " · 待首次采样") + "</div>";
 }
 

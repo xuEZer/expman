@@ -171,11 +171,12 @@ def _workers(window, names, progress, now):
                 },
                 "gpu": {
                     "budget_kb": number(worker.gpu_reserve_kb),
-                    "reserved_kb": number(info.get("gpu_reserved_kb")),
-                    "allocated_kb": number(info.get("gpu_allocated_kb")),
-                    "peak_reserved_kb": number(info.get("gpu_peak_reserved_kb")),
-                    "peak_allocated_kb": number(info.get("gpu_peak_allocated_kb")),
-                    "cap_kb": number(worker.gpu_cap_kb),
+                    "used_kb": number(info.get("gpu_used_kb")),
+                    "peak_used_kb": number(info.get("gpu_process_peak_kb")),
+                    "requested_cap_kb": number(worker.gpu_cap_kb),
+                    "cap_kb": number(worker.gpu_cap_kb)
+                    if getattr(worker, "mps_client", None) is not None
+                    else None,
                 },
                 "dependencies": None
                 if worker.dependencies is None
@@ -193,11 +194,12 @@ def _resources(device_memory, host_memory, workers, plan):
     gpu_left = capacity.get("gpu_left_kb") or {}
     held = {}
     for worker in workers:
-        entry = held.setdefault(
-            worker["device"], {"actual_kb": 0.0, "allocated_kb": 0.0, "budget_kb": 0.0}
-        )
-        entry["actual_kb"] += worker["gpu"]["reserved_kb"] or 0.0
-        entry["allocated_kb"] += worker["gpu"]["allocated_kb"] or 0.0
+        entry = held.setdefault(worker["device"], {"actual_kb": 0.0, "budget_kb": 0.0})
+        used = worker["gpu"]["used_kb"]
+        if used is None:
+            entry["actual_kb"] = None
+        elif entry["actual_kb"] is not None:
+            entry["actual_kb"] += used
         entry["budget_kb"] += worker["gpu"]["budget_kb"] or 0.0
     cards = []
     for device, observation in sorted(device_memory.items()):
@@ -212,10 +214,9 @@ def _resources(device_memory, host_memory, workers, plan):
                 "total_kb": total,
                 "free_kb": free,
                 "other_kb": None
-                if used is None
-                else max(0.0, used - (mine.get("actual_kb") or 0.0)),
+                if used is None or mine.get("actual_kb", 0.0) is None
+                else max(0.0, used - mine.get("actual_kb", 0.0)),
                 "expman_actual_kb": mine.get("actual_kb", 0.0),
-                "expman_allocated_kb": mine.get("allocated_kb", 0.0),
                 "expman_budget_kb": mine.get("budget_kb", 0.0),
                 "launchable_kb": number(gpu_left.get(device)),
                 "age_seconds": age(observation.get("observed_at")),

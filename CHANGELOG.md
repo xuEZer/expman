@@ -8,6 +8,8 @@
 
 ### Changed
 
+- 显存改用 MPS 单客户端硬上限，启动时核验 PID 与 GPU。worker 在现有主机内存采样线程中一并查询 NVIDIA 客户端显存，CUDA OOM 后按提高的预算重试。
+
 - 实验配置语法整体替换：`!choice`、顶层 `sweep` 与中间过渡的顶层 `over` 全部移除，改由三个顶层控制键表达——**`combines`** 取一个映射列表，每项是一份稀疏覆盖、逐项各跑一个 Run（配对同级字段），**`grid`** 列出各轴并跑它们的乘积（笛卡尔积），**`scan`** 在自身内部声明参数（文件不必重复书写，写了也会被覆盖）、以每条轴列出的第一个取值为基准点、一次只动一条轴（单参数扫描）。三者共用同一条形状规则：**列表表示该节点取其中一个值，映射表示继续往下走**，并且**可以叠加**：嵌套关系由外向内固定为 `combines` → `grid` → `scan`，Run 集是三层的乘积、内层变化最快；原先 `scan` 的列表形式（整份方案）改由 `combines` 承担。`expand` 段、`baseline` 开关、`over.mode`、以及用 `name` 触发默认查找一并消失，且**不提供任何兼容层或迁移提示**：旧写法要么退化为普通数据字段，要么按 YAML 语法错误被拒。`name` 保持为普通数据字段，查找职责由 `defaults: <name>` 承担。
 
 - 新增命令行入口 `expman`（`run` / `resume` / `status` / `stop`）：pipeline 以 `module:attr` 定位，支持 `Pipeline` 实例、Stage 类列表或零参工厂，创建时记入 manifest 供 `resume` 自动重建；`status` 只读批目录展示各 run 进度与剩余时间区间，`stop` 向运行进程发送 SIGTERM 优雅停止（PID 记录在批目录 `expman.pid`，退出码 143），恢复仍走既有 checkpoint 通道。`Batch` 新增内部 `_pipeline_spec` 参数；库 API 行为不变。

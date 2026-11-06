@@ -27,9 +27,7 @@ HOST_RESERVE_KB = 1024 * 1024
 # unknown attempt may hold; over-estimating costs throughput, under-estimating
 # costs the host. It is also the cold start of the feature regression.
 HOST_PEAK_KB_DEFAULT = 1024 * 1024
-# Cold-start PyTorch allocator peak for a top-level Stage. A Stage with completed
-# samples that never report PyTorch CUDA usage will subsequently receive no GPU
-# contract and can run without occupying a card.
+# Cold-start process-group GPU memory estimate until NVIDIA samples are available.
 GPU_PEAK_KB_DEFAULT = 1024 * 1024
 # Share of a device's total memory one probe attempt may reach. A Stage
 # with no sample in this Batch is capped at this share of the host (or of
