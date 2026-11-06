@@ -464,9 +464,15 @@ def _gather(batch) -> dict:
     now = time()
     window = _publish_window(batch, scheduler)
     names = _stage_names(batch)
+    # A skipped tick (pressure, missing observation, MPS startup, or empty queue)
+    # must not reuse an earlier tick's placements or capacity.
+    plan = window["plan"]
+    observed = window["host_memory"].get("observed_at")
+    if observed is None or (plan is not None and plan["at"] < observed):
+        plan = None
     workers = _workers(window, names, _progress(batch), now)
     resources = _resources(
-        window["device_memory"], window["host_memory"], workers, window["plan"]
+        window["device_memory"], window["host_memory"], workers, plan
     )
     stages = _stages(
         window["completion"], names, window["view"], stage_samples(window["history"])
@@ -480,7 +486,14 @@ def _gather(batch) -> dict:
     for worker in workers:
         stage_index = worker["stage_index"]
         running_by_stage[stage_index] = running_by_stage.get(stage_index, 0) + 1
-    host = resources["host"]
+    if plan is not None:
+        gate = "open" if plan["placements"] else "closed"
+    elif not window["queue"]:
+        gate = "idle"
+    elif window["host_memory"].get("tight"):
+        gate = "closed"
+    else:
+        gate = "waiting"
     return {
         "schema": SCHEMA,
         "generated_at": now,
@@ -513,9 +526,9 @@ def _gather(batch) -> dict:
             "running_runs": len(window["active"]),
             "pending_by_stage": pending_by_stage,
             "running_by_stage": running_by_stage,
-            "gate": "open" if host["admits_next"] and not host["tight"] else "closed",
+            "gate": gate,
             "estimate": window["view"],
-            "plan": window["plan"],
+            "plan": plan,
         },
         "events": _events(window["events"]),
     }

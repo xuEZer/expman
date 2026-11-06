@@ -171,25 +171,40 @@ function topBar(s, detail) {
     '<span class="spacer"></span>' + buttons + stopButton + connectionPill() + "</div>";
 }
 
+function admissionTile(s) {
+  if (s.source !== "live") return tile("调度门闸", "–", "批次未在运行，无实时准入数据");
+  const schedule = s.schedule || {};
+  const host = (s.resources || {}).host || {};
+  const plan = schedule.plan;
+  const knownHost = ok(host.available_kb);
+  const hostText = host.tight || plan?.host_fits === false ? "主机内存不足"
+    : plan?.host_fits === true ? "主机内存可容纳候选"
+    : knownHost ? "主机内存有余量" : "主机内存待采样";
+  const gpuText = plan?.gpu_fits === false ? "GPU 余量不足"
+    : plan?.gpu_fits === true ? "GPU 可容纳候选" : "GPU 准入待评估";
+  const placed = plan?.placements?.length || 0;
+  let outcome = "等待调度";
+  if (plan && placed) outcome = "有可行派发";
+  else if (!schedule.pending_runs) outcome = "无排队任务";
+  else if (plan?.ready === 0) outcome = "等待就绪候选";
+  else if (plan || host.tight) outcome = "本轮未派发";
+  const count = plan ? " · 已派发 " + (plan.launched || []).length + " 个" : "";
+  return tile("调度门闸", outcome, hostText + " · " + gpuText + count);
+}
+
 function tiles(s) {
   const b = s.batch || {};
   const counts = b.counts || {};
   const remaining = b.remaining || {};
-  const host = (s.resources || {}).host || {};
-  const gate = (s.schedule || {}).gate;
-  const live = s.source === "live";
   const coverage = ok(remaining.coverage) ? Math.round(remaining.coverage * 100) + "%" : "–";
   const spanText = ok(remaining.lower_seconds) && ok(remaining.upper_seconds)
     ? secs(remaining.lower_seconds) + "～" + secs(remaining.upper_seconds) : "??:??:??";
-  const tight = host.tight ? "主机内存紧张" : gate === "open" ? "可接纳" : "等待内存";
   return '<div class="grid tiles">' + [
     tile("已运行", secs(b.elapsed_seconds), "共 " + esc(b.experiments) + " 个配置 · " + esc(b.stages) + " 个阶段"),
     tile("预计剩余", spanText, "覆盖 " + coverage + " · 样本 " + esc(remaining.samples)),
     tile("运行 / 排队", (counts.running || 0) + " / " + (counts.pending || 0),
       "成功 " + (counts.succeeded || 0) + " · 失败 " + (counts.failed || 0) + " · 停止 " + (counts.cancelled || 0)),
-    live
-      ? tile("调度门闸", gate === "open" ? "开放" : "关闭", tight + " · 排队 " + esc((s.schedule || {}).pending_runs) + " 个")
-      : tile("调度门闸", "–", "批次未在运行，无实时准入数据"),
+    admissionTile(s),
   ].join("") + "</div>";
 }
 

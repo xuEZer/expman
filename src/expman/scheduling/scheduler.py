@@ -668,7 +668,9 @@ class GpuScheduler:
         if host_capacity <= 0 or not devices_in_plan:
             self.last_plan = {
                 "at": time(),
-                "ready": len(self.batch._queue),
+                "ready": None,
+                "host_fits": False if host_capacity <= 0 else None,
+                "gpu_fits": None,
                 "capacity": {
                     "host_left_kb": host_capacity,
                     "gpu_left_kb": available_gpu,
@@ -739,6 +741,12 @@ class GpuScheduler:
         self.last_plan = {
             "at": time(),
             "ready": len(candidates),
+            "host_fits": any(c.host_reserve_kb <= host_capacity for c in candidates)
+            if candidates
+            else None,
+            "gpu_fits": any(c.gpu_reserve_kb <= max(gpu_capacities) for c in candidates)
+            if candidates
+            else None,
             "capacity": {
                 "host_left_kb": host_capacity,
                 "gpu_left_kb": dict(available_gpu),
@@ -761,14 +769,14 @@ class GpuScheduler:
 
     def _launch_available(self, memory, host):
         """Launch the resource-aware packing plan chosen from this tick's snapshot."""
-        for candidate, device in self._launch_plan(memory, host):
-            if not self._launch(device, memory[device], host, candidate):
-                continue
-            # The plan is what admission chose; a placement refused between
-            # planning and process creation did not become a launch.
-            plan = self.last_plan
-            if plan is not None:
-                plan["launched"].append(candidate.run_id)
+        placements = self._launch_plan(memory, host)
+        launched = [
+            candidate.run_id
+            for candidate, device in placements
+            if self._launch(device, memory[device], host, candidate)
+        ]
+        if self.last_plan is not None:
+            self.last_plan = {**self.last_plan, "launched": launched}
 
     def _materialize_reuses(self):
         """Advance cache-equivalent Stage members without creating a worker."""

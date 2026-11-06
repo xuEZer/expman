@@ -482,6 +482,32 @@ def test_a_snapshot_never_fits_a_model(tmp_path):
 
 
 @POSIX
+def test_gate_uses_current_plan_and_actual_gpu_headroom(tmp_path):
+    batch = make_batch(tmp_path, count=1)
+    scheduler = GpuScheduler(batch)
+    memory = {0: DeviceMemory("GPU-test-0", 24 * 1024, 190)}
+    host = Host().sample()
+    batch._host_memory = {
+        "available_kb": host.available_kb,
+        "admits_next": True,
+        "observed_at": time(),
+    }
+    assert not scheduler._launch_plan(memory, host)
+    schedule = build_snapshot(batch)["schedule"]
+    assert schedule["gate"] == "closed"
+    assert schedule["plan"]["host_fits"] is True
+    assert schedule["plan"]["gpu_fits"] is False
+    assert schedule["plan"]["launched"] == []
+
+    assert scheduler._launch_plan(Memory([0]).sample(), host)
+    assert build_snapshot(batch)["schedule"]["gate"] == "open"
+    batch._host_memory["observed_at"] = scheduler.last_plan["at"] + 1
+    schedule = build_snapshot(batch)["schedule"]
+    assert schedule["plan"] is None
+    assert schedule["gate"] == "waiting"
+
+
+@POSIX
 def test_a_running_attempt_reports_allocation_against_actual_use(tmp_path):
     batch = seed_finished_first(make_batch(tmp_path))
     GpuScheduler(batch)
