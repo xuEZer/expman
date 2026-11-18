@@ -1,13 +1,8 @@
-"""A dashboard process that watches a runs/ tree instead of one Batch.
+"""Serve batch observations from a workspace over HTTP and server-sent events.
 
-It is deliberately independent of every experiment process: it discovers
-batches the same way the CLI does, reads whatever each one has left on disk,
-and reports a running batch from the snapshot that batch publishes.  Nothing
-here may reach back into an experiment, and the only write it can perform is
-the stop request, which reuses the PID record ``expman stop`` already owns.
-
-The page and its scripts ship in this package and use no external resource,
-so a cluster without internet access can still open it.
+Workspace discovery registers new batch names in the shared ID database.
+The server reads snapshots or durable batch records, serves bundled static
+assets, and forwards stop requests when allow_stop is enabled.
 """
 
 import json
@@ -20,10 +15,10 @@ from typing import cast
 from urllib.parse import parse_qs, urlparse
 
 from expman.observation.analysis import analysis_payload, fingerprint
+from expman.observation.archive import read_batch, summarize
 from expman.observation.registry import ensure_ids
+from expman.observation.snapshot import SCHEMA
 from expman.process_control import request_stop
-from expman.webui.archive import read_batch, summarize
-from expman.webui.snapshot import SCHEMA
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 STATIC_FILES = {
@@ -47,10 +42,9 @@ class Workspace:
     def collect(self) -> tuple[list[dict], dict[int, dict]]:
         """Summaries for the list page and full snapshots keyed by batch ID.
 
-        The durable records are re-read every tick.  That is a few small
-        files per batch and the scan runs on the publisher thread, so a
-        current view of a batch that died without cleaning up is worth more
-        than the reads it costs.
+        Each refresh checks the batch control FIFO and the latest published snapshot. The
+        archive reader opens the batch manifest when the snapshot is absent
+        or unusable.
         """
         summaries = []
         details: dict[int, dict] = {}
@@ -59,19 +53,10 @@ class Workspace:
                 snapshot = read_batch(directory, batch_id)
                 details[batch_id] = snapshot
                 summaries.append(summarize(snapshot))
-        summaries.sort(key=lambda item: item["id"] or 0)
         return summaries, details
 
     def directory(self, batch_id: int) -> Path | None:
         return ensure_ids(self.root).get(batch_id)
-
-
-def stop(batch_id: int, directory: Path) -> tuple[bool, str]:
-    """Ask the process that owns a batch to stop, via its PID record."""
-    success, message = request_stop(directory)
-    if not success and "is not running" in message:
-        message = f"batch {batch_id} is not running (no live PID record)"
-    return success, message
 
 
 def _starting_payload() -> str:
@@ -83,9 +68,8 @@ def _starting_payload() -> str:
 class Stream:
     """The newest workspace snapshot, rebuilt on a cadence for all readers.
 
-    One publisher serves every subscriber: a browser must never make the
-    machine query nvidia-smi, and a batch's full snapshot is only serialized
-    for the pages actually watching it.
+    Each tick produces one overview frame and one detail frame per watched
+    batch. Subscribers share the serialized frames.
     """
 
     def __init__(self, workspace: Workspace, interval: float) -> None:
@@ -132,13 +116,10 @@ class Stream:
             self.stopped.wait(self.interval)
 
     def refresh(self) -> None:
-        """Rebuild every frame; a build failure becomes a degraded payload.
+        """Refresh the overview and watched details.
 
-        A frame a watched batch already has survives a tick that could not
-        read it: one unreadable tick must not look like a batch that is gone,
-        and a build that fails outright must not empty the pages already open
-        on one. Both are the difference between a dashboard that blinks and a
-        dashboard that lies.
+        Keep the previous detail frame when discovery skips a watched batch.
+        A failed refresh publishes the error on the overview frame.
         """
         try:
             summaries, details = self.workspace.collect()
@@ -177,11 +158,10 @@ class Stream:
             return self.frames.get(key) or self.frames[""]
 
     def wait(self, generation: int, key: object, timeout: float) -> tuple[int, str]:
-        """Block until a frame for ``key`` is newer than ``generation``.
+        """Wait for a newer frame for the requested batch or the overview.
 
-        A subscriber that has just named a batch has to wait for the next
-        publish, because a single batch's snapshot is only serialized for the
-        pages that asked for it.
+        On timeout, return the current frame or the overview if the requested
+        batch has no frame yet.
         """
         with self.condition:
             deadline = monotonic() + timeout
@@ -241,7 +221,7 @@ class Handler(BaseHTTPRequestHandler):
         if directory is None:
             self._error(404, f"no batch {batch_id}")
             return
-        ok, message = stop(batch_id, directory)
+        ok, message = request_stop(directory)
         self._body({"status": "stopping" if ok else "refused", "message": message})
 
     def _get(self, path, query):
@@ -335,7 +315,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def _stream(self, key):
-        """Push every new snapshot to one subscriber until it goes away."""
+        """Send the latest frame to one subscriber after updates and timeouts."""
         stream = self.dashboard.stream
         if key is not None:
             stream.watch(key)
@@ -350,12 +330,7 @@ class Handler(BaseHTTPRequestHandler):
             generation = -1
             while not stream.stopped.is_set():
                 generation, payload = stream.wait(generation, key, HEARTBEAT_SECONDS)
-                frame = (
-                    f"data: {payload}\n\n"
-                    if payload is not None
-                    else ": keep-alive\n\n"
-                )
-                self.wfile.write(frame.encode())
+                self.wfile.write(f"data: {payload}\n\n".encode())
                 self.wfile.flush()
         finally:
             if key is not None:
@@ -429,7 +404,7 @@ class WebUI:
         self._server.stream.refresh()
 
     def wait(self) -> None:
-        """Block until interrupted; the caller still has to close() the UI."""
+        """Wait until close() is called or Ctrl+C interrupts the caller."""
         with suppress(KeyboardInterrupt):
             self._done.wait()
 
@@ -452,7 +427,9 @@ def _check(host, port, interval, allow_stop):
         or not isinstance(interval, (int, float))
         or not 0 < float(interval) < 3600
     ):
-        raise ValueError("interval must be a positive finite number of seconds")
+        raise ValueError(
+            "interval must be greater than zero and less than 3600 seconds"
+        )
     if not isinstance(allow_stop, bool):
         raise ValueError("allow_stop must be a boolean")
 
@@ -474,7 +451,8 @@ def serve(
     _check(host, port, interval, allow_stop)
     workspace = Workspace(root)
     last = None
-    for candidate in (0,) if port == 0 else range(port, port + PORT_ATTEMPTS):
+    last_port = min(port + PORT_ATTEMPTS - 1, 65535) if port else 0
+    for candidate in range(port, last_port + 1):
         try:
             server = DashboardServer(
                 (host, candidate),
@@ -487,4 +465,4 @@ def serve(
             continue
         display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
         return WebUI(server, display_host).start()
-    raise OSError(f"no free port in {port}..{port + PORT_ATTEMPTS - 1}: {last}")
+    raise OSError(f"could not bind dashboard in {port}..{last_port}: {last}")

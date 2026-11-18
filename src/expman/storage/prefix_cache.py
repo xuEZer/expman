@@ -5,15 +5,13 @@ import warnings
 from hashlib import sha256
 from uuid import uuid4
 
-from expman.core.dependencies import matches
 from expman.storage.base import (
     RecoveryWarning,
     StorageError,
     read_record,
-    stage_seconds,
-    validate_snapshot,
     write_record,
 )
+from expman.storage.run import stage_seconds, validate_snapshot
 
 
 def _hex(value, length):
@@ -50,18 +48,17 @@ class PrefixCache:
         directory = self._directory(reference)
         self.metadata(reference, position)
         record = read_record(directory / "snapshot.pkl", self.serializer)
-        validate_snapshot(record, position, require_rng=True)
-        stage_seconds(record)
+        validate_snapshot(record, position, shared=True)
         return record
 
-    def _candidates(self, parent, position, config):
+    def _candidates(self, parent, position, dependencies):
         """Yield the usable ``(reference, metadata)`` nodes for one position."""
         directory = self.root / self.key / parent
         for path in sorted(directory.glob("*/metadata.pkl")):
             reference = (self.key, parent, path.parent.name)
             try:
                 metadata = self.metadata(reference, position)
-                if matches(metadata["dependencies"], config):
+                if metadata["dependencies"] == dependencies:
                     yield reference, metadata
             except (
                 StorageError,
@@ -77,12 +74,10 @@ class PrefixCache:
                 )
 
     def metadata(self, reference, position) -> dict:
-        """Read one node's metadata, which is small and always present.
+        """Read the dependencies, duration and metrics of a published node.
 
-        A scheduler that only needs a Stage's dependencies, duration or metrics
-        decides with this instead of ``load``: a snapshot can carry the whole
-        Stage output, and reading it costs that much memory in the scheduler for
-        every run that reuses it.
+        The scheduler uses these fields to reuse a Stage without loading the
+        output into the parent process.
         """
         directory = self._directory(reference)
         metadata = read_record(directory / "metadata.pkl", self.serializer)
@@ -91,14 +86,17 @@ class PrefixCache:
             or metadata.get("version") != 1
             or metadata.get("position") != position
             or metadata.get("reference") != reference
+            or not isinstance(metadata.get("dependencies"), list)
+            or not isinstance(metadata.get("metrics"), list)
         ):
             raise StorageError("invalid shared-cache metadata")
+        stage_seconds(metadata)
         return metadata
 
     def find(
-        self, parent, position, config
+        self, parent, position, dependencies
     ) -> tuple[tuple[str, str, str], dict] | None:
-        for reference, _metadata in self._candidates(parent, position, config):
+        for reference, _metadata in self._candidates(parent, position, dependencies):
             try:
                 return reference, self.load(reference, position)
             except (
@@ -116,10 +114,10 @@ class PrefixCache:
         return None
 
     def find_metadata(
-        self, parent, position, config
+        self, parent, position, dependencies
     ) -> tuple[tuple[str, str, str], dict] | None:
         """Like ``find``, but returns the metadata without the snapshot."""
-        for reference, metadata in self._candidates(parent, position, config):
+        for reference, metadata in self._candidates(parent, position, dependencies):
             return reference, metadata
         return None
 
@@ -133,11 +131,11 @@ class PrefixCache:
                 "version": 1,
                 "reference": reference,
                 "position": record["position"],
-                "dependencies": record.get("config_dependencies", []),
+                "dependencies": record["config_dependencies"],
                 # Everything a reusing scheduler needs, so that it never has to
                 # read the snapshot itself.
-                "elapsed_seconds": record.get("elapsed_seconds"),
-                "metrics": record.get("metrics", []),
+                "elapsed_seconds": record["elapsed_seconds"],
+                "metrics": record["metrics"],
             },
             self.serializer,
         )

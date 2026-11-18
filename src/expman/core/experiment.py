@@ -14,7 +14,6 @@ from expman.core.pipeline import Pipeline
 from expman.core.randomness import RandomStateManager, validate_seed
 from expman.core.recorders import InMemoryRecorder, Recorder
 from expman.storage.base import (
-    RunStore,
     Serializer,
     StorageError,
     read_record,
@@ -22,6 +21,7 @@ from expman.storage.base import (
 )
 from expman.storage.metrics import MetricStore
 from expman.storage.prefix_cache import PrefixCache
+from expman.storage.run import RunStore
 
 
 class OutputSource(Protocol):
@@ -48,9 +48,8 @@ class SnapshotOutput:
 class AttemptResult:
     """Attempt summary; the output is read from its record on demand.
 
-    A batch keeps one of these per attempt for its whole lifetime, so the output
-    object is not retained: output_source rereads the authoritative record, and
-    every access returns a fresh object.
+    Batch retains the summaries. A successful run with stages reads its final
+    snapshot each time the caller requests the output.
     """
 
     run_id: str
@@ -100,10 +99,10 @@ class ExperimentResult:
 class Experiment:
     """A stable run identity with durable positional stage snapshots.
 
-    Experiment is an internal component: the scheduler executes exactly one
-    top-level Stage per worker attempt through run_stage(), which restores the
-    completed prefix and the latest checkpoint. Exceptions become summaries;
-    BaseException interruptions are recorded and propagated to the caller.
+    A worker requests one top-level Stage through run_stage(). It restores
+    the completed prefix and reuses or computes the target. Execution
+    exceptions become failed StageResults. Interruptions propagate to the
+    worker, which reports their outcome to the scheduler when possible.
     """
 
     def __init__(
@@ -168,19 +167,39 @@ class Experiment:
     def result(self) -> ExperimentResult:
         return ExperimentResult(self.run_id, tuple(self._attempts))
 
-    def _output_source(self) -> OutputSource | None:
-        """Snapshot source for this run's output when it is re-readable."""
-        if not self.pipeline.stages:
-            return None
-        position = (len(self.pipeline.stages) - 1,)
-        if not (self._store.stage_dir(position) / "completed.pkl").exists():
-            return None
-        return SnapshotOutput(self._store, position)
+    def record_attempt(
+        self,
+        status: Status,
+        duration_seconds: float,
+        *,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Append one finished attempt; successful output stays in its snapshot."""
+        source = None
+        if status is Status.SUCCEEDED and self.pipeline.stages:
+            position = (len(self.pipeline.stages) - 1,)
+            if not self._store.has_completed(position):
+                raise StorageError(
+                    f"successful experiment has no final snapshot: {self.output_dir}"
+                )
+            source = SnapshotOutput(self._store, position)
+        self._attempts.append(
+            AttemptResult(
+                self.run_id,
+                len(self._attempts) + 1,
+                status,
+                duration_seconds,
+                error_type=error_type,
+                error_message=error_message,
+                output_source=source,
+            )
+        )
 
     def run_stage(
         self, stage_index: int, *, attempt: int, recorder: Recorder | None = None
     ) -> StageResult:
-        """Run exactly one top-level stage, restoring the completed prefix."""
+        """Restore the required prefix and reuse or execute the requested Stage."""
         if not 0 <= stage_index < len(self.pipeline.stages):
             raise ValueError("stage_index must identify a top-level Pipeline stage")
         for index in range(stage_index):
@@ -210,12 +229,10 @@ class Experiment:
             )
             with ctx.observe(self.pipeline.name, kind="experiment") as context:
                 self.pipeline.run(ctx=context, stop_after=stage_index)
-        except BaseException as error:
-            status = Status.FAILED if isinstance(error, Exception) else Status.CANCELLED
+        except Exception as error:
+            status = Status.FAILED
             error_type = type(error).__qualname__
             error_message = _error_message(error)
-            if not isinstance(error, Exception):
-                raise
         return StageResult(
             self.run_id,
             stage_index,

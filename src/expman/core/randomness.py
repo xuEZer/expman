@@ -1,9 +1,7 @@
 """Global RNG initialization and portable state snapshots for experiment recovery."""
 
-import importlib
 import random
-from copy import deepcopy
-from typing import Any
+from importlib import import_module
 
 from expman.storage.base import StorageError
 
@@ -15,45 +13,27 @@ def validate_seed(seed: int) -> int:
     return seed
 
 
-def _optional_import(name: str) -> Any:
-    """Import an optional backend, or report that it is not installed."""
-    try:
-        return importlib.import_module(name)
-    except ModuleNotFoundError as error:
-        if error.name != name:
-            raise
-        return None
-
-
 class RandomStateManager:
     def __init__(self, seed: int):
         self.seed_value = validate_seed(seed)
-        self.numpy = _optional_import("numpy")
-        self.torch = _optional_import("torch")
+        # Workers verify their MPS client before importing either backend.
+        self.numpy = import_module("numpy")
+        self.torch = import_module("torch")
 
     def seed(self) -> None:
         random.seed(self.seed_value)
-        if self.numpy is not None:
-            self.numpy.random.seed(self.seed_value)
-        if self.torch is not None:
-            self.torch.manual_seed(self.seed_value)
+        self.numpy.random.seed(self.seed_value)
+        self.torch.manual_seed(self.seed_value)
 
     def capture(self) -> dict:
         try:
-            state = {
+            algorithm, keys, position, gaussian, cached = self.numpy.random.get_state()
+            return {
                 "version": 1,
                 "seed": self.seed_value,
                 "python": random.getstate(),
-                "numpy": None,
-                "torch": None,
-            }
-            if self.numpy is not None:
-                algorithm, keys, position, gaussian, cached = (
-                    self.numpy.random.get_state()
-                )
-                state["numpy"] = (algorithm, keys.tolist(), position, gaussian, cached)
-            if self.torch is not None:
-                state["torch"] = {
+                "numpy": (algorithm, keys.tolist(), position, gaussian, cached),
+                "torch": {
                     "cpu": bytes(self.torch.get_rng_state().tolist()),
                     "cuda": [
                         bytes(item.tolist())
@@ -61,8 +41,8 @@ class RandomStateManager:
                     ]
                     if self.torch.cuda.is_available()
                     else [],
-                }
-            return deepcopy(state)
+                },
+            }
         except Exception as error:
             raise StorageError(f"could not capture random state: {error}") from error
 
@@ -72,33 +52,23 @@ class RandomStateManager:
                 not isinstance(state, dict)
                 or state.get("version") != 1
                 or state.get("seed") != self.seed_value
-                or not {"python", "numpy", "torch"} <= state.keys()
             ):
                 raise ValueError("invalid random-state version or seed")
             random.Random(0).setstate(state["python"])
-            if state["numpy"] is not None:
-                if self.numpy is None:
-                    raise ValueError("saved random state requires NumPy")
-                self.numpy.random.RandomState(0).set_state(state["numpy"])
-            if state["torch"] is not None:
-                if self.torch is None:
-                    raise ValueError("saved random state requires PyTorch")
-                cpu = state["torch"]["cpu"]
-                cuda = state["torch"]["cuda"]
-                if not isinstance(cpu, bytes) or not isinstance(cuda, list):
-                    raise ValueError("invalid PyTorch random state")
-                self.torch.Generator(device="cpu").set_state(self._tensor(cpu))
-                if self.torch.cuda.is_available():
-                    count = self.torch.cuda.device_count()
-                    # A CPU-only snapshot remains restorable if a retry later sees
-                    # CUDA. In that case _apply deliberately leaves CUDA RNG alone.
-                    if cuda and (
-                        len(cuda) != count
-                        or any(not isinstance(item, bytes) or not item for item in cuda)
-                    ):
-                        raise ValueError(
-                            "saved CUDA random states do not match visible devices"
-                        )
+            self.numpy.random.RandomState(0).set_state(state["numpy"])
+            cpu, cuda = state["torch"]["cpu"], state["torch"]["cuda"]
+            if not isinstance(cpu, bytes) or not isinstance(cuda, list):
+                raise ValueError("invalid PyTorch random state")
+            self.torch.Generator(device="cpu").set_state(self._tensor(cpu))
+            # A snapshot without CUDA streams can restore the CPU generators
+            # even when a later attempt runs on a GPU.
+            if cuda and (
+                len(cuda) != self.torch.cuda.device_count()
+                or any(not isinstance(item, bytes) or not item for item in cuda)
+            ):
+                raise ValueError(
+                    "saved CUDA random states do not match visible devices"
+                )
         except Exception as error:
             raise StorageError(f"could not validate random state: {error}") from error
 
@@ -107,18 +77,11 @@ class RandomStateManager:
 
     def _apply(self, state):
         random.setstate(state["python"])
-        if state["numpy"] is not None:
-            self.numpy.random.set_state(state["numpy"])
-        if state["torch"] is not None:
-            self.torch.set_rng_state(self._tensor(state["torch"]["cpu"]))
-            if (
-                self.torch.cuda.is_available()
-                and state["torch"]["cuda"]
-                and len(state["torch"]["cuda"]) == self.torch.cuda.device_count()
-            ):
-                self.torch.cuda.set_rng_state_all(
-                    [self._tensor(item) for item in state["torch"]["cuda"]]
-                )
+        self.numpy.random.set_state(state["numpy"])
+        self.torch.set_rng_state(self._tensor(state["torch"]["cpu"]))
+        cuda = state["torch"]["cuda"]
+        if cuda:
+            self.torch.cuda.set_rng_state_all([self._tensor(item) for item in cuda])
 
     def restore(self, state: dict) -> None:
         self.validate(state)
@@ -131,9 +94,5 @@ class RandomStateManager:
 
 
 def seed_everything(seed: int) -> None:
-    """Seed Python and installed NumPy/PyTorch global generators.
-
-    Independent generators, data-loader workers and deterministic GPU algorithms
-    remain the responsibility of user code. Optional library import errors propagate.
-    """
+    """Seed the global Python, NumPy and PyTorch generators."""
     RandomStateManager(seed).seed()

@@ -3,8 +3,18 @@
 import math
 from dataclasses import dataclass
 from numbers import Real
+from typing import TypeGuard
 
 UNKNOWN_CLOCK = "??:??:??～??:??:??"
+
+
+def valid_seconds(value: object) -> TypeGuard[float]:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
 
 
 def validate_coverage(value: object) -> float:
@@ -34,12 +44,9 @@ def _clock(seconds: object, *, upper: bool) -> str:
 class TimeEstimate:
     """A remaining-time interval, rendered as ``DD:HH:MM～DD:HH:MM``.
 
-    Both endpoints are required for a displayable estimate; ``coverage`` is the
-    side mass the residuals were calibrated to, so each side carries half of the
-    missing mass. It stays nominal rather than guaranteed: Stage samples are not
-    exchangeable across a growing schedule, a censored sample only bounds one
-    side, and the concurrency packing that combines Stages treats their
-    durations as independent.
+    Each Stage model uses ``coverage`` to select residual quantiles. The
+    combined interval reports the completion times of two scheduling scenarios
+    at the current concurrency. Its batch-level coverage is uncalibrated.
     """
 
     lower_seconds: float | None
@@ -47,6 +54,14 @@ class TimeEstimate:
     coverage: float
     completed_samples: int
     remaining_experiments: int
+
+    @property
+    def known(self) -> bool:
+        return (
+            valid_seconds(self.lower_seconds)
+            and valid_seconds(self.upper_seconds)
+            and self.lower_seconds <= self.upper_seconds
+        )
 
     def __str__(self) -> str:
         return (

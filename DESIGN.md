@@ -1,378 +1,110 @@
-# expman 架构设计
+# expman 源码导读
 
-日期：2026-09-08 · 目标版本：0.1.0
+expman 把一条 Python 实验流程应用到多份配置上，在一台 Linux 主机的 NVIDIA GPU 上调度这些实验，并保存足够的信息供中断后继续运行。用户编写每个阶段的计算逻辑。框架决定哪个阶段现在可以运行、运行在哪张卡上，以及 retry 或 resume 时应从哪里开始。安装、命令参数和可运行示例见 [README](README.md)。
 
-## 1. 目标与范围
+## 从一次实验读起
 
-expman 用可组合的阶段组织实验流程，让用户专注于每个阶段的数据处理逻辑，并提供一致的执行观测。
-
-当前实现支持 YAML 配置展开与默认参数合并，以及 Pipeline 流程定义 → Batch 创建 Experiment → GPU 调度执行和队尾重试 → 获得业务结果和观测事件。Batch 是唯一执行入口，Experiment 是内部组件。
-
-核心设计遵循以下原则：
-
-| 原则 | 具体落点 |
-|---|---|
-| 单一职责 | Stage 处理一个阶段；Pipeline 定义顺序；Experiment（内部组件）管理具体配置和尝试；Batch 是唯一执行入口，管理执行队列；Recorder 接收事件 |
-| 开闭原则 | 新增业务阶段继承 Stage；新增存储适配器实现 Recorder |
-| 依赖倒置 | 执行层依赖 Recorder 协议，不依赖具体数据库或监控平台 |
-| 组合与显式依赖 | Pipeline 组合阶段类型；业务对象通过输入输出传递；用户通过 ctx.cfg 读取完整实验配置 |
-| 最小可用抽象 | 先稳定同步顺序执行与监测契约，再基于实际需求增加调度等能力 |
-
-## 2. 组件关系
+假设实验包含“准备数据 → 训练”两个阶段，配置文件列出两种学习率。这个例子里有一个 **Batch**（整批实验）、两个 **run**（各自对应一个 `Experiment`、一份具体配置和一个稳定的 `run_id`）。每个 run 都要得到两个阶段的输出。**调度单元是某个 run 的一个顶层 Stage**，worker 只负责该阶段的一次尝试。若准备数据声明只依赖数据配置，两份配置在同一种子下可以共享前一阶段的结果。
 
 ```mermaid
 flowchart LR
-    U[用户代码] --> BATCH[Batch]
-    BATCH --> E[Experiment]
-    E --> P[Pipeline]
-    P --> S[Stage.run]
-    S --> B[用户实现的 process]
-    P --> C[RunContext]
-    S --> C
-    B -->|指标与进度| C
-    C -->|不可变事件| R[Recorder 协议]
-    R --> M[InMemoryRecorder]
+    CLI["expman run 或 Python API"] --> B["Batch 与 BatchState"]
+    CFG["YAML 展开的配置"] --> B
+    B --> G["GpuScheduler 主进程"]
+    G -->|派发一个顶层阶段| W["worker 独立解释器"]
+    W --> E["Experiment.run_stage"]
+    E --> P["Pipeline 与 ManagedStages"]
+    P --> U["用户 Stage.process"]
+    W -->|事件、资源采样、完成摘要| G
+    P --> D["批次目录中的阶段快照与指标"]
+    G --> M["批次清单与运行时间"]
+    B --> L["实时快照 live.json"]
+    D --> A["离线分析"]
+    M --> V["状态与归档读取"]
+    L --> V
+    A --> UI["独立 Web 服务"]
+    V --> UI
 ```
 
-## 3. Stage：业务扩展点
+1. **创建批次。** CLI 将 `module:attr` 解析为 Pipeline。Python 用户可以直接构造 `Batch(pipeline, cfg)`。YAML 展开为一组配置，直接传入一个字典则创建一个 run。Batch 校验设备和种子，创建 run 目录，并保存初始队列。[CLI](src/expman/cli.py) · [Batch](src/expman/scheduling/batch.py)
+2. **选择任务。** 主进程取每个 run 当前就绪的顶层阶段。可以共享前缀的成员按组处理。命中缓存时，主进程只读元数据，把指标和快照引用写到目标 run，推进它的阶段位置。需要计算时，主进程根据内存余量选择候选和设备，在启动 worker 前持久化该成员的活动状态。[调度循环](src/expman/scheduling/scheduler.py) · [阶段分组](src/expman/scheduling/_stages.py)
+3. **计算一个阶段。** worker 在独立解释器内核验 MPS 客户端，加载用户模块和本次尝试的输入，重建 Experiment。执行第 `i` 个阶段前，`run_stage(i)` 检查前置阶段都已有完成记录。Pipeline 从头走到 `i`，依次恢复已有阶段的输出和随机状态，再构造需要执行的 Stage 调用其 `process(data, ctx)`。相邻阶段可以运行在不同进程，跨进程传值依赖磁盘快照。[worker 入口](src/expman/scheduling/_worker.py) · [Experiment](src/expman/core/experiment.py) · [托管阶段执行](src/expman/core/execution.py)
+4. **收集结果。** worker 通过本地 socket 把完成摘要传给主进程。主进程记录历史，释放占用，安排下一阶段或重试。最后 `Batch.run()` 按配置建立顺序返回 `ExperimentResult`。成功结果保存最终快照的位置，访问 `result.output` 时才反序列化，读取大型输出时应计入这次 I/O。[进程间通信](src/expman/scheduling/ipc.py) · [结果对象](src/expman/core/experiment.py)
 
-```python
-class Stage[InputT, OutputT]:
-    def __init__(self, *, name: str | None = None): ...
-    @classmethod
-    def config_dependencies(cls, cfg) -> Mapping | bool: ...
-    def process(self, data: InputT, ctx: RunContext) -> OutputT: ...
-    def run(self, data: InputT, ctx: RunContext | None = None) -> OutputT: ...
-```
+## 定义一条流程
 
-- Stage 必须重写 `process()`（`__init__` 在实例化时校验）。重写 `config_dependencies()` 声明该 Stage 结果依赖的配置位置（见 §7）。
-- 循环、状态形状和 checkpoint 时机由用户显式控制。`ctx.resume_range(start, stop)` 返回一个迭代器：首次执行从 `start` 开始，有可读 checkpoint 时从 `max(start, checkpoint 记录的位置)` 开始。`ctx.checkpoint(position, state)` 持久化任意 `state`（非字典值会被透明包装），并把它设为最新 checkpoint。下一次尝试通过 `ctx.checkpoint_state` 取回同一个对象。
-- 阶段入口自动恢复随机状态：有可读 checkpoint 时重置到 checkpoint 存档时刻，否则保持阶段入口的随机状态。用户负责保证循环体按 `index` 和全局随机状态可重放；不要跨断点持有流游标。
-- `run()` 是基类提供的执行入口，执行 `process()`，通过 RunContext 统一包装生命周期监测；完成时保存返回值和最新 checkpoint 状态（无 checkpoint 则为空状态）。未接入 Experiment/Batch 时静默降级：无存档与恢复。
-- `run()` 使用 `typing.final` 标记，供静态工具检查覆盖行为；扩展契约要求用户只覆盖 `process()`。
-- 名称默认使用子类名，可通过 `super().__init__(name="...")` 设置。自定义构造函数须调用基类构造函数。
-- 阶段可持有模型、优化器、缓存等实例状态，但这些状态不会自动跨进程恢复；通过 `ctx.checkpoint()` 显式保存，或通过上游阶段输出传递。通过 `ctx.cfg` 读取完整实验配置。
-- Pipeline 接收 Stage 类，并通过无参构造函数创建实例。
-- Stage 实例也可直接调用 `run()`，这时实例状态由调用方管理。
+`Stage` 是用户扩展点。Pipeline 接收 **Stage 类**的序列，每个实际执行的位置都无参构造一个新实例，上一步的输出作为下一步的输入。第一步在 Batch 内收到 `None`。阶段可以返回任意能由选定 serializer 保存的 Python 值。Stage 的泛型描述单个阶段的输入输出，相邻阶段的类型兼容由流程作者负责。[Stage](src/expman/core/stage.py) · [Pipeline](src/expman/core/pipeline.py)
 
-计时实现集中在 RunContext，Stage 和 Pipeline 共用同一套生命周期语义。
+有两种常用的执行方式。调试单个转换时可调用 `stage.run(data)` 或 `pipeline.run(data)`，在调用者进程内同步执行。交给 Batch 托管时，同一个 `process` 会收到带存储服务的 `RunContext`。用户因此可以在循环内写 checkpoint、记录持久化指标。两种路径共用阶段的开始、结束、异常和父子事件语义。[运行上下文](src/expman/core/context.py) · [执行作用域](src/expman/core/execution.py)
 
-## 4. Pipeline：组合与数据流
-
-```python
-pipeline = Pipeline([LoadData, Train, Evaluate], name="experiment")
-result = pipeline.run(data=None, ctx=context)
-```
-
-Pipeline 在构造时将 Stage 类序列保存为 tuple，防止调用方后续修改原列表影响组合。它是可复用的流程定义，需要执行的阶段按顺序创建新实例。
-
-执行规则：
-
-1. 创建 Pipeline 执行作用域，记录开始事件。
-2. 按位置检查已完成快照；可复用时恢复输出并跳过构造，否则无参构造 Stage 并调用 `run()`。
-3. 将每个阶段返回的对象直接传给下一个阶段。
-4. 返回最后一个阶段的输出，记录成功事件。
-
-空 Pipeline 原样返回输入；`None` 是合法输入和输出。任何阶段抛出异常，后续阶段停止执行，异常向调用方传播。
-
-输入输出可使用列表、数组、数据类、模型对象或其他 Python 对象。推荐用数据类表达复杂阶段间契约，例如训练输出包含模型、验证数据和评估所需元信息。expman 不隐式复制、序列化或合并数据；原地修改输入的行为由业务阶段负责。
-
-相邻阶段的数据类型兼容性由用户保证。Stage 泛型描述单个阶段的输入输出；当前异构 Pipeline 使用 `Any`，不会自动静态推导整条链，也不会在运行前验证数据 schema。
-
-阶段可在自己的 `process()` 中调用另一个 Pipeline，并传入当前上下文；父子执行标识保留嵌套关系。当前执行为同步串行，Experiment、Batch 和内存记录器按单线程使用设计。
-
-## 5. RunContext：运行身份与公共服务
-
-RunContext 保存 `run_id`、尝试编号 `attempt`、只读完整配置 `cfg`、位置标识 `stage_id`、Recorder 和当前执行作用域，提供：
-
-| 接口 | 用途 |
+| 在 `process` 中需要什么 | 对应的接口与契约 |
 |---|---|
-| `observe(name, kind=...)` | 创建子作用域并记录生命周期事件 |
-| `report_metric(name, value, step=...)` | 上报有限实数指标 |
-| `log_metrics(mapping, step=...)` | 将嵌套数值指标事务写入 SQLite |
-| `report_progress(completed, total=..., unit=...)` | 上报绝对完成量，可省略总量 |
-| `emit(event)` | 将事件发送给记录器并隔离普通记录故障 |
+| 本次参数 | `ctx.cfg` 是当前 run 的只读配置。Stage 可以用 `config_dependencies(cfg)` 声明哪些配置路径会影响结果，默认依赖整份配置。 |
+| 继续循环 | 将**下一次要执行的位置**和业务状态传给 `ctx.checkpoint(position, state)`。重试时 `ctx.checkpoint_state` 返回保存值，`ctx.resume_range(start, stop)` 从 `max(start, position)` 接续。 |
+| 临时进度和事件 | `report_progress`、`report_metric` 送给 Recorder。普通 Recorder 错误被记录并隔离。各次调用有独立的执行 ID，事件可按父 ID 还原调用层次。 |
+| 用于后续分析的指标 | `ctx.log_metrics(mapping, step=...)` 将整批有限实数指标写入 SQLite。持久化失败会使当前阶段失败。 |
+| 嵌套子流程 | `Pipeline([Child]).run(data, ctx)` 为子阶段分配独立存储位置。直接调用 `Child().run(data, ctx)` 只建立观测作用域。在该子调用中使用 `ctx.checkpoint()` 会抛出 `RuntimeError`，外层的 checkpoint 仍属于外层阶段。 |
 
-业务数据通过阶段输入输出传递，RunContext 承载配置和执行服务。`ctx.cfg` 是当前尝试的完整配置，用户自行读取其中需要的字段。
+## 配置怎样决定工作量
 
-每次顶层调用省略 `ctx` 时自动创建独立 RunContext。需要检查记录或接入自己的存储时，由调用方显式创建并传入上下文。显式复用同一个上下文表示这些调用属于同一 `run_id`；每次具体执行仍获得不同的 `execution_id`。
+`load_configs` 处理 YAML 语法及默认文件，`expand` 负责生成组合，`configured_devices` 校验整个批次共享的设备列表。[配置加载](src/expman/config/loader.py) · [变体展开](src/expman/config/variants.py) · [批次约束](src/expman/config/schema.py)
 
-上下文本身为 frozen dataclass。配置递归包装为只读映射和序列；需要跨尝试恢复的模型数据、循环位置等，由用户在 `process()` 中通过 `ctx.checkpoint(position, state)` 显式保存，框架把最新 checkpoint 记录交给阶段入口，经 `ctx.checkpoint_state` 取回、`ctx.resume_range()` 从已保存位置继续。每次尝试先创建新的上下文，再由 Stage 恢复业务状态。运行时的尝试编号、执行 ID 和 Recorder 使用本次执行的信息。
+- 展开按 `combines → grid → scan` 嵌套。`combines` 的每项是对基础参数的一份覆盖。`grid` 做各轴的笛卡尔积。`scan` 先取各轴首值组成基准点，再逐轴改变单个参数。配置解析默认值后按首次出现的顺序去重。
+- 映射节点可以写 `defaults: name`。加载器按字段路径到项目的 `configs/<字段路径>/<name>.yaml` 查找。字典递归合并，显式值优先，数组和 `null` 整体替换。默认文件缺失会告警，同一文件在一次加载中只提示一次。
+- 每份 Batch 配置要求根部的 `seed` 和相同的 `device` 列表。`seed` 是无符号 32 位整数。依赖声明中的 `True` 表示整个子树，映射可细化到字段或序列下标。若训练读取学习率而准备数据只读取数据集，应由两个 Stage 分别声明。漏掉真正使用的配置项可能让缓存复用错误结果。[配置摘要](src/expman/core/dependencies.py)
 
-## 6. 观测契约
+## 哪些状态保存在哪里
 
-### 6.1 生命周期
+下表的路径相对于批次目录。默认 serializer 使用 pickle，快照和共享缓存属于需要一起保留的**可信本地记录**。Batch 恢复时从目录内的清单和配置重建实验。每次原子保存都生成新的修订标识，执行前持锁核对该标识，防止一个较早打开的会话覆盖后来保存的进度。
 
-每次 Experiment 尝试、Pipeline 或 Stage 执行产生一个开始事件和一个终止事件，使用相同 `execution_id`：
+| 位置 | 内容和使用者 |
+|---|---|
+| `batch.pkl`、`timing.pkl` | BatchStore 保存队列、活动成员、阶段游标、各次尝试、阶段历史和 Pipeline 签名。单独的 timing 记录批次累计墙钟时间与最近的有效 ETA。 |
+| `experiments/<run_id>/config.pkl`、`rng_initial.pkl` | 具体配置与 run 的初始随机状态。 |
+| `experiments/<run_id>/stages/<位置>/` | `status.pkl` 是阶段状态，`checkpoint.pkl` 是最近一次成功保存的中间进度，`completed.pkl` 是完成快照或共享节点引用。每次 Pipeline 调用所在路径还有用于校验定义的 `pipeline.pkl`。 |
+| `cache/<key>/<父节点>/<节点>/` | `snapshot.pkl` 保存大输出及状态，`metadata.pkl` 保存依赖、指标和耗时。调度器据元数据推进等价 run，下游 worker 再读取输出。 |
+| `metrics.sqlite3` | 同批次各 run 的持久化标量。主键是 run ID、阶段路径、step、指标路径。重试重新写同一点时更新值，省略 step 的汇总值使用 `-1`。 |
+| `experiments/<run_id>/attempts/stage-<i>/<尝试号>/` | worker 启动描述、输入和 `output.log`，可用来定位某次尝试的导入、启动或业务异常。 |
+| `live.json` | 当前或最后一次发布的观测快照，供独立进程展示。运行队列的恢复依据是 `batch.pkl`。 |
 
-```text
-running → succeeded | failed | cancelled
-```
+[批次文件](src/expman/storage/batch.py) · [原子写和互斥锁](src/expman/storage/base.py) · [阶段文件](src/expman/storage/run.py) · [共享前缀](src/expman/storage/prefix_cache.py) · [指标库](src/expman/storage/metrics.py)
 
-事件包含 run ID、尝试编号、执行 ID、父执行 ID、名称、执行种类和 UTC 时间戳。终止事件还包含耗时；失败事件记录异常类型和文本。指标和进度事件也带有尝试编号。
+**恢复从三个粒度看。** Batch 用 `BatchState` 区分待调度、已派发及每个 run 的下一阶段。恢复会检查清单和 Pipeline 签名，重新登记上次未收尾的活动成员。在 run 内，已有完成快照的阶段由 worker 恢复。中途失败的阶段从它最后一次成功写入的 checkpoint 开始。进程结束时才保存在内存中的对象需要由用户的 `process` 重建。[批次状态](src/expman/scheduling/state.py) · [托管执行](src/expman/core/execution.py)
 
-- 普通业务异常记为 `failed`，保留原异常继续抛出。
-- `KeyboardInterrupt`、`SystemExit` 等不属于 Exception 的 BaseException 记为 `cancelled`，继续抛出。
-- 子阶段失败或取消会使所在 Pipeline 以相应状态结束。
-- 进程被强制杀死时不能保证产生终止事件；恢复时依据持久化队列，将未结束尝试记为 cancelled，再从已成功写入的快照继续。
+**阶段位置决定恢复哪条记录。** 一个顶层 Stage 的位置是它在 Pipeline 中的索引。嵌套 Pipeline 在父位置后加上调用序号和子阶段索引。checkpoint 同步保存调用计数、位置、业务状态、累计阶段耗时、配置依赖和随机状态。一个训练循环多次调用同一个验证 Pipeline 时，各轮因此能找到各自的输出。临时文件写入、刷新并同步成功后才原子替换目标。完成快照提交后清理该阶段的 checkpoint。损坏或依赖不匹配的 checkpoint 会告警并退回阶段入口。无法读取本 run 已完成的输出则报告存储错误。
 
-Stage 名称允许重复。每次调用生成独立执行 ID，事件按调用顺序记录，支持同一 Stage 类在 Pipeline 中出现多次，每次使用独立实例。
+**何时可以共享。** 在同一批次内，缓存以 Pipeline 签名和 seed 分区。签名由各 Stage 类的模块名、限定名和可读取的模块文件摘要组成。查找时还要匹配上一步的共享节点、当前阶段位置、完整的依赖路径集合及各路径的值摘要。这样，即使两个训练阶段配置相同，也只有上游数据来自同一前缀时才会共享。run 自己已经开始的阶段优先恢复自己的工作。共享节点先写快照，再发布元数据。命中时目标 run 记录引用并恢复相应指标。外部数据文件的内容变化需要由业务配置体现。
 
-### 6.2 计时与进度
+清理缓存前需要确认哪些节点仍被 run 引用，即使批次已经成功，用户也可能再次读取最终输出。清理函数取得批次锁，扫描完成记录后只删除无引用节点。读取完成记录或校验共享引用失败时，清理会在删除前中止。[缓存清理](src/expman/observation/cleanup.py)
 
-使用 `time.perf_counter()` 测量持续时间，UTC 时间戳用于展示和关联。某个执行自己的开始、结束记录器调用不计入其持续时间；执行内部的指标上报、子阶段监测等开销包含在内。Pipeline 总耗时包含阶段间编排，因此通常大于各阶段耗时之和。
+**随机状态与计时。** 每个 run 根据 seed 初始化 Python、NumPy 和 PyTorch 全局随机生成器。CUDA 设备可用时也捕获各可见设备的状态。托管执行恢复已完成前缀的结束状态，并在有 checkpoint 时于调用 `process` 前重置到保存点。恢复会校验随机状态记录的格式、seed、CPU 状态与非空 CUDA 状态的设备数，应用失败时回滚。缺失或无效的随机状态会报错。用户自建的生成器和 DataLoader 子进程状态由用户保存。[随机状态实现](src/expman/core/randomness.py)
 
-自动计时观测主机端经过时间。GPU 异步任务如需测量设备完成时间，由业务阶段自行建立同步边界。
+批次墙钟时间剔除停机间隔，约每五秒保存一次。阶段 checkpoint 和完成快照都要求保存有限、非负的累计执行秒数。断点计时缺失或无效时会告警并从阶段开头重跑。已提交快照计时无效时读取报错。若在两个保存点之间失败，被丢弃的工作要重新执行。每次 worker 尝试的实测时长另计入调度历史和 run 的尝试摘要，因此排查重试开销应看尝试历史。[批次计时](src/expman/scheduling/batch.py) · [尝试收尾](src/expman/scheduling/scheduler.py)
 
-阶段内部进度由用户主动上报；`completed` 表示非负整数完成量，`total` 可未知，单位可以是 step、batch、epoch 或其他业务单位。已知总量时要求 `completed <= total`。事件记录器保存上报序列，不推断循环和进度重置语义。单个阶段有多个循环时，用户应定义清楚该阶段的统一进度口径。
+## 调度器如何使用 GPU 和主机内存
 
-### 6.3 记录器
+单个 run 按阶段推进，多个 run 可以并发，不同阶段尝试可落在不同卡上。一次尝试用 GPU UUID 绑定一张可见卡，业务代码可使用 `cuda:0`。Linux 上的 MPS 服务、主机内存限制和显存采样各有独立实现。[MPS 客户端核验](src/expman/resources/mps.py) · [主机 cgroup](src/expman/resources/limits.py) · [每进程显存采样](src/expman/resources/gpu_memory.py)
 
-`Recorder` 是具有 `record(event)` 方法的结构化协议。内置 `InMemoryRecorder` 保持事件的发送顺序。
+| 调度时的问题 | 对应源码 |
+|---|---|
+| 有哪些等价的工作可以复用？哪个阶段是候选？ | `StageWork` 按截至当前阶段的配置依赖和 seed 分组，根据历史为候选估计耗时、主机内存和显存。[阶段工作量](src/expman/scheduling/_stages.py) |
+| 现在还能放多少作业？ | 主进程读取 `/proc/meminfo` 和 NVIDIA 设备读数，扣除主机保留量及活跃 worker 尚未使用的预算。冷启动时主机和 GPU 的峰值估计均为 1 GiB。资源不足时暂缓派发，压力持续时按规则减载。[设备采样](src/expman/resources/devices.py) · [容量计算](src/expman/scheduling/_resource.py) |
+| 哪些作业放在哪张卡？ | `pack_candidates` 在每轮保留一组可行排布，根据剩余主机内存和各卡相对容量打分。准入消耗估计峰值。单个 worker 的主机或 GPU 硬上限另留余量。主机 cgroup 不能核验时可回退到进程用量采样，展示中会区分预算和已核验上限。[装箱逻辑](src/expman/scheduling/_planning.py) |
+| worker 报了什么？下一步如何处理？ | Worker 封装进程、IPC 消息和资源读数。普通失败按该 Stage 的重试预算处理。CUDA OOM 或主机限额终止用作需求下界，下一次重新估价。调度退出时回收 worker 进程组。[Worker](src/expman/scheduling/_process.py) · [调度循环](src/expman/scheduling/scheduler.py) |
 
-记录同步发生在业务线程中，慢记录器会增加执行耗时。记录器的普通异常通过 logging 输出并被抑制，业务结果保持原有语义；因此记录属于尽力交付，记录器故障时可能缺失事件。若需要可靠持久化，应由适配器设计缓冲、重试和落盘机制。
+ETA 同样按剩余的**阶段组**估算。耗时模型根据配置距离给成功样本赋权，在对数尺度上估计持续时间。被中断的样本只提供下界。峰值模型使用邻近配置的经验分位数。`estimate_parallel` 分别用耗时下界和上界推演各卡工作完成时刻，取两次排程完工时间中的较小值和较大值作为整批区间。观测不足时保留“未知”，页面只展示已发布的估计。[耗时模型](src/expman/estimation/duration_model.py) · [峰值模型](src/expman/estimation/memory_model.py) · [并行 ETA](src/expman/scheduling/parallel_estimation.py)
 
-内存记录器保留全部事件，适合小规模执行、示例和测试。长实验应控制上报频率，或接入持久化记录器。
+## 观测与查错入口
 
-## 7. YAML 配置与实验集合
+`expman status` 与归档页面从批次文件重建状态。实验主进程另有旁路线程，把在锁内读到的调度状态和阶段完成组数整理为实时快照并原子写入 `live.json`，写入失败不会中断实验。`expman web` 在独立进程内通过 HTTP 和 SSE 提供这些数据。读取端在批次停止管道可连接且快照足够新鲜时标为实时。历史快照早于最新批次清单或快照不可用时，从持久化记录重建。页面查询不会触发训练或资源调度。[归档读取](src/expman/observation/status.py) · [快照构建](src/expman/observation/snapshot.py) · [来源判定](src/expman/observation/archive.py) · [Web 服务](src/expman/webui/server.py)
 
-公共接口：
+CLI 的 run、resume 在持有批次执行锁期间监听 `stop.fifo`。Python 调用可在主线程通过 `handle_sigterm=True` 启用相同行为。CLI 和 Web 向管道写入请求后，内核向持有读端的进程发送 SIGTERM，调度器收尾并保存进度。Web 的 `--read-only` 禁用停止操作。[进程控制](src/expman/process_control.py)
 
-```python
-from expman import load_configs
+结果分析用 run ID 联结配置、尝试摘要及 SQLite 指标。一个指标优先采用汇总步，否则取该指标的最大 step。缺值按指标分别计数，失败或未完成的 run 计入覆盖度。数值参数可计算 Spearman 秩相关，类别参数按组汇总并计算效应量。[结果分析](src/expman/observation/analysis.py)
 
-configs = load_configs("experiment.yaml")  # list[dict[str, Any]]
-```
-
-一份实验 YAML 描述一个实验集合。每个展开后的配置字典对应一次 Run；没有控制键时集合大小为一。字段和层次由用户定义，加载器只处理格式与展开规则，参数的业务含义由用户代码校验。
-
-实验文档有四个可选的控制键：`combines`、`grid`、`scan` 与 `defaults`。四者都是框架保留键，在展开前移除，不进入 Run 配置；`combines` / `grid` / `scan` 只认根节点，`defaults` 可写在任意映射节点。
-
-### 7.1 展开控制面 `combines`、`grid` 与 `scan`
-
-三个控制键共用同一条形状规则：**列表表示该节点取其中一个值，映射表示继续往下走**。跑法由关键字决定，不再由形状推断：
-
-- **`combines`（整份方案）**：取值为映射的列表，每项是一棵稀疏覆盖，合并到文件之上后作为一个 Run；项与项之间不组合，项内的列表是普通数据。
-- **`grid`（笛卡尔积）**：列出的每个叶子都是轴，各轴同时变化，Run 集是它们取值的乘积。被列出的字段由 `grid` 接管，文件里的取值被替换。
-- **`scan`（单参数扫描）**：轴在 `scan` 内部声明，文件不必重复书写（写了也会被覆盖）。每条轴取自己列出的第一个值，它们的组合是**基准点**，先产出它，再让每条轴各自偏离一次，其余轴留在基准值。
-
-- 三个键可以叠加，嵌套关系由外向内固定为 `combines` → `grid` → `scan`：`grid` 与 `scan` 都作用在上一个键产出之后的文档上，Run 集是三层的乘积，内层变化最快。
-- 展开顺序由控制树的书写顺序决定，与数据字段的书写顺序无关，因此重排数据字段不改变 Run 编号；`grid` 多轴时最后一个轴变化最快。
-- defaults 解析后按结构去重：与已产出的 Run 相同的配置不再产出，去重跨层进行。
-- 覆盖在基准文档之上按路径打补丁，未列出的同层字段保持原值，所以扫描 `tip.rank` 不会丢掉 `tip` 的其它字段；展开后的每个 Run 都一定是映射。
-- `grid` 控制树里的键必须已存在于默认值合并后的文档中（因此 `combines` 新引入的字段可以成为它的轴），`combines` 的项与 `scan` 自己声明参数、不要求预先存在；`device` 不允许作为展开轴；控制树、列表与轴取值都不能为空，`grid` / `scan` 的叶子必须是列表，`combines` 的项必须是映射。
-
-### 7.2 默认配置发现与合并
-
-展开之前先解析 `defaults`。任何映射节点都可以带 `defaults: <name>`，按字段路径查找文件：
-
-```text
-models.forecasting.defaults: patchtst
-  → <项目根目录>/configs/models/forecasting/patchtst.yaml
-```
-
-文件内容作为默认映射，与当前节点合并：两侧均为字典时递归合并；其余情况由实验配置的值整体替换，包括列表和显式 `null`。合并后继续处理子节点，包括默认参数引入的嵌套查找。`defaults` 是从文档中移除的查找指令，不进入 Run 配置。
-
-根节点的 `defaults` 对应 `configs/<name>.yaml`。列表元素使用其所在字段路径，列表索引仅用于错误位置展示，不作为目录名。`defaults` 值和用于查找的字段路径分量必须是非空字符串，不能包含路径分隔符或使用 `.`、`..`；解析后的路径须位于配置根目录内。循环默认文件引用会报错。
-
-每次调用缓存已读取文件和缺失结果，避免随 Run 数重复读取或重复警告。缓存仅在本次调用内有效，返回结果不共享可变数据，也不修改文件。
-
-### 7.3 文件契约与错误
-
-- 使用 PyYAML SafeLoader 的独立子类，不修改全局 YAML 加载行为；实验文件和默认文件都要求单个 YAML 文档、映射顶层和字符串键，重复字段、合并键 `<<`、未知标签与循环锚点报错。
-- `combines`、`grid` 与 `scan` 只允许出现在实验文件中，默认文件出现其中任何一个都报错；`combines` 必须是列表且项为映射，`grid` 与 `scan` 必须是映射。
-- 普通非循环 YAML 锚点可用。
-- 缺失实验文件、已有文件解析失败、读取失败等抛出 `ConfigError`，包含来源路径；解析错误还携带 YAML 位置信息。
-- 缺失默认文件发出 `MissingConfigWarning` 并继续，同一次加载对同一路径只警告一次；调用方可使用 Python warnings 机制控制展示或提升为错误。
-
-`load_configs()` 一次性返回整个列表。加载失败时不返回部分结果；该接口负责解析配置，运行身份分配和执行队列由 Batch 与 Experiment 处理。
-
-## 8. Experiment 与 Batch
-
-`Batch` 是唯一执行入口；`Experiment` 是内部组件，由 Batch 与调度 worker 使用，不对外导出。每个顶层 Stage 在独立工作进程中经 `Experiment.run_stage()` 执行。
-
-```python
-pipeline = Pipeline([Impute, Forecast, Evaluate])
-batch = Batch(pipeline, cfg="experiment.yaml", max_retries=1)
-results = batch.run()
-```
-
-### 8.1 实验身份与隔离
-
-Experiment 保存一份具体配置、稳定的 `run_id` 和独立目录。首次执行从 `None` 输入开始；每次尝试使用新的上下文，复用已完成阶段的快照，并把待执行阶段最新可用的 checkpoint 交给 Stage 在执行入口恢复。只实例化仍需执行的阶段。
-
-阶段收到完整的 `ctx.cfg`，尝试编号 `ctx.attempt` 从 1 开始递增。`experiment.cfg` 返回配置副本，调用方不能通过该属性修改实验的初始配置。用户的类变量、模块全局变量、外部服务和文件不在实例隔离范围内。
-
-### 8.2 顺序队列与重试
-
-Batch 构造时加载 YAML，并按展开顺序创建 Experiment；也接受一份已解析的配置字典作为单成员集合。配置加载错误在执行前抛出。
-
-GPU 派发以顶层 Stage 为单位，重试候选优先，新的参数组合按同 Stage 历史的配置距离排序；联合装箱还要满足主机内存和显存合约。成功则完成；普通失败在重试预算未耗尽时重新入队。默认 `max_retries=1` 表示最多两次尝试；该参数必须为非负整数。
-
-Stage 构造异常采用同一重试策略，单个实验失败不终止整组。
-
-重试保留实验 ID、递增尝试编号，恢复已保存进度。业务阶段需要自行管理重复执行带来的文件或外部系统副作用。失败后仅保存错误类型和文本，不保存异常对象或 traceback；Batch 在失败后执行垃圾回收以释放不可达的用户对象。
-
-中断信号记录取消状态后继续抛出，立即停止队列；该实验保留在队首供恢复。中断后可通过 `batch.results` 查看部分结果。使用 `Batch.resume(pipeline, output_dir)` 从持久化队列恢复，中断次数不计入失败重试预算。每个 Batch 对象只执行一次。
-
-### 8.3 结果与观测
-
-`Batch.run()` 返回按配置顺序排列的 `tuple[ExperimentResult, ...]`，不受实际重试顺序影响。每个结果包含稳定 `run_id` 和全部 `AttemptResult`。
-
-AttemptResult 记录尝试编号、状态、耗时、输出及错误摘要。ExperimentResult 的状态和输出取最后一次尝试，耗时为全部尝试耗时之和；尚未执行时状态为 `pending`、输出为 `None`。结果是尝试历史的快照。输出不随结果常驻内存：AttemptResult 只保留摘要和最终阶段 SnapshotOutput，`output` 每次按阶段快照读取。因此父进程内存不随已完成实验数增长，中断后 `batch.results` 仍能读到全部输出，代价是每次访问都产生一个新的副本，修改不回写记录，重复使用需要调用方自行保存引用。
-
-Batch 默认使用一个内存 Recorder 收集所有实验事件，可传入自定义记录器。事件层次为 Experiment 尝试 → Pipeline → Stage，通过 `run_id`、`attempt` 和父子执行 ID 关联。记录器普通故障继续采用尽力交付语义，不将一次成功业务执行转为重试。
-
-## 9. 持久化与恢复契约
-
-默认以 `runs/<batch-id>/` 作为 Batch 目录。用户可指定新的 `output_dir`；已有目录通过 resume 打开，创建操作不会覆盖历史数据。
-
-```text
-<batch>/
-    batch.pkl                      配置清单、Pipeline 签名、队列、活动实验、尝试摘要
-    run.lock                       进程级互斥锁
-    experiments/<run-id>/
-        config.pkl                 最终配置，只保存一次
-        rng_initial.pkl            run 初始化后的随机状态
-        stages/
-            pipeline.pkl           当前流程签名
-            0/
-                status.pkl         框架维护的阶段状态
-                completed.pkl      返回值 + 状态量 + 随机状态的完整快照
-                checkpoints/
-                    000...001.pkl  状态量 + 进度 + 内部调用位置
-                    000...002.pkl
-```
-
-Stage ID 直接取局部位置 `0、1、2…`，名称只用于展示。嵌套流程使用父阶段位置、调用序号和子阶段位置形成数字路径；checkpoint 同步保存内部调用计数，避免恢复循环中的嵌套 Pipeline 时混用结果。
-
-阶段完成快照是返回值和状态量的单个保存事务。写入临时文件、flush/fsync 后原子替换目标路径，成功后才算完成。保存失败按普通阶段失败处理；未完成的临时文件不参与恢复。状态文件自动记录 running、succeeded、failed 或 cancelled，恢复复用时记录 reused 标记，执行事件也带有该标记和 stage_id。
-
-Checkpoint 由用户通过 `ctx.checkpoint(position, state)` 显式保存，只保留最新一份成功写入的记录。恢复发生在阶段执行入口：有可读 checkpoint 时框架重置随机状态到存档时刻，并把存档状态通过 `ctx.checkpoint_state` 交给 `process()`；`resume_range()` 从 `max(start, checkpoint 记录的位置)` 开始迭代。最新 checkpoint 损坏时 warning 并尝试上一份，两份都不可用则 `checkpoint_state` 为 None，`resume_range()` 从 `start` 开始。已完成阶段快照损坏会报 StorageError，避免静默传递错误的阶段输入。
-
-Batch 清单原子记录待执行队列、当前活动成员及尝试摘要。Ctrl+C 会将当前成员放回队首并保存取消记录；进程突然结束时，resume 根据活动成员补记中断尝试，其未知耗时记为 0。已完成成员保持完成，失败预算依据已持久化的 failed 尝试数计算。快照和清单不能构成跨文件的单次事务；若进程在结果保存后、清单更新前结束，恢复会复用已保存阶段结果补完该实验。
-
-恢复读取保存的配置而非原 YAML，并校验阶段类、顺序及可获取的源码摘要；默认模块和类标识不等同于完整依赖环境指纹。实例已加载后如果清单被另一执行者更新，会拒绝使用陈旧队列。运行期间持有操作系统锁，进程退出后锁自动释放。
-
-默认 PickleSerializer 保存可 pickle 的 Python 对象，加载只适用于可信文件和兼容的依赖、设备环境。Serializer 协议允许替换 dump/load，创建与恢复时须使用匹配的实现。用户负责通过 `ctx.checkpoint()` 显式保存 model/optimizer 等状态；独立随机生成器和数据位置等业务状态也由用户保存；框架不会自动捕获活跃模型的内部执行状态。配置中的字典、列表、集合转换为只读包装，任意可变业务对象应定义为状态量。
-
-这里的状态快照与清单用于恢复，Recorder 事件仍由用户选择存储适配器；默认内存 Recorder 不提供跨进程指标历史。
-
-## 10. 扩展顺序
-
-以下为后续需求，具体 API 和实现将在对应迭代确定：
-
-| 层次 | 候选能力 | 需要先明确的契约 |
-|---|---|---|
-| 运行查询 | 指标历史、日志、产物检索与对比报告 | 查询与事件存储 schema |
-| 批量运行环境 | 机器环境覆盖、本地验证与远端运行 | 运行环境及进程边界 |
-| 恢复扩展 | 保存器集成、异步保存及跨环境迁移 | 数据一致性、依赖环境及外部副作用 |
-| 数据复用扩展 | 跨 Batch 共享产物 | 外部输入版本与缓存清理策略 |
-| 时间估计扩展 | 并发环境校正、跨 Batch 校准与预算判断 | 环境可比性、资源竞争观测和实际覆盖率 |
-| 调度与资源扩展 | 真实 GPU 工作负载校准、设备迁移策略 | 资源竞争和不同设备上的恢复兼容性 |
-| 展示与集成 | CLI 状态、对比报告、通知、远端后端 | 查询接口、事件订阅、外部系统适配 |
-
-缓存匹配需要覆盖输入及相关配置、阶段版本和随机性。恢复训练需要用户提供模型、优化器、独立随机生成器及数据迭代位置等状态，不能由通用阶段计时自动推导。ETA 的精度需通过实际实验验证，随观测增加也可能修正此前估计。
-
-扩展时优先增加独立服务或适配器，保持 Stage 的业务接口稳定。
-
-## 11. 验证与演进
-
-0.1.0 的行为测试覆盖顺序执行、对象传递、空管道、异常与取消、重复实例、运行隔离、嵌套作用域、指标与进度校验、记录器故障隔离和计时。
-
-配置测试覆盖候选组合、分支独立性、普通列表、模型切换、默认合并、文件路径解析、缺失警告、错误输入和 Run 数据隔离。
-
-批量与恢复测试覆盖队尾顺序、尝试预算、阶段复用、只读配置、状态量恢复、单份 checkpoint、阶段完成后不留 checkpoint、损坏回退、保存失败、进程锁、Pipeline 匹配，以及独立子进程的 SIGINT 和突然退出恢复。
-
-版本记录见 [CHANGELOG.md](CHANGELOG.md)，开发和 Git 约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
-
-## 数值指标持久化
-
-`RunContext.log_metrics(mapping, step=None)` 在受管阶段中提供同步持久化接口。`metrics.py` 负责整树校验、路径编码和 SQLite 事务写入；Experiment 注入存储服务，Batch 在创建及恢复时为全部实验指定同一个 `metrics.sqlite3`。连接按调用关闭，不进入 checkpoint 或阶段快照。
-
-`metrics` 表字段为 `run_id`、`stage_path`、`step`、`metric_path`、`value`、`attempt`、`updated_at`。前四项构成主键；位置路径与指标路径使用 JSON 数组文本，汇总 step 使用非空哨兵值 `-1`。指标值保存为 REAL，更新时间为 UTC ISO 8601。UPSERT 只更新传入的叶子指标，恢复不删除历史行。执行次数是最近一次写入的元数据，不参与唯一键。
-
-所有叶子先验证为有限实数，再开始同一次调用的事务。数据库写入错误包装为 `StorageError` 并传播给阶段，触发已有失败及队尾重试机制。SQLite 指标事务与阶段快照、队列清单分别提交；快照失败后已提交指标保留，重试以相同唯一键覆盖。可选 Recorder 的错误隔离策略继续只适用于观测事件。
-
-## 批次时间估计与调度
-
-`Batch.estimate(coverage=None) -> TimeEstimate` 根据尚未物化的顶层 Stage 组估计 GPU Batch 的剩余完工时间。每个 Stage 在 log 尺度上用核加权几何均值预测耗时，并由留一残差的 conformal 顺序统计量给出乘性区间；距离按声明配置项等权、类别项按 one-hot 组计一次，被中断的样本只进入下界一侧。运行中的 Stage 按上下界分别扣除已运行时间，再把待执行工作装入当前各卡并发槽位，两遍装箱得到 makespan 包络。没有成功耗时样本或无可用槽位时返回未知；所有工作完成时返回零。覆盖参数保留在 Batch 清单中，默认 0.8。
-
-候选选择优先处理重试，然后按同 Stage 已采样配置的距离覆盖异质参数。联合装箱以主机内存和各卡显存的剩余资源为主要评分，参数距离只打破资源效果接近的平局。后台线程刷新 ETA 并保存累计墙钟时间。
-
-## 多卡进程调度
-
-YAML 顶层 `device` 是 Batch 级必填的非空、非负且不重复的 NVIDIA GPU 编号列表，所有展开成员一致；不能作为 `grid` 或 `scan` 的轴。GPU 分配不改写只读 `ctx.cfg`；子进程启动前用 GPU UUID 设置 `CUDA_VISIBLE_DEVICES`，同一实验只使用一张卡。
-
-`GpuScheduler` 在主进程持有 Batch 锁并管理多个独立解释器；单个实验的每次尝试使用新的进程组。bootstrap 先安装父进程 EOF 监听，再导入用户模块和反序列化 Pipeline/Serializer。入口脚本的顶层 Stage 可复用，主入口必须有 main guard；局部类和闭包不满足默认进程传输契约。工作进程持有实验目录锁，避免同一实验快照被两个执行者写入。
-
-调度任务是一个顶层 Stage。调度器只派发尚未完成的目标 Stage；子进程在进入目标前恢复已有前缀快照，禁止隐式执行缺失的上游 Stage。完成消息携带 StageResult（状态、耗时）和 Stage 声明的配置依赖；普通 Recorder 事件也通过同一私有 socket IPC 传输。调度器每个 tick 读取全局主机与整卡显存，消费 worker 资源线程通过同一条 IPC 消息上报的内存和显存采样；worker 以物理 GPU UUID 和自身 PID 查询 NVIDIA 计算进程，但不逐个查询 worker 的 `/proc` 或 cgroup；仅在 worker 已退出而 IPC 来不及报告 cgroup OOM 时读取一次该 cgroup 的事件计数。
-
-每个顶层 Stage 使用独立的耗时、主机峰值和显存峰值模型。特征为滚动累积的声明依赖路径：所有上游 Stage 声明的路径与当前 Stage 声明的路径共同组成输入身份；此前缀相同即上游输入相同。依赖在派发前由 `Stage.config_dependencies(cfg)` 计算，因此冷启动也直接按声明路径选择异质组合，不需要探查阶段；有样本时从资源可行候选中选择与同 Stage 样本距离最大的配置。估计取同 Stage 最近配置的保守经验分位数，样本不足时取整个 Stage 的分位数；因此不会因稀疏高维数据向未采样区域产生无界外推。三个模型共用同一种配置距离：按声明的配置项等权平均、每个变量归一到 1 以内，因此一个变量无论展开成多少列都只占一份权重，候选排序和近邻选择不会因编码宽度而改变。模型缓存只在新的 Stage 完成时失效，tick 的瞬时资源报告不会训练模型。
-
-无样本的 Stage 以探测方式运行：预留量取设备的 1/4（`PROBE_SHARE`），下限取 1 GiB 默认值，也不低于本 Batch 已观测并按截断倍率抬高的最大主机峰值（`probe_cap_kb`）。探测取代了旧版冷启动把整个 Batch 压到单并发推进的串行规则；探测互相并行，同时启动几个由装箱算术决定。准入按裸的峰值估计计价：主机要求 `MemAvailable - HOST_RESERVE_KB` 足以覆盖新 Stage 的估计和所有运行 worker 尚未用到的估计部分，GPU 按整卡空闲显存及同卡 worker 尚未使用的估计部分计算。每个 cgroup `memory.max` 是模型峰值的 110%，MPS 客户端显存上限取相同的余量与启动下限，并受物理卡容量约束。这 10% 因此是单个尝试被允许超出的范围，而不是装箱可以重复花费的容量；把余量也算进准入会让每张卡常驻一段从未被使用的内存。拒绝申请或接近上限时，样本只按固定倍率作为有限的下界并抬升同一组合的重试估计。每次尝试在用户代码之前核验 MPS 客户端身份，驱动按本次限额拒绝超额分配。驱动采样缺失时，该卡暂停追加派发。
-
-没有显存比例门槛或 CUDA OOM 的整卡 gate。CUDA OOM 触发预算重估；历史以本次上限为有限下界，下一次采用提高后的上限重试而不消耗用户失败次数。每 tick 使用整卡空闲显存及运行 worker 尚未使用的估计部分重新做联合装箱，因此扩大后的上限只有在资源确实可用时才派发。主机读数紧张/失败仍使用全局 HostGate 减载最新 worker。GPU UUID 变化或设备缺失属于不可恢复的一致性错误。
-
-主进程在创建 worker 前原子保存活动 Stage、Stage 尝试编号与队列状态；Stage 快照/checkpoint 和 SQLite 指标仍由子进程写入。完成 IPC 驱动主进程更新 Stage 历史、最终 ExperimentResult、设备/并发历史和队列。硬退出时父进程 EOF 监听清理进程组；resume 对活动 Stage 补记中断并从相应 Stage 重试。真实 NVIDIA 验证仍应在可访问 GPU 的 uv 环境执行。
-
-
-## 随机数生命周期
-
-根部 `seed` 是 run 级必填框架参数，只接受 uint32 范围整数。Batch 在创建目录前验证每份配置，Experiment 也独立验证。`RandomStateManager` 在尝试开始时加载 Python、NumPy/PyTorch；首次执行设种子并原子保存 rng_initial.pkl，之后的尝试读取该记录。依赖损坏等导入错误继续传播。GPU 子进程已在导入这些库前绑定可见设备。
-
-RunStore 的运行期 rng 服务负责为完成快照/checkpoint 加入独立 rng_state 字段。状态包含格式版本、有效 seed、Python 状态、NumPy 全局状态（普通标量/列表）、PyTorch CPU/CUDA 状态（bytes 列表）；与状态量同文件保存但字段独立，不将库模块或运行期管理器序列化。公开 seed_everything() 提供相同的初始化行为。
-
-Pipeline 复用已完成阶段时恢复其结束随机状态；有 checkpoint 时框架把随机状态重置到 checkpoint 存档时刻，`process()` 通过 `ctx.checkpoint_state` 接收业务状态，其之前的随机数消耗不计入续跑序列。无有效 checkpoint 时通过初始状态与上游完成快照重建阶段入口。状态恢复先校验 Python/NumPy/CPU 生成器及 CUDA 数量，应用失败时回滚到应用前随机状态，使候选 checkpoint 回退不会残留部分恢复结果。随机状态保存故障与对应业务快照保存故障同样视为阶段失败。
-
-旧记录缺少 rng_state 时 warning 后保留业务恢复兼容性，不承诺随机连续。新的初始记录和已完成记录随机状态损坏不静默重置种子。随机库/可见 CUDA 设备需兼容；独立生成器、子数据加载进程、process 内部的模型重建逻辑和确定性算法选择仍由业务代码负责。当前实现为单个 run 的随机状态初始化与恢复，跨实验前缀共享另行实现。
-
-## 同 Batch 连续前缀缓存
-
-Batch 为各 Experiment 和 GPU worker 提供同一个 cache 根目录。Pipeline 在阶段入口先检查本 run 完成记录，再查询共享节点；第一次未命中后关闭后续共享查询。已执行节点的本地引用记录 shared_reused=False，重试时沿用该边界。已有阶段状态或 checkpoint 表示本 run 已进入阶段，优先恢复自己的进度。
-
-`Stage.config_dependencies(cfg)` 由用户显式声明依赖，声明与配置树同构：节点为 `True` 表示依赖该子树，为映射则递归到子键（序列用整数下标），缺省或 `False` 表示不依赖，返回 `True` 表示依赖完整配置。声明接收只读的 `cfg`，因此可以按取值选择分支；默认返回 `True`，读取 `ctx.cfg` 却未重写该方法的 Stage 因此保守地依赖完整配置。框架把声明解析为路径集合并对路径的完整值计算摘要（`dependencies.py`），不再在运行时追踪读取、也没有探查阶段。前缀身份是所有上游 Stage 声明与当前 Stage 声明的并集；嵌套 Pipeline 的依赖由外层 Stage 的声明覆盖。checkpoint 与完成快照保存当前声明的依赖，恢复时校验格式及配置值。旧 checkpoint 若携带早期运行时追踪的依赖记录，仍按该记录匹配；由于摘要方案已规范化，这类记录通常不匹配并按损坏回退到重跑。
-
-PrefixCache 使用 Pipeline 签名与根 seed 隔离树；树边包含阶段位置、声明的配置依赖与不可变 UUID 节点。snapshot.pkl 原子写入完成后才发布 metadata.pkl，读者只扫描已发布元数据。节点保存输出、state、随机状态及数值指标。本地完成记录引用节点，恢复时重新反序列化以隔离可变对象。候选损坏时 warning 并重新计算；本 run 已提交引用损坏则按恢复错误处理。
-
-共享命中将指标复制到当前 run，再提交本地完成引用。指标 UPSERT 允许中途退出后重放。旧格式本地快照仍能恢复，但缺少共享父节点身份的后续阶段只保存本地快照。并发发布使用独立节点，允许重复计算，不等待其他生产者。
-
-## 可恢复的阶段诊断计时
-
-每个阶段的完成快照及 checkpoint 都包含 `elapsed_seconds`（秒）。构造 Stage 之前启动单调时钟；保存时将恢复的累计值与本次执行时长相加，与进度写入同一原子记录。计时字段由框架管理，不占用状态量。
-
-例如 checkpoint 记录 100 秒，随后运行 20 秒后中断；恢复后再运行 30 秒完成，阶段快照记录 130 秒。没有 checkpoint 的失败阶段重跑时从零计时。停机时间和恢复检查点的加载时间不计入累计值。保存时取写入前的时间截点，因此当前保存操作的耗时不在该记录内；不中断继续运行时，它会进入下一次记录的执行时长。嵌套阶段独立计时，外层耗时包含内层执行，不能直接将各层耗时相加。
-
-共享复用保留源快照的 elapsed_seconds，本 run 的 status.pkl 另存 restore_seconds，覆盖查找、加载及恢复操作（截至写入状态之前）。正常完成的 status.pkl 同步记录阶段累计耗时。旧快照缺少计时字段时视为未知，续跑后的累计值保持 None，避免把部分时长当作完整历史。损坏的 checkpoint 计时字段触发与 state 相同的回退流程。
-
-Batch 的尝试耗时与剩余时间估计保持原有规则，仍计入真实的失败、中断执行消耗。阶段计时用于实验诊断。
-
-命名默认配置统一位于项目根目录的 `configs/`。项目定位按实验 YAML 的祖先目录、当前工作目录的祖先目录依次查找，取首个包含 `pyproject.toml` 文件或 `.git` 标识的目录。Git worktree 的 `.git` 文件同样有效。找不到项目标识时，命名配置加载抛出 ConfigError；没有 name 的纯配置无需定位项目。
-
-GPU 显存查询使用内部默认超时 3 秒。实测该查询在 WSL2 单卡机器上按调度节奏运行 300 次：中位 53 毫秒、p99 300 毫秒、最坏 620 毫秒；宿主机 CPU 满载时中位 143 毫秒、最坏 915 毫秒。超时取观测最坏值的约三倍，既避免误判为内存不足（会误杀运行中的尝试），又把驱动卡死时的单个 tick 限制在 3 秒。`nvidia-smi` 先从 PATH 解析，失败时回退到 WSL2 的 `/usr/lib/wsl/lib/nvidia-smi`，因为 WSL2 默认不把该目录加入 PATH。主机内存读数与显存查询在同一个调度 tick 内完成，任一路径失败、超时或返回无效数据都按主机内存不足处理：清除旧读数、发出 RuntimeWarning、暂停派发（有多个尝试在跑时撤销最近启动的一个，带冷却），下一个 tick 重新查询，调度不因查询失败终止。`/proc/meminfo` 缺失、字段不全或数值超范围都会进入该路径，不使用可能造成误减载的近似值。GPU 身份改变属于不可恢复的设备一致性错误。上述参数由框架内部定义。
-
-Batch 的累计墙钟时间与最近有效剩余时间区间原子保存在 `timing.pkl`。运行期间约每 5 秒更新一次，正常结束或捕获中断时再保存；关闭 CLI 仍记录。`Batch.elapsed_seconds` 返回跨 resume 累计运行时间，排除两次运行之间的停机时间，并行实验不重复累计。突然退出只能恢复最近成功保存的累计值。GPU 恢复初期尚无可用调度数据时，直接显示保存的同覆盖率预测区间，取得有效数据后更新。旧目录缺少 timing.pkl 时无法还原历史墙钟时间，从零开始累计；原有实验耗时及并发历史仍用于重新估计。
-
-GPU 派发按 Stage 的异质配置距离生成候选，再联合主机内存和各卡显存选择装箱计划。CLI 读取最近有效 ETA，后台计时线程刷新默认覆盖率的预测并保存；显式调用 `Batch.estimate()` 即时计算。
-
-## 工作进程环境
-
-每次尝试都是一个独立解释器，用户代码与所有数值库都在其中导入，所以线程上限与 HF 端点由框架在启动 worker 时写入环境，不要求项目自行声明。线程上限取固定值（`environment.WORKER_THREADS`）而不按机器核数或当前并发折算：它的目的是限制多个并行尝试合计对 CPU 的占用，固定值使同一配置的每次尝试都在同一预算下计时，耗时样本才可比。shell 已导出的 `*_NUM_THREADS` 视为项目自行决定线程预算，框架整组不再设置——只覆盖其中一部分会让各库的线程数彼此不一致。`HF_ENDPOINT` 只在未设置时写入镜像地址，下载路由因此仍可被部署环境覆盖。写入的值随 `bootstrap.pkl` 落在尝试目录，供事后诊断；`EXPMAN_THREADS` 的非法取值在构造 Batch 时报错，此时输出目录尚未创建、也没有启动过任何尝试；调度器在一次运行开始时再解析一次，取值因此对每次运行都是当前的。
-
-## 运行看板（WebUI）
-
-看板是一个**独立进程**（`expman web`），不与任何实验进程耦合：它在回环地址上起一个 HTTP + Server-Sent Events 服务，启动即扫描 `runs/` 下的全部批次，可先于或晚于实验启动，实验结束后继续服务。静态页面与脚本由标准库交付、不引用外网资源；接入看板不需要新增依赖，也不改变 `Batch` 的公开接口。
-
-**两级页面。** `/` 是批次列表（ID、名称、状态、run 计数、阶段进度、已用/剩余时间），`/b/<id>/` 是单批次详情；SSE 端点 `/api/stream?batch=<id>` 只序列化被订阅批次的快照，避免每 tick 全量序列化所有批次。停止按钮走唯一写操作 `POST /api/stop/<id>`，`--read-only` 时返回 403，`/api/health` 的 `stop` 字段告知前端是否显示。
-
-**两个生产者，一种形状。** 逐卡实时内存（`_gpu_running_info`、`_device_memory`）与计划（`_schedule_view`、`last_plan`）只在实验进程内存、不落盘；`batch.pkl` 事件驱动写入、长 Stage 期间静止，`timing.pkl` 约每 5 秒落盘。为了让独立看板也能看到实时指标，运行中的批次由实验进程内的旁路线程把 `build_snapshot()` 的结果约每秒原子写入 `runs/<目录>/live.json`（临时文件 + `os.replace`）；看板把 `live.json` 与持久化记录合并成**同一种形状**，因此「运行中」与「已停止」只是同一渲染路径的两种数据来源。心跳默认开启（`EXPMAN_LIVE=off` 可关），写入失败全静默，绝不回到实验；批次结束不删除 `live.json`，其内容即停止前的最后真实状态。
-
-**三种来源。** 每个批次按 PID 存活与 `live.json` 新鲜度（`STALE_SECONDS`）判定：`live`（PID 存活且快照新鲜，实时面板可用）、`last`（进程已退但留有快照，显示停止前最后读数）、`archive`（只有持久化记录，实时面板置空）。状态收敛为 `running` / `stopped` / `finished` / `failed`。
-
-**只读与单写者。** 写 `live.json` 的线程与调度器同进程，只在 `batch._state_lock` 下拷贝调度器已发布的状态（队列、活动表、阶段历史、设备与主机内存读数、`_schedule_view`、`last_plan`、事件环形缓冲），其余派生计算全部在锁外对这些副本进行。它绝不调用会懒建模型、记录样本或改动准入的内部入口（`_launch_plan` / `_stage_peak` / `_stage_duration`），因此发布的快照不会改变调度决策。看板进程自身是纯读者：不导入 Pipeline 类、不执行用户代码，只在需要时读取上述文件。`build_snapshot` 整体包裹：呈现层抛出的任何异常都降级为一条 `degraded` 负载继续推送，不会回到实验。测试用 `test_a_snapshot_never_fits_a_model` 固化「快照不训练模型」这一约束。
-
-**观测 vs 估计。** 页面上每个资源读数都带 `age_seconds`：它是该观测被采集到现在的秒数。显存与主机内存由调度器每个 tick 采样，读数陈旧时前端转灰，避免把冻结的数字当成实时值。所有派生量都取自调度器已经算过的结果：Batch 级剩余时间取 `_display_estimate()`（CLI 显示的同一区间），不做第二次拟合；阶段剩余时间由「剩余组数 × 该 Stage 单组耗时区间」给出，其中单组中位区间由 `estimate_parallel` 在原有计算里顺带发布到 `_schedule_view`，而不是看板自己推断。下个 tick 的计划同样由调度侧在 `_launch_plan()` 里发布成 `last_plan`，看板只读，不预演调度。仅归档批次没有实时样本，其阶段区间退化为按已到达该阶段的 run 计数近似（`approximate: True`）。
-
-**结果分析。** `analysis.py` 离线拼接一张 Run × 配置项 × 指标的宽表：`batch.pkl` 给 Run 清单、状态与累计尝试耗时，`experiments/<run_id>/config.pkl` 给自变量（`batch.pkl` 不含配置，必须逐 Run 读取），`metrics.sqlite3` 给因变量——同一指标优先取 `step=-1` 的汇总值、否则取最大 step，同名指标出现在多个 Stage 时加 `S<index>.` 前缀消歧。耗时以 `run_duration_seconds` 伪指标参与分析。局部结果是一等公民：配置不可读的 Run 记为 skipped(原因) 而不失败，失败/未完成的 Run 按状态排除并计入覆盖度（`runs_total` 含全部 manifest Run），每个指标各自计 `n`、缺值 Run 按 pairwise 跳过。分析方法刻意简单：数值项（≥3 个不同取值）给 Spearman 秩相关、绝对值即影响力；其余按取值分组，影响力取组间平方和占总平方和之比（η²）；常量项与样本不足项（有效点 < 3、类别组 < 2）跳过并显式标注，每组只有一个样本时只列均值不算 η²。指标与配置项都按影响力排序。`GET /api/analysis/<id>` 在请求线程上同步计算，按批目录的 mtime 指纹（manifest、指标库、每个 `config.pkl`）缓存；分析不导入用户代码、不做显著性检验、不主张因果。
-
-**停止按钮。** 默认开放；`--read-only` 时关闭 `POST /api/stop`。服务端先应答再读 `expman.pid` 发送 `SIGTERM`，复用既有调度器的 `except BaseException` 清理路径，退出码 143、与 `expman stop` 一致。绑定地址默认仅回环，暴露到网络需显式传 `--host`。
+| 你遇到的现象 | 建议先读的行为测试 |
+|---|---|
+| 输入输出、事件父子关系或停止位置异常 | [Pipeline 测试](tests/cpu/test_pipeline.py) |
+| retry 后跑错步、状态冲突或随机序列改变 | [断点与恢复测试](tests/cpu/test_stage_loop.py) · [RNG 测试](tests/cpu/test_randomness.py) |
+| 配置数量或合并结果与预期不同 | [配置展开测试](tests/cpu/test_config.py) |
+| 想验证真实的 CLI → MPS → CUDA 计算，以及重试、主动停止与恢复 | [真卡批次测试](tests/gpu/test_cuda_batch.py) |

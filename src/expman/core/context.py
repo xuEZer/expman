@@ -1,6 +1,5 @@
 """Run-scoped services and nested execution observation."""
 
-import logging
 import math
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -13,11 +12,9 @@ from uuid import uuid4
 
 from expman.core.events import Event, ExecutionEvent, MetricEvent, ProgressEvent, Status
 from expman.core.frozen import freeze
-from expman.core.recorders import InMemoryRecorder, Recorder
-from expman.storage.base import Checkpoint, RunStore
+from expman.core.recorders import InMemoryRecorder, Recorder, record_event
 from expman.storage.metrics import MetricStore, flatten_metrics
-
-_logger = logging.getLogger(__name__)
+from expman.storage.run import Checkpoint, RunStore
 
 
 def _now() -> datetime:
@@ -59,9 +56,7 @@ class RunContext:
     _store: RunStore | None = field(default=None, kw_only=True, repr=False)
     _stage_path: tuple[int, ...] = field(default=(), kw_only=True, repr=False)
     _checkpoint: Checkpoint | None = field(default=None, kw_only=True, repr=False)
-    _checkpoint_record: dict | None = field(default=None, kw_only=True, repr=False)
     _pipeline_calls: dict = field(default_factory=dict, kw_only=True, repr=False)
-    _explicit_checkpoint_used: bool = field(default=False, kw_only=True, repr=False)
     attempt: int = field(default=1, kw_only=True)
     _execution_id: str | None = field(default=None, repr=False)
 
@@ -79,10 +74,7 @@ class RunContext:
         return self._execution_id
 
     def emit(self, event: Event) -> None:
-        try:
-            self.recorder.record(event)
-        except Exception:
-            _logger.warning("Recorder failed for run %s", self.run_id, exc_info=True)
+        record_event(self.recorder, event)
 
     @contextmanager
     def observe(
@@ -213,18 +205,8 @@ class RunContext:
 
     @property
     def checkpoint_state(self) -> Any:
-        """The state carried by the latest checkpoint, or None from scratch.
-
-        A state saved through ``checkpoint()`` with a non-dictionary value is
-        unwrapped transparently; dictionary states are returned as-is.
-        """
-        record = self._checkpoint_record
-        if record is None:
-            return None
-        state = record.get("state")
-        if isinstance(state, dict) and set(state) == {"__payload__"}:
-            return state["__payload__"]
-        return state
+        """The state carried by the latest checkpoint, or None from scratch."""
+        return None if self._checkpoint is None else self._checkpoint.state
 
     def resume_range(self, start: int, stop: int):
         """Iterate from ``start`` to ``stop``, resuming from the checkpoint step.
@@ -237,32 +219,12 @@ class RunContext:
         stop = _nonnegative_integer(stop, "resume_range stop")
         if start > stop:
             raise ValueError("resume_range start must not exceed stop")
-        record = self._checkpoint_record
-        resume_step = start
-        if record is not None:
-            step = record.get("step")
-            if step is not None:
-                resume_step = max(start, _nonnegative_integer(step, "checkpoint step"))
-        if resume_step >= stop:
-            return iter(())
-        return iter(range(resume_step, stop))
+        if self._checkpoint is not None:
+            start = max(start, self._checkpoint.step)
+        return iter(range(start, stop))
 
     def checkpoint(self, position: int, state: Any) -> None:
-        """Persist an explicit checkpoint at ``position`` with the given ``state``.
-
-        ``state`` may be any value; non-dictionaries are wrapped internally so
-        the storage format stays uniform.  The user owns the loop and decides
-        what to save and when.
-        """
+        """Persist the stage's state and the position to resume from."""
         if self._checkpoint is None:
             raise RuntimeError("checkpoint() requires a managed Stage context")
-        position = _nonnegative_integer(position, "checkpoint position")
-        stored_state = state if isinstance(state, dict) else {"__payload__": state}
-        self._checkpoint.save(step=position, state=stored_state)
-        # Keep the in-memory record in sync so the completed snapshot can use
-        # the latest explicit state without re-reading disk.
-        record = dict(self._checkpoint_record) if self._checkpoint_record else {}
-        record["step"] = position
-        record["state"] = stored_state
-        object.__setattr__(self, "_checkpoint_record", record)
-        object.__setattr__(self, "_explicit_checkpoint_used", True)
+        self._checkpoint.save(step=position, state=state)

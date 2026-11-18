@@ -106,7 +106,7 @@ wheels = [
 
 [[package]]
 name = "expman"
-version = "0.1.0"
+version = "0.1.1+fixed1g"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },

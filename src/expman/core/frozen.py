@@ -96,5 +96,5 @@ def freeze(value: Any) -> Any:
     ):
         return value
     raise TypeError(
-        f"mutable configuration object {type(value).__name__}; declare runtime objects as Stage state variables in init"
+        f"unsupported configuration value {type(value).__name__}. Construct runtime objects in Stage.process()."
     )

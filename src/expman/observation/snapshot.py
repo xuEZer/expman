@@ -1,0 +1,475 @@
+"""Build the dashboard snapshot from the current batch and scheduler observations.
+
+Under the batch state lock, collect group completion, the current ETA, and
+copies of worker and batch state. Build the resource tables and timeline
+after releasing the lock. An error during collection or rendering produces a
+degraded snapshot.
+"""
+
+import math
+from copy import copy
+from time import perf_counter, time
+
+from expman.core.events import Status
+from expman.estimation.estimate import valid_seconds
+from expman.observation.status import run_counts
+
+SCHEMA = 1
+
+
+def number(value):
+    """Convert a finite integer or float to a float for JSON output."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number_value = float(value)
+    return number_value if math.isfinite(number_value) else None
+
+
+def age(stamp):
+    """Seconds since an observation was taken, or None when unknown."""
+    moment = number(stamp)
+    return None if moment is None else round(max(0.0, time() - moment), 3)
+
+
+def remaining_interval(estimate):
+    """The remaining-time interval shared by live and archived views."""
+    if estimate is None:
+        return None
+    return {
+        "lower_seconds": number(estimate.lower_seconds),
+        "upper_seconds": number(estimate.upper_seconds),
+        "coverage": number(estimate.coverage),
+        "samples": estimate.completed_samples,
+        "remaining_groups": estimate.remaining_experiments,
+    }
+
+
+def _remaining(batch):
+    """The current batch interval from the latest scheduler estimate."""
+    try:
+        estimate = batch._display_estimate()
+    except Exception:
+        return None
+    return remaining_interval(estimate)
+
+
+def _last_attempt_status(experiment):
+    """The status of a run's latest attempt, or None before its first one."""
+    attempts = experiment._attempts
+    return attempts[-1].status if attempts else None
+
+
+def _worker_progress(event):
+    if event is None:
+        return None
+    return {
+        "completed": event.completed,
+        "total": event.total,
+        "unit": event.unit,
+        "stage_id": event.stage_id,
+    }
+
+
+def _workers(window, names, now):
+    """One entry per running attempt: what it holds, what it was charged, its span."""
+    workers = []
+    session_start = max(window["marks"], default=0.0)
+    for run_id, worker in window["workers"].items():
+        elapsed = max(0.0, window["sampled_at"] - worker.started)
+        expected = worker.expected
+        limit = worker.limit
+        verified = bool(getattr(limit, "verified", False))
+        host_cap = worker.host_limit_kb
+        if host_cap is None:
+            host_cap = getattr(limit, "cap_kb", None)
+        host_cap = number(host_cap) if verified else None
+        if host_cap is not None and host_cap <= 0:
+            host_cap = None
+        stage_index = worker.stage_index
+        usage_source = worker.host_usage_source
+        usage_known = usage_source != "unavailable"
+        workers.append(
+            {
+                "run_id": run_id,
+                "run": run_id[:6],
+                "stage_index": stage_index,
+                "stage": names[stage_index] if stage_index < len(names) else None,
+                "attempt": worker.stage_attempt,
+                "device": worker.device,
+                "uuid": worker.uuid,
+                "elapsed_seconds": round(elapsed, 1),
+                "started_at": round(now - elapsed, 1),
+                "start_seconds": round(
+                    max(session_start, window["elapsed"] - elapsed), 2
+                ),
+                "end_seconds": round(window["elapsed"], 2),
+                "expected": None
+                if expected is None
+                else {
+                    "lower_seconds": number(expected.lower),
+                    "center_seconds": number(expected.center),
+                    "upper_seconds": number(expected.upper),
+                },
+                "host": {
+                    "reserved_kb": number(worker.host_reserve_kb),
+                    "resident_kb": number(worker.resident_kb) if usage_known else None,
+                    "peak_kb": number(worker.peak_kb) if usage_known else None,
+                    "cap_kb": host_cap,
+                    "requested_cap_kb": number(getattr(limit, "cap_kb", None)),
+                    "capped": host_cap is not None,
+                    "usage_source": usage_source,
+                    "usage_error": worker.host_usage_error,
+                    "reached_cap": bool(worker.cap_hit),
+                },
+                "gpu": {
+                    "budget_kb": number(worker.gpu_reserve_kb),
+                    "used_kb": number(worker.gpu_used_kb),
+                    "peak_used_kb": number(worker.gpu_process_peak_kb),
+                    "requested_cap_kb": number(worker.gpu_cap_kb),
+                    "cap_kb": number(worker.gpu_cap_kb)
+                    if worker.gpu_limit_verified
+                    else None,
+                },
+                "dependencies": None
+                if worker.dependencies is None
+                else len(worker.dependencies),
+                "progress": _worker_progress(worker.progress),
+            }
+        )
+    workers.sort(key=lambda item: item["started_at"])
+    return workers
+
+
+def _resources(device_memory, host_memory, workers, plan):
+    """Card and host memory: what others hold, what expman holds, what is left."""
+    capacity = (plan or {}).get("capacity") or {}
+    gpu_left = capacity.get("gpu_left_kb") or {}
+    held = {}
+    for worker in workers:
+        entry = held.setdefault(worker["device"], {"actual_kb": 0.0, "budget_kb": 0.0})
+        used = worker["gpu"]["used_kb"]
+        if used is None:
+            entry["actual_kb"] = None
+        elif entry["actual_kb"] is not None:
+            entry["actual_kb"] += used
+        entry["budget_kb"] += worker["gpu"]["budget_kb"] or 0.0
+    cards = []
+    for device, observation in sorted(device_memory.items()):
+        total = number(observation.get("total_kb"))
+        free = number(observation.get("free_kb"))
+        used = None if total is None or free is None else max(0.0, total - free)
+        mine = held.get(device, {})
+        cards.append(
+            {
+                "index": device,
+                "uuid": observation.get("uuid"),
+                "total_kb": total,
+                "free_kb": free,
+                "other_kb": None
+                if used is None or mine.get("actual_kb", 0.0) is None
+                else max(0.0, used - mine.get("actual_kb", 0.0)),
+                "expman_actual_kb": mine.get("actual_kb", 0.0),
+                "expman_budget_kb": mine.get("budget_kb", 0.0),
+                "launchable_kb": number(gpu_left.get(device)),
+                "age_seconds": age(observation.get("observed_at")),
+            }
+        )
+    host_total = number(host_memory.get("total_kb"))
+    host_available = number(host_memory.get("available_kb"))
+    resident = (
+        None
+        if any(worker["host"]["resident_kb"] is None for worker in workers)
+        else sum(worker["host"]["resident_kb"] for worker in workers)
+    )
+    budget = sum(worker["host"]["reserved_kb"] or 0.0 for worker in workers)
+    used = (
+        None
+        if host_total is None or host_available is None
+        else max(0.0, host_total - host_available)
+    )
+    return {
+        "devices": cards,
+        "host": {
+            "total_kb": host_total,
+            "available_kb": host_available,
+            "used_kb": used,
+            "other_kb": None
+            if used is None or resident is None
+            else max(0.0, used - resident),
+            "expman_actual_kb": resident,
+            "expman_budget_kb": budget,
+            "launchable_kb": number(capacity.get("host_left_kb")),
+            "headroom_kb": number(host_memory.get("headroom_kb")),
+            "swap_total_kb": number(host_memory.get("swap_total_kb")),
+            "swap_free_kb": number(host_memory.get("swap_free_kb")),
+            "tight": bool(host_memory.get("tight", False)),
+            "admits_next": bool(host_memory.get("admits_next", False)),
+            "age_seconds": age(host_memory.get("observed_at")),
+        },
+    }
+
+
+def stage_samples(history):
+    """How each Stage's samples were obtained: measured, reused or censored."""
+    counts = {}
+    for entry in history:
+        stage_index = entry.get("stage")
+        if not isinstance(stage_index, int):
+            continue
+        bucket = counts.setdefault(
+            stage_index, {"measured": 0, "reused": 0, "censored": 0}
+        )
+        if entry.get("reused"):
+            bucket["reused"] += 1
+        else:
+            duration = entry.get("stage_duration_seconds")
+            if valid_seconds(duration) and duration > 0:
+                if entry.get("status") == Status.SUCCEEDED.value:
+                    bucket["measured"] += 1
+                elif entry.get("status") == Status.CANCELLED.value:
+                    bucket["censored"] += 1
+    return counts
+
+
+def stage_record(
+    index, name, known, completed, total, unit, samples, approximate=False
+):
+    """One Stage's row in a snapshot, shared by both reading paths.
+
+    ``known`` is False until the scheduler has reported the Stage at all, and
+    ``unit`` is the scheduler's unit interval, which only a live batch holds.
+    The archived path passes nothing there and marks the row approximate
+    instead, so both paths serialize the same keys.
+    """
+    unit = unit or {}
+    return {
+        "index": index,
+        "name": name,
+        "known": known,
+        "groups_total": total,
+        "groups_done": completed,
+        "groups_remaining": None
+        if not known or total is None or completed is None
+        else max(0, total - completed),
+        "unit_lower_seconds": number(unit.get("unit_lower_seconds")),
+        "unit_upper_seconds": number(unit.get("unit_upper_seconds")),
+        "unit_samples": unit.get("spans"),
+        "samples": samples,
+        "approximate": approximate,
+    }
+
+
+def _stages(completion, names, view, samples):
+    """Per-Stage remaining group counts plus the unit interval to multiply them by.
+
+    Reported before the scheduler exists as well: the Stage list is known from
+    the Pipeline, so the dashboard can show the shape of the batch while its
+    first attempt is still being prepared.
+    """
+    counts = {index: (done, total) for index, done, total in completion or ()}
+    units = (view or {}).get("stages") or {}
+    return [
+        stage_record(
+            index,
+            name,
+            index in counts,
+            *counts.get(index, (None, None)),
+            units.get(index),
+            samples.get(index, {}),
+        )
+        for index, name in enumerate(names)
+    ]
+
+
+def gantt_rows(history, names, workers=()):
+    """Completed and running attempts on the same Batch effective clock.
+
+    Only entries with a recorded span belong on the axis.
+    """
+    records = list(history)
+    completed = {
+        (entry.get("run_id"), entry.get("stage"), entry.get("attempt"))
+        for entry in records
+    }
+    for worker in workers:
+        identity = (worker["run_id"], worker["stage_index"], worker["attempt"])
+        if identity not in completed:
+            records.append(
+                {
+                    "run_id": worker["run_id"],
+                    "stage": worker["stage_index"],
+                    "attempt": worker["attempt"],
+                    "device": worker["device"],
+                    "start_seconds": worker["start_seconds"],
+                    "end_seconds": worker["end_seconds"],
+                    "status": Status.RUNNING.value,
+                    "reused": False,
+                }
+            )
+    rows = []
+    for entry in records:
+        start = number(entry.get("start_seconds"))
+        end = number(entry.get("end_seconds"))
+        run_id = entry.get("run_id")
+        if start is None or end is None or not isinstance(run_id, str):
+            continue
+        stage_index = entry.get("stage")
+        rows.append(
+            {
+                "run": run_id[:6],
+                "stage_index": stage_index,
+                "stage": names[stage_index]
+                if isinstance(stage_index, int) and stage_index < len(names)
+                else None,
+                "attempt": entry.get("attempt"),
+                "device": entry.get("device"),
+                "start_seconds": round(start, 2),
+                "end_seconds": round(end, 2),
+                "status": entry.get("status"),
+                "reused": bool(entry.get("reused")),
+            }
+        )
+    rows.sort(key=lambda row: (row["start_seconds"], row["run"]))
+    return rows
+
+
+def session_marks(marks):
+    """Positions on the clock where a previous invocation ended and another began."""
+    return sorted(
+        value
+        for value in (number(mark) for mark in marks or ())
+        if value is not None and value >= 0
+    )
+
+
+def _events(items, limit=40):
+    """The tail of the scheduler's own event log, oldest first."""
+    return [
+        {
+            "at": number(item.get("at")),
+            "age_seconds": age(item.get("at")),
+            "kind": item.get("kind"),
+            "run": None
+            if not isinstance(item.get("run_id"), str)
+            else item["run_id"][:6],
+            "stage_index": item.get("stage_index"),
+            "attempt": item.get("stage_attempt"),
+            "device": item.get("device"),
+            "status": item.get("status"),
+            "detail": item.get("detail"),
+        }
+        for item in list(items)[-limit:]
+    ]
+
+
+def build_snapshot(batch) -> dict:
+    """One JSON-safe snapshot of a Batch, including a degraded one on failure."""
+    try:
+        return _gather(batch)
+    except Exception as error:
+        return {
+            "schema": SCHEMA,
+            "generated_at": time(),
+            "source": "live",
+            "degraded": f"{type(error).__name__}: {error}",
+        }
+
+
+def _publish_window(batch):
+    """Capture the live state, including group completion and ETA, under one lock."""
+    with batch._state_lock:
+        scheduler = batch._scheduler
+        try:
+            completion = None if scheduler is None else scheduler.stages.completion()
+        except Exception:
+            completion = None
+        return {
+            "workers": {}
+            if scheduler is None
+            else {run_id: copy(worker) for run_id, worker in scheduler.workers.items()},
+            "sampled_at": perf_counter(),
+            "queue": set(batch.state.queue),
+            "active": dict(batch.state.active_gpu),
+            "progress": dict(batch.state.stage_progress),
+            "history": list(batch.state.stage_history),
+            "marks": list(batch.state.session_marks),
+            "statuses": [
+                (experiment.run_id, _last_attempt_status(experiment))
+                for experiment in batch.experiments
+            ],
+            "remaining": _remaining(batch),
+            "device_memory": dict(batch.live.device_memory),
+            "host_memory": dict(batch.live.host_memory),
+            "elapsed": batch.elapsed_seconds,
+            "view": batch.live.schedule_view,
+            "plan": None if scheduler is None else scheduler.last_plan,
+            "events": [] if scheduler is None else list(scheduler.events),
+            "completion": completion,
+        }
+
+
+def _gather(batch) -> dict:
+    now = time()
+    window = _publish_window(batch)
+    names = [stage.__name__ for stage in batch.pipeline.stages]
+    # A skipped tick (pressure, missing observation, MPS startup, or empty queue)
+    # must not reuse an earlier tick's placements or capacity.
+    plan = window["plan"]
+    observed = window["host_memory"].get("observed_at")
+    if observed is None or (plan is not None and plan["at"] < observed):
+        plan = None
+    workers = _workers(window, names, now)
+    resources = _resources(
+        window["device_memory"], window["host_memory"], workers, plan
+    )
+    stages = _stages(
+        window["completion"], names, window["view"], stage_samples(window["history"])
+    )
+    pending_by_stage = {}
+    for run_id in window["queue"]:
+        stage_index = window["progress"].get(run_id)
+        if isinstance(stage_index, int):
+            pending_by_stage[stage_index] = pending_by_stage.get(stage_index, 0) + 1
+    running_by_stage = {}
+    for worker in workers:
+        stage_index = worker["stage_index"]
+        running_by_stage[stage_index] = running_by_stage.get(stage_index, 0) + 1
+    if plan is not None:
+        gate = "open" if plan["placements"] else "closed"
+    elif not window["queue"]:
+        gate = "idle"
+    elif window["host_memory"].get("tight"):
+        gate = "closed"
+    else:
+        gate = "waiting"
+    return {
+        "schema": SCHEMA,
+        "generated_at": now,
+        "source": "live",
+        "batch": {
+            "name": batch.output_dir.name,
+            "dir": str(batch.output_dir),
+            "elapsed_seconds": window["elapsed"],
+            "coverage": number(batch.estimate_coverage),
+            "max_retries": batch.max_retries,
+            "experiments": len(batch.experiments),
+            "stages": len(names),
+            "counts": run_counts(window["statuses"], window["active"], window["queue"]),
+            "remaining": window["remaining"],
+            "session_marks": session_marks(window["marks"]),
+        },
+        "stages": stages,
+        "workers": workers,
+        "gantt": gantt_rows(window["history"], names, workers),
+        "resources": resources,
+        "schedule": {
+            "pending_runs": len(window["queue"]),
+            "running_runs": len(window["active"]),
+            "pending_by_stage": pending_by_stage,
+            "running_by_stage": running_by_stage,
+            "gate": gate,
+            "estimate": window["view"],
+            "plan": plan,
+        },
+        "events": _events(window["events"]),
+    }

@@ -1,25 +1,11 @@
-"""Environment values expman sets for every worker process on its own.
+"""Thread-pool and Hugging Face environment defaults for each worker.
 
-Each attempt runs in its own interpreter, launched by the scheduler, and that
-process is where user code — and therefore every numerical library — gets
-imported. So that is where the framework quietly configures the two things that
-are tedious to get right and expensive to get wrong:
+EXPMAN_THREADS sets a positive thread limit, defaults to four and accepts
+``off`` to leave library defaults in place. If any supported thread-pool
+variable is already present, the whole group is inherited from the parent.
 
-* a fixed per-worker thread ceiling, so that N attempts running side by side
-  cannot together oversubscribe the CPU, and
-* the Hugging Face mirror endpoint, so model downloads do not depend on a
-  direct route to huggingface.co.
-
-Nothing here is a public API: the values are merged into the worker environment
-at launch, and a project never has to configure them. What the surrounding
-shell already exported always wins, and two variables override the defaults:
-
-``EXPMAN_THREADS``
-    ``off`` disables the thread ceiling; an integer sets a different one.
-``EXPMAN_HF_MIRROR``
-    ``off`` leaves ``HF_ENDPOINT`` alone; ``cn`` selects the default mirror;
-    any other value is used as the endpoint itself (a scheme is added when the
-    value arrives without one).
+EXPMAN_HF_MIRROR accepts ``cn``, ``off`` or an endpoint. An existing
+HF_ENDPOINT takes precedence.
 """
 
 import os

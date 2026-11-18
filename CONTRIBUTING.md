@@ -1,88 +1,49 @@
-# 开发与版本管理
+# 开发与验证
 
-## 分支与提交
+## 环境与提交检查
 
-- `main` 保存经过验证的工作版本。
-- 新功能使用 `feat/<name>`，修复使用 `fix/<name>`，文档维护使用 `docs/<name>`。
-- 一次提交围绕一个完整目的，代码、必要测试与对应文档一起提交。
-- 提交消息采用 Conventional Commits：`feat:`、`fix:`、`docs:`、`test:`、`chore:`、`refactor:`。例如 `feat: add sequential pipeline execution`。
-- **每次提交前必须通过 `ruff check .` 和 `ruff format --check .`，包括仅修改文档的提交。** 修复后重新检查，暂存确认过的改动，再提交。
-- 合并前检查变更、运行测试和示例，确认工作区没有实验数据、密钥、构建产物或本地环境文件。
-
-项目使用 uv 管理唯一的锁定环境，其中只有运行依赖（NumPy、PyTorch、PyYAML）。pytest、Pyright 和 pre-commit 位于 `pyproject.toml` 的 dev 依赖组（不进入包依赖），`uv sync` 一并安装；Ruff 仍是独立工具，由 pre-commit 的 `additional_dependencies` 和 CI 的 `uv run --with ruff==...` 各自固定版本：
+项目使用 uv。包依赖为 PyYAML、NumPy 和 PyTorch，开发依赖组包含 pytest、Pyright 和 pre-commit。Ruff 用于检查源码。安装环境及本地提交 hook：
 
 ```bash
 uv sync
-uv run pre-commit install --install-hooks
+python -m pip install pre-commit ruff
+pre-commit install --install-hooks
 ```
 
-每次新克隆仓库或重建环境后，都需要重新安装 hook。
-
-提交前检查：
+修改 Python 代码后、每次提交前都运行以下检查。仅修改文档的提交也执行同样的检查。若项目环境已单独安装与本机驱动匹配的 PyTorch，手动检查时可设置 `UV_NO_SYNC=1`，让 uv 使用当前环境，与提交 hook 一致。
 
 ```bash
 ruff check .
 ruff format --check .
-uv run pytest -v
-git diff --check
-git status --short
-```
-
-需要自动修复时，执行 `ruff check --fix .` 和 `ruff format .`，然后检查差异并重新运行上述检查。
-
-类型检查由 Pyright 负责，配置在 `pyproject.toml` 的 `[tool.pyright]`：
-
-```bash
 uv run pyright
+uv run pytest
 ```
 
-`pyright[nodejs]` 让 Node 运行时作为 `nodejs-wheel-binaries` 从 PyPI 安装，不需要单独装 Node，也不访问 nodejs.org。
+需要自动修复时运行 `ruff check --fix .` 和 `ruff format .`，检查差异后重新验证。提交 hook 还会运行 `uv lock --check`。GitHub Actions 在推送和拉取请求时运行 Ruff、Pyright，并在 Python 3.12、3.13、3.14 上运行 CPU 测试。
 
-`.pre-commit-config.yaml` 为每次提交运行全项目 Ruff lint、格式检查、Pyright 类型检查和 pytest 测试套件，任一失败都会阻止提交。hook 只检查，不自动修改或暂存文件；pre-commit 会临时隐藏已跟踪文件的未暂存改动，以检查本次提交对应的内容。不要使用 `--no-verify` 或 `SKIP` 绕过检查。
+CI 的真卡测试使用 `expman-gpu` 标签。该标签用于每个作业独立分配、作业结束即销毁的 Linux x64 runner，须提供 NVIDIA GPU、MPS，以及与锁文件中 PyTorch 兼容的驱动。没有匹配的 runner 时，作业会排队等待。
 
-Ruff 版本固定在两处：`.pre-commit-config.yaml` 的 `additional_dependencies`（本地 hook）和 `.github/workflows/ci.yml`（CI）。升级时一起改。
+## 分支与提交
 
-项目附带 GitHub Actions 配置，在推送或创建 PR 后执行 Ruff 检查、Pyright 类型检查，以及 Python 3.12–3.14 的安装、pytest 测试和示例检查。远端分支保护需要在托管平台另行配置。
-
-## 版本
-
-版本号集中维护在 `pyproject.toml`，格式为 `MAJOR.MINOR.PATCH`，对应 Git 附注标签 `vMAJOR.MINOR.PATCH`。
-
-- 当前处于 `0.x` 开发期，公共接口仍在演进。
-- `0.x` 的接口不兼容调整通过提高次版本号发布，并在 CHANGELOG 中提供迁移说明。
-- 补丁版本用于兼容修复；新增兼容功能提高次版本号。
-- 达到 `1.0.0` 后，接口不兼容变更提高主版本号。
-
-发布步骤：
-
-1. 更新项目版本及 `CHANGELOG.md`，保持 README 的当前版本一致。
-2. 完成 Ruff lint、格式检查、测试、示例及安装检查，审核 Git 差异。
-3. 提交版本变更，再创建附注标签，例如 `git tag -a v0.1.0 -m "expman 0.1.0"`。
-4. 在配置好远端并获得发布授权后推送分支和标签；包分发另行安排。
+- `main` 保存通过验证的代码。功能、修复和文档分支分别使用 `feat/<name>`、`fix/<name>` 和 `docs/<name>`。
+- 一次提交围绕一个目的，一起提交实现、相应的行为测试和接口说明。提交消息采用 Conventional Commits，例如 `fix: preserve checkpoints on retry`。
+- 提交前用 `git diff --check` 和 `git status --short` 核对改动。正常提交须经过仓库的 pre-commit 检查。
 
 ## 代码约定
 
-- 公共接口提供类型注解和文档；Stage 子类覆盖 `process()`，统一通过 `run()` 调用。
-- 对业务规则、故障行为和对外契约做测试，避免只测试私有实现细节。
-- 核心执行层仅依赖标准库；配置模块使用 PyYAML，存储和监控集成通过 Recorder 扩展。
-- 新增功能同步修改设计文档及 CHANGELOG，明确已实现能力与后续规划。
+- 为公共接口提供类型注解和文档。业务阶段实现 `Stage.process`，按需声明 `config_dependencies`。
+- 为使用者可观察的行为与故障恢复写测试。修改行为时同步核对 README 中的示例和架构说明。
 
-## 完整后端验证
+## 真实 GPU 验证
 
-需要验证完整功能时，在可访问实际 NVIDIA GPU 的环境运行：
+pytest 和提交 hook 默认运行 `tests/cpu/` 和 `tests/gpu/`。后者需要 Linux、NVIDIA 驱动、MPS，以及与驱动兼容的 CUDA 版 PyTorch。单独运行真卡测试可执行
 
 ```bash
-uv run python scripts/test_full.py
+uv run --no-sync pytest tests/gpu/
 ```
 
-该入口执行全部测试，并将任何 skip 视为验证未完成（非零退出码）。缺少依赖、GPU 不可访问或显存不足时，修复环境后重跑；不要删除测试或取消跳过条件来获得通过。普通 pytest 命令仍可用于最小依赖环境的兼容性测试，其结果不能替代完整后端验证。
+提交 hook 和上面的命令都使用已安装的项目环境，避免提交时自动替换 PyTorch。
 
-当前开发机运行时也保持项目源码优先：
+测试检查主机剩余内存，并在 `CUDA_VISIBLE_DEVICES` 可见、空闲显存能容纳初始 worker 限额的物理卡中，选择 `nvidia-smi` 采样利用率最低的一张。正在运行其他计算任务的卡也参与排序。利用率相同时优先选空闲显存更多的卡，显存也相同时选物理编号较小的卡。
 
-```bash
-PYTHONDONTWRITEBYTECODE=1 \
-CUDA_VISIBLE_DEVICES=GPU-23e616ac-ab14-91bd-71e2-ac9a8887337b \
-uv run python scripts/test_full.py
-```
-
-上面的 GPU UUID 仅适用于当前开发机；其他机器使用自己的完整测试环境。沙箱阻止 GPU 访问时，需要在获准访问 GPU 的执行环境运行。
+并发测试按 GPU UUID 加锁，在同一 Linux 网络命名空间中各自领取一张卡，直到本次真卡用例结束。测试输出选中的物理卡编号和 UUID。硬件条件不足或 CUDA/MPS 用例执行出错都会使测试和提交检查失败。

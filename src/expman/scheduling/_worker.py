@@ -13,9 +13,8 @@ from time import monotonic
 from expman.core.context import _error_message
 from expman.core.events import Status
 from expman.core.experiment import Experiment, StageResult
-from expman.scheduling import _mps, gpu_memory
-from expman.scheduling.ipc import worker_channel
-from expman.scheduling.limits import (
+from expman.resources import gpu_memory, mps
+from expman.resources.limits import (
     attempt_cgroup,
     cap_matches_request,
     events,
@@ -23,7 +22,8 @@ from expman.scheduling.limits import (
     own_cgroup,
     usage,
 )
-from expman.storage.base import PickleSerializer, RunLock, read_record
+from expman.scheduling.ipc import worker_channel
+from expman.storage.base import PickleSerializer, read_record, run_lock
 
 PROC_STATUS = Path("/proc/self/status")
 
@@ -151,7 +151,7 @@ def main():
     root = Path(sys.argv[1])
     channel = worker_channel(os.environ["EXPMAN_IPC_FD"])
     try:
-        server_pid = _mps.verify_client()
+        server_pid = mps.verify_client()
     except Exception as error:
         print(f"[expman] MPS startup: {error}", file=sys.stderr, flush=True)
         channel.send(
@@ -194,10 +194,9 @@ def main():
         _cache_root=payload["cache_root"],
         _resume=True,
     )
-    experiment._attempts = payload["attempts"]
     recorder = IpcRecorder(channel)
     try:
-        with RunLock(experiment.output_dir):
+        with run_lock(experiment.output_dir):
             stage_index = payload["stage_index"]
             try:
                 result = experiment.run_stage(
@@ -216,7 +215,7 @@ def main():
             completed = (
                 None
                 if result.status.value != "succeeded"
-                else experiment._store.summary((stage_index,))
+                else experiment._store.completed((stage_index,), metadata_only=True)
             )
             with suppress(OSError):
                 channel.send(

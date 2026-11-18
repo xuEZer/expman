@@ -1,21 +1,22 @@
 """Stage-group makespan estimates for the GPU scheduler."""
 
+from statistics import median
 from time import time
 
-from expman.estimation.estimate import TimeEstimate
+from expman.estimation.estimate import TimeEstimate, valid_seconds
 
 _LOWER = 0
 _UPPER = 1
 
 
-def _publish(batch, *, degraded=None, **fields):
+def _publish(batch, coverage, *, degraded=None, **fields):
     """Record what this pass learned for the dashboard.
 
-    The dashboard is a reader: everything it shows about the schedule is
-    published here, by the thread that already did the work, instead of being
-    recomputed on demand.  Fitting a duration model is therefore still
-    single-writer even while a browser is open.
+    The dashboard reads results at the Batch's configured coverage. A caller
+    requesting another coverage gets its own TimeEstimate.
     """
+    if coverage != batch.estimate_coverage:
+        return
     view = {
         "at": time(),
         "degraded": degraded,
@@ -29,14 +30,7 @@ def _publish(batch, *, degraded=None, **fields):
         "stages": {},
     }
     view.update(fields)
-    batch._schedule_view = view
-
-
-def _median(values):
-    if not values:
-        return None
-    ordered = sorted(values)
-    return ordered[len(ordered) // 2]
+    batch.live.schedule_view = view
 
 
 def _stage_view(groups, active_groups, tasks):
@@ -66,8 +60,8 @@ def _stage_view(groups, active_groups, tasks):
     for stage_index, spans in measured.items():
         entry = stages[stage_index]
         entry["spans"] = len(spans)
-        entry["unit_lower_seconds"] = _median([span[_LOWER] for span in spans])
-        entry["unit_upper_seconds"] = _median([span[_UPPER] for span in spans])
+        entry["unit_lower_seconds"] = median(span[_LOWER] for span in spans)
+        entry["unit_upper_seconds"] = median(span[_UPPER] for span in spans)
     return stages
 
 
@@ -79,29 +73,28 @@ def estimate_parallel(scheduler, coverage):
     Stage groups that still require a process contribute to the makespan.
 
     Later Stages wait for their unfinished prefix even when another device is
-    idle. Every task carries an interval, so the packing runs once per side. The two
-    makespans bound the same greedy schedule evaluated with the shortest and the
-    longest duration each task admits. They are an envelope, not a joint
-    confidence interval: the packing adds tasks as if their durations were
-    independent, so the two sides are each valid alone rather than together.
+    idle. Each scenario schedules all remaining groups greedily using one
+    endpoint of their predicted durations. The slot assignment and task order
+    can differ between the two scenarios.
     """
     batch = scheduler.batch
     with batch._state_lock:
-        queue = list(batch._queue)
-        active = dict(batch._active_gpu)
-        running = dict(batch._gpu_running_info)
-        host = dict(batch._host_memory)
-        groups = scheduler._remaining_stage_groups(queue, running)
+        queue = list(batch.state.queue)
+        active = dict(batch.state.active_gpu)
+        running = dict(batch.live.running_info)
+        host = dict(batch.live.host_memory)
+        groups = scheduler.stages.remaining_groups(queue, running)
         samples = sum(
             entry.get("status") == "succeeded"
             and not entry.get("reused")
-            and isinstance(entry.get("stage_duration_seconds"), (int, float))
+            and valid_seconds(entry.get("stage_duration_seconds"))
             and entry["stage_duration_seconds"] > 0
-            for entry in batch._stage_history
+            for entry in batch.state.stage_history
         )
     if groups is None or set(active) != set(running):
         _publish(
             batch,
+            coverage,
             degraded="运行中尝试与调度视图不一致",
             pending_runs=len(queue),
             running_runs=len(active),
@@ -113,16 +106,20 @@ def estimate_parallel(scheduler, coverage):
         # Nothing left to run: keep the per-Stage unit intervals from the last
         # informative pass, so a finished batch still explains how long its
         # Stages took instead of forgetting them.
-        previous = (batch._schedule_view or {}).get("stages") or {}
+        previous = (batch.live.schedule_view or {}).get("stages") or {}
         _publish(
             batch,
+            coverage,
             pending_runs=len(queue),
             running_runs=len(active),
             groups=0,
             running_groups=0,
             samples=samples,
             makespan={"lower_seconds": 0.0, "upper_seconds": 0.0},
-            stages=previous,
+            stages={
+                stage: {**details, "groups": 0, "running": 0}
+                for stage, details in previous.items()
+            },
         )
         return TimeEstimate(0.0, 0.0, coverage, samples, 0)
 
@@ -131,44 +128,45 @@ def estimate_parallel(scheduler, coverage):
     incomplete = False
     overdue = False
     for group, (run_id, stage_index) in groups.items():
-        if group in active_groups:
-            elapsed = running[run_id].get("duration", 0.0)
-            if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
-                incomplete = True
-                continue
+        active_run = group in active_groups
+        if active_run and coverage == batch.estimate_coverage:
+            # Keep the dispatch-time prediction for the usual live countdown.
             span = [
                 running[run_id].get(key)
                 for key in ("expected_lower_seconds", "expected_upper_seconds")
             ]
-            if not all(isinstance(value, (int, float)) and value > 0 for value in span):
+        else:
+            predicted = scheduler.stages.duration(
+                run_id, stage_index, coverage=coverage
+            )
+            span = [] if predicted is None else [predicted.lower, predicted.upper]
+        if not span or not all(valid_seconds(value) for value in span):
+            incomplete = True
+            continue
+        if active_run:
+            elapsed = running[run_id].get("duration")
+            if not valid_seconds(elapsed):
                 incomplete = True
                 continue
             if elapsed >= span[_UPPER]:
-                # The attempt is still running, so reaching the old upper bound
-                # invalidates that prediction rather than proving completion.
                 incomplete = True
                 overdue = True
                 continue
             span = [max(0.0, value - elapsed) for value in span]
-        else:
-            predicted = scheduler._stage_duration(run_id, stage_index)
-            if predicted is None:
-                incomplete = True
-                continue
-            span = [predicted.lower, predicted.upper]
         tasks.append((span, group))
 
     stages = _stage_view(groups, active_groups, tasks)
     if incomplete:
         _publish(
             batch,
+            coverage,
             degraded=(
                 "运行中阶段已达到或超出耗时预测上界，无法给出剩余时间区间"
                 if overdue
                 else (
-                    "尚无阶段耗时样本，无法给出完工区间"
+                    "待执行阶段缺少可用耗时区间，无法估计完工时间"
                     if not tasks
-                    else "部分阶段缺少耗时区间，本区间只覆盖已有样本的阶段"
+                    else "部分阶段缺少耗时区间，无法给出整批完工区间"
                 )
             ),
             pending_runs=len(queue),
@@ -191,6 +189,7 @@ def estimate_parallel(scheduler, coverage):
     if not counts:
         _publish(
             batch,
+            coverage,
             degraded="主机内存紧张，没有可用的并行位",
             pending_runs=len(queue),
             running_runs=len(active),
@@ -206,7 +205,7 @@ def estimate_parallel(scheduler, coverage):
         # A shared prefix has the same predecessors for every equivalent run.
         # Completed groups are absent, so find the nearest unfinished one.
         for previous_index in range(stage_index - 1, -1, -1):
-            previous = scheduler._stage_group(run_id, previous_index)
+            previous = scheduler.stages.group(run_id, previous_index)
             if previous in groups:
                 predecessors[group] = previous
                 break
@@ -258,9 +257,11 @@ def estimate_parallel(scheduler, coverage):
             pending.remove(group)
         return max(max(values) for values in slots.values())
 
-    lower, upper = makespan(_LOWER), makespan(_UPPER)
+    # Longer Stage durations can change greedy placement enough to finish earlier.
+    lower, upper = sorted((makespan(_LOWER), makespan(_UPPER)))
     _publish(
         batch,
+        coverage,
         pending_runs=len(queue),
         running_runs=len(active),
         groups=len(groups),

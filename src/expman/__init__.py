@@ -1,39 +1,32 @@
 """Composable experiment execution with optional progress reporting."""
 
-import expman.config.devices as devices
+import expman.resources.devices as devices
 from expman.config import (
     ConfigError,
-    DeviceMemory,
-    MeminfoMonitor,
     MissingConfigWarning,
-    NvidiaMemory,
     load_configs,
 )
-from expman.core import (
-    Event,
-    ExecutionEvent,
-    MetricEvent,
-    Pipeline,
-    ProgressEvent,
-    Recorder,
-    RunContext,
-    Stage,
-    Status,
-)
+from expman.core.context import RunContext
+from expman.core.events import Event, ExecutionEvent, MetricEvent, ProgressEvent, Status
 from expman.core.experiment import AttemptResult, ExperimentResult, StageResult
+from expman.core.pipeline import Pipeline
 from expman.core.randomness import seed_everything
-from expman.core.recorders import InMemoryRecorder
+from expman.core.recorders import InMemoryRecorder, Recorder
 from expman.core.settings import get, set
-from expman.estimation import TimeEstimate
+from expman.core.stage import Stage
+from expman.estimation.estimate import TimeEstimate
 from expman.observation import cleanup
-from expman.scheduling import Batch, environment, limits
-from expman.storage import (
-    Checkpoint,
+from expman.resources import limits
+from expman.resources.devices import DeviceMemory, MeminfoMonitor, NvidiaMemory
+from expman.scheduling import environment
+from expman.scheduling.batch import Batch
+from expman.storage.base import (
     PickleSerializer,
     RecoveryWarning,
     Serializer,
     StorageError,
 )
+from expman.storage.run import Checkpoint
 
 __all__ = [
     "AttemptResult",

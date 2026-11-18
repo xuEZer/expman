@@ -16,7 +16,9 @@ def _plain(value):
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return [_plain(item) for item in value]
     if isinstance(value, (set, frozenset)):
-        return frozenset(_plain(item) for item in value)
+        # A worker has its own hash seed. Preserve set identity with a tuple
+        # and order its members by value before hashing. Sequences use lists.
+        return tuple(sorted((_plain(item) for item in value), key=pickle.dumps))
     return value
 
 
@@ -69,10 +71,6 @@ def stage_dependencies(stage, config):
         (path, observation(config, path))
         for path in declared_paths(stage.config_dependencies(config))
     ]
-
-
-def matches(dependencies, config):
-    return all(observation(config, path) == digest for path, digest in dependencies)
 
 
 def validate(dependencies):

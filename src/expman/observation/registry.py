@@ -1,77 +1,60 @@
-"""Stable integer IDs for the batches living under ``runs/``.
+"""Stable workspace-local batch IDs shared by the CLI and dashboard."""
 
-The CLI and the dashboard resolve a batch the same way, so the registry
-lives here instead of inside one of them.  The file is advisory: a missing
-or damaged ``runs/.batches.json`` is rebuilt by scanning the directory, and
-the ID of a batch that disappears stays reserved so the remaining IDs never
-shift under a running process.
-
-Every entry point takes an optional root so the dashboard can be pointed at
-another directory tree, which is also what the tests do.
-"""
-
-import json
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 RUNS_DIR = Path("runs")
-REGISTRY_NAME = ".batches.json"
+REGISTRY_NAME = ".batches.sqlite3"
 
 
-def _root(root: Path | None) -> Path:
-    return RUNS_DIR if root is None else Path(root)
-
-
-def load_registry(root: Path | None = None) -> dict:
-    """Read the ID registry, tolerating a missing or damaged file."""
+def scan_runs(root: Path) -> list[Path]:
+    """Discover batch directories, oldest first and by name for timestamp ties."""
+    found = []
     try:
-        data = json.loads((_root(root) / REGISTRY_NAME).read_text())
-    except (OSError, ValueError):
-        return {"next_id": 0, "batches": {}}
-    if not isinstance(data, dict) or not isinstance(data.get("batches"), dict):
-        return {"next_id": 0, "batches": {}}
-    if not isinstance(data.get("next_id"), int):
-        data["next_id"] = len(data["batches"])
-    return data
+        for path in root.iterdir():
+            if (path / "batch.pkl").is_file():
+                try:
+                    found.append((path.stat().st_mtime_ns, path))
+                except FileNotFoundError:
+                    continue
+    except FileNotFoundError:
+        return []
+    return [path for _, path in sorted(found)]
 
 
-def save_registry(registry: dict, root: Path | None = None) -> None:
-    base = _root(root)
-    base.mkdir(parents=True, exist_ok=True)
-    (base / REGISTRY_NAME).write_text(json.dumps(registry, indent=2))
-
-
-def is_batch_dir(path: Path) -> bool:
-    return path.is_dir() and (path / "batch.pkl").exists()
-
-
-def scan_runs(registry: dict, root: Path | None = None) -> bool:
-    """Register unregistered batches, oldest first; True when anything changed."""
-    try:
-        base = _root(root).resolve()
-        candidates = sorted(
-            (path for path in base.iterdir() if is_batch_dir(path)),
-            key=lambda path: path.stat().st_mtime,
-        )
-    except OSError:
-        return False
-    known = set(registry["batches"].values())
-    changed = False
-    for path in candidates:
-        if path.name not in known:
-            registry["batches"][str(registry["next_id"])] = path.name
-            registry["next_id"] += 1
-            changed = True
-    return changed
+def _registered(connection: sqlite3.Connection) -> dict[str, int]:
+    return dict(connection.execute("SELECT name, id FROM batches"))
 
 
 def ensure_ids(root: Path | None = None) -> dict[int, Path]:
-    """Assign stable IDs to batches; return the ID -> directory map."""
-    registry = load_registry(root)
-    if scan_runs(registry, root):
-        save_registry(registry, root)
-    base = _root(root).resolve()
-    return {
-        int(batch_id): base / name
-        for batch_id, name in registry["batches"].items()
-        if (base / name).is_dir()
-    }
+    """Look up visible batches, registering new names in one write transaction."""
+    base = (RUNS_DIR if root is None else Path(root)).resolve()
+    candidates = scan_runs(base)
+    if not candidates:
+        return {}
+
+    registry = base / REGISTRY_NAME
+    known: dict[str, int] = {}
+    if registry.exists():
+        with closing(sqlite3.connect(f"{registry.as_uri()}?mode=ro", uri=True)) as db:
+            # A concurrent creator may have opened the file before committing its schema.
+            if db.execute(
+                "SELECT 1 FROM sqlite_schema WHERE name='batches'"
+            ).fetchone():
+                known = _registered(db)
+
+    new_names = [(path.name,) for path in candidates if path.name not in known]
+    if new_names:
+        with closing(sqlite3.connect(registry, timeout=30)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS batches (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)"
+            )
+            db.executemany(
+                "INSERT OR IGNORE INTO batches (id, name) "
+                "SELECT COALESCE(MAX(id), -1) + 1, ? FROM batches",
+                new_names,
+            )
+            known = _registered(db)
+    return {known[path.name]: path for path in candidates}

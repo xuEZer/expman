@@ -1,9 +1,8 @@
 """Process-wide Batch defaults, configured in code with ``expman.set``.
 
-The command line deliberately keeps no flags for retry counts or interval
-coverage: import expman next to the Pipeline definition and call ``set()``
-there, and every entry point in the process — the CLI included, which imports
-the pipeline module — picks the values up.
+The CLI imports the Pipeline module before constructing a new Batch, so it
+sees defaults set in that module. Explicit Batch arguments take precedence.
+Resume restores the settings saved in the batch manifest.
 """
 
 from expman.core.context import _nonnegative_integer
@@ -15,18 +14,18 @@ _SETTINGS: dict[str, float | int] = {"retries": 1, "coverage": 0.8}
 def set(**settings: float | int) -> None:
     """Set process-wide Batch defaults.
 
-    ``retries`` is a nonnegative integer (attempts per stage) and
+    ``retries`` is a nonnegative integer (extra attempts per failed stage) and
     ``coverage`` is the nominal interval coverage, a number strictly
     between 0 and 1. Unknown keys raise ValueError.
     """
     for key, value in settings.items():
         if key == "retries":
-            _nonnegative_integer(value, "retries")  # type: ignore[arg-type]
+            _nonnegative_integer(value, "retries")
         elif key == "coverage":
             validate_coverage(value)
         else:
             raise ValueError(f"unknown setting {key!r}; available: {sorted(_SETTINGS)}")
-        _SETTINGS[key] = value
+    _SETTINGS.update(settings)
 
 
 def get(key: str) -> float | int:

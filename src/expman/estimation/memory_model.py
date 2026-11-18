@@ -3,8 +3,8 @@
 Resource admission needs a conservative estimate, but a sparse high-dimensional
 regression can turn modest uncertainty in log space into an arbitrarily large
 number after exponentiation. The scheduler therefore uses nearby, finite
-observations from the same Stage. A capped cgroup sample is a lower bound, so it
-receives one fixed bump; it is never extrapolated into an unbounded tail.
+observations from the same Stage. A capped host or GPU sample is a lower bound
+and receives one fixed bump; it is never extrapolated into an unbounded tail.
 
 Neighborhoods are measured over the Stage's declared configuration variables,
 exactly as the duration model measures them, so both models agree on what a
@@ -14,8 +14,14 @@ exactly as the duration model measures them, so both models agree on what a
 from dataclasses import dataclass, field
 from math import ceil, isfinite
 
-import expman.config.devices as devices
 from expman.estimation.time_model import Encoding, variable_distance
+
+# Empirical percentile of nearby Stage samples used for admission. It is high
+# because the reserve has to bound the next attempt, not describe the average one.
+PEAK_QUANTILE = 0.9
+# A run stopped by its host or GPU cap receives a retry floor above the peak
+# it was seen to reach; the cap is recomputed from the raised estimate.
+PEAK_BUMP_MARGIN = 1.5
 
 LOCAL_MIN_SAMPLES = 4
 LOCAL_NEIGHBORS = 8
@@ -35,8 +41,8 @@ class LocalQuantileEstimator:
     encoding: Encoding
     indices: dict
     default: float
-    quantile: float = devices.PEAK_QUANTILE
-    margin: float = devices.PEAK_BUMP_MARGIN
+    quantile: float = PEAK_QUANTILE
+    margin: float = PEAK_BUMP_MARGIN
     include_zero: bool = False
     observations: list[tuple[int, float]] = field(default_factory=list)
     floors: dict = field(default_factory=dict)
@@ -83,7 +89,7 @@ class LocalQuantileEstimator:
 
 @dataclass
 class PeakCeiling:
-    """Largest observed whole-attempt host peak for cold-start admission."""
+    """Largest adjusted host peak of a successful final Stage for the ETA slot forecast."""
 
     ceiling_kb: float = 0.0
 
@@ -99,8 +105,6 @@ class PeakCeiling:
         if not isinstance(peak, (int, float)) or not isfinite(peak) or peak <= 0:
             return
         adjusted = (
-            float(peak) * devices.PEAK_BUMP_MARGIN
-            if entry.get("capped")
-            else float(peak)
+            float(peak) * PEAK_BUMP_MARGIN if entry.get("capped") else float(peak)
         )
         self.ceiling_kb = max(self.ceiling_kb, adjusted)

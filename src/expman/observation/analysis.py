@@ -1,21 +1,14 @@
-"""Offline analysis of a batch's results: simple independent-to-dependent reads.
+"""Analyze scalar metrics, configuration values and durations from batch records.
 
-The module reads only what a batch leaves on disk: the manifest for the run
-list, attempt statuses and durations, each run's ``config.pkl`` for the
-independent variables, and ``metrics.sqlite3`` for the dependent ones.  It
-never imports user code, never executes a pipeline and never writes.
+The reader loads the manifest and configurations from the trusted batch
+directory. An unreadable run configuration is reported in the skipped list.
+An unreadable manifest or a failed metrics query raises AnalysisError.
 
-A batch does not have to be complete.  Every metric is summarised over the
-runs where it exists, every configuration leaf is paired with every metric
-over the runs where both exist, and anything that cannot be read is reported
-as a skipped entry with its reason instead of failing the whole analysis.
-
-The methods are deliberately simple.  A numeric field with three or more
-distinct values gets a Spearman rank correlation; anything else is grouped by
-value, and the share of the metric's total variation that lies between groups
-measures the field's influence.  Constant fields are reported once and then
-left out of every table.  Nothing here asserts causality: a large influence
-only describes the observed data.
+Comparisons use successful runs containing both the metric and configuration
+field, with at least three paired observations. Numeric fields with three
+or more distinct values use Spearman rank correlation. Other varying fields
+are grouped by value and compared using the fraction of metric variation
+between groups.
 """
 
 import json
@@ -24,15 +17,17 @@ import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import mean, stdev
 from time import time
 from typing import Any
 
-from expman.observation.status import last_status, run_state
-from expman.storage.base import PickleSerializer, StorageError, read_record
+from expman.observation.status import RecordedBatch
+from expman.storage.base import StorageError
+from expman.storage.batch import BatchStore
 
 ANALYSIS_SCHEMA = 1
 SUMMARY_STEP = -1  # MetricStore's sentinel for run-level summary values
-MIN_NUMERIC_POINTS = 3  # a rank correlation below this says nothing
+MIN_NUMERIC_POINTS = 3  # Minimum paired observations for any field/metric comparison.
 MIN_GROUPS = 2
 DURATION_METRIC = "run_duration_seconds"
 
@@ -54,7 +49,7 @@ class RunRow:
 
 @dataclass(frozen=True)
 class Collected:
-    """The joined table plus everything that could not be joined."""
+    """The joined rows and the runs whose configurations could not be read."""
 
     runs: list[RunRow]
     skipped: list[dict[str, str]]
@@ -84,10 +79,7 @@ def fingerprint(directory: Path) -> tuple:
     return tuple(parts)
 
 
-def _total_seconds(entry: dict) -> float | None:
-    attempts = entry.get("attempts")
-    if not isinstance(attempts, list):
-        return None
+def _total_seconds(attempts: list) -> float | None:
     total = 0.0
     seen = False
     for attempt in attempts:
@@ -98,28 +90,21 @@ def _total_seconds(entry: dict) -> float | None:
     return total if seen else None
 
 
-def _read_config(directory: Path, run_id: str) -> dict:
-    path = directory / "experiments" / run_id / "config.pkl"
-    try:
-        config = read_record(path, PickleSerializer())
-    except (StorageError, OSError) as error:
-        raise AnalysisError(f"cannot read {path}: {error}") from error
-    if not isinstance(config, dict):
-        raise AnalysisError(f"{path} does not hold a configuration mapping")
-    return config
-
-
-def _metric_name(stage: tuple, metric: tuple, shared: set[tuple]) -> str:
-    if metric in shared:
-        return "S" + ".".join(str(part) for part in stage) + "." + ".".join(metric)
-    return ".".join(metric)
+def _path_label(path: tuple[str, ...]) -> str:
+    """Quote literal keys that would look like a nested path or stage qualifier."""
+    return ".".join(
+        part
+        if part.isidentifier() and not (part.startswith("S") and part[1:].isdecimal())
+        else json.dumps(part, ensure_ascii=False)
+        for part in path
+    )
 
 
 def _read_metrics(directory: Path, run_ids: set[str]) -> dict[str, dict[str, float]]:
     """Per-run ``{metric name: value}`` maps; summaries beat intermediate steps.
 
-    A metric logged once under the same name in several stages is kept under a
-    stage-prefixed name so the two never overwrite each other.
+    When several stages log the same metric path, qualify each name with
+    its stage path.
     """
     path = directory / "metrics.sqlite3"
     if not path.exists():
@@ -172,49 +157,36 @@ def _read_metrics(directory: Path, run_ids: set[str]) -> dict[str, dict[str, flo
 
     per_run: dict[str, dict[str, float]] = {run_id: {} for run_id in run_ids}
     for (run_id, stage, metric), (_, value) in chosen.items():
-        per_run[run_id][_metric_name(stage, metric, shared)] = value
+        name = _path_label(metric)
+        if metric in shared or name == DURATION_METRIC:
+            name = "S" + ".".join(str(part) for part in stage) + "." + name
+        per_run[run_id][name] = value
     return per_run
 
 
 def collect_runs(directory: Path) -> Collected:
     """Join the manifest, each run's config and the metric store into rows."""
     try:
-        manifest = read_record(directory / "batch.pkl", PickleSerializer())
-    except (StorageError, OSError) as error:
-        raise AnalysisError(
-            f"cannot read {directory / 'batch.pkl'}: {error}"
-        ) from error
-    entries = manifest.get("experiments") if isinstance(manifest, dict) else None
-    if not isinstance(entries, list):
-        raise AnalysisError(f"{directory} does not hold a Batch manifest")
-
-    run_ids: set[str] = set()
-    for entry in entries:
-        if isinstance(entry, dict) and isinstance(entry.get("run_id"), str):
-            run_ids.add(entry["run_id"])
-    metrics = _read_metrics(directory, run_ids)
-    active = set(manifest.get("active_gpu") or {})
-    queue = set(manifest.get("queue") or [])
-
-    runs: list[RunRow] = []
-    skipped: list[dict[str, str]] = []
-    for entry in entries:
-        if not isinstance(entry, dict) or not isinstance(entry.get("run_id"), str):
-            continue
-        run_id = entry["run_id"]
-        status = run_state(run_id, last_status(entry), active, queue)
+        report = RecordedBatch.read(directory)
+    except StorageError as error:
+        raise AnalysisError(str(error)) from error
+    store = BatchStore(directory)
+    metrics = _read_metrics(directory, {run.run_id for run in report.runs})
+    runs = []
+    skipped = []
+    for run in report.runs:
         try:
-            config = _read_config(directory, run_id)
-        except AnalysisError as error:
-            skipped.append({"run_id": run_id, "reason": str(error)})
+            config = store.load_config(run.run_id)
+        except StorageError as error:
+            skipped.append({"run_id": run.run_id, "reason": str(error)})
             continue
         runs.append(
             RunRow(
-                run_id=run_id,
-                status=status,
-                duration_seconds=_total_seconds(entry),
+                run_id=run.run_id,
+                status=run.state,
+                duration_seconds=_total_seconds(run.attempts),
                 config=config,
-                metrics=metrics.get(run_id, {}),
+                metrics=metrics.get(run.run_id, {}),
             )
         )
     return Collected(runs=runs, skipped=skipped)
@@ -237,6 +209,8 @@ def _is_number(value: Any) -> bool:
 
 
 def _group_key(value: Any) -> str:
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
     return json.dumps(value, sort_keys=True, default=str)
 
 
@@ -276,22 +250,27 @@ def _spearman(xs: list[float], ys: list[float]) -> float | None:
 def _sample_sd(values: list[float]) -> float | None:
     if len(values) < 2:
         return None
-    mean = sum(values) / len(values)
-    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
-    return math.sqrt(variance)
+    try:
+        return stdev(values)
+    except OverflowError:
+        # The standard deviation itself can exceed the maximum finite float.
+        return None
 
 
 def _eta_squared(groups: dict[str, list[float]]) -> float | None:
     """The share of the metric's total variation that lies between groups."""
     everything = [value for values in groups.values() for value in values]
-    total_mean = sum(everything) / len(everything)
-    ss_total = sum((value - total_mean) ** 2 for value in everything)
+    scale = max(abs(value) for value in everything)
+    if scale == 0:
+        return None
+    # Scaling cancels in this ratio and keeps the squared deviations in range.
+    total_mean = mean(everything) / scale
+    ss_total = sum((value / scale - total_mean) ** 2 for value in everything)
     if ss_total <= 0:
         return None
     ss_between = 0.0
     for values in groups.values():
-        mean = sum(values) / len(values)
-        ss_between += len(values) * (mean - total_mean) ** 2
+        ss_between += len(values) * (mean(values) / scale - total_mean) ** 2
     return ss_between / ss_total
 
 
@@ -320,7 +299,7 @@ def _categorical_pair(
             {
                 "value": raw_values[key],
                 "n": len(values),
-                "mean": sum(values) / len(values),
+                "mean": mean(values),
             }
         )
     summary.sort(key=lambda item: (-item["mean"], str(item["value"])))
@@ -329,7 +308,7 @@ def _categorical_pair(
     if lonely:
         note = "每个取值只有一个样本，只列各组均值，不计算影响力度量"
     else:
-        note = None if _eta_squared(groups) is not None else "指标在有效样本内无变异"
+        note = None if effect is not None else "指标在有效样本内无变异"
     return {
         "field": field_name,
         "kind": "categorical",
@@ -351,9 +330,7 @@ def _pair_for(
     if len(distinct) <= 1:
         return None
     if all(_is_number(value) for value in field_values) and len(distinct) >= 3:
-        return _numeric_pair(
-            field_name, [float(value) for value in field_values], metric_values
-        )
+        return _numeric_pair(field_name, field_values, metric_values)
     groups: dict[str, list[float]] = {}
     raw: dict[str, Any] = {}
     for value, y in zip(field_values, metric_values, strict=True):
@@ -368,7 +345,7 @@ def _pair_for(
 def _metric_stats(values: list[float], analyzed: int) -> dict[str, Any]:
     return {
         "n": len(values),
-        "mean": sum(values) / len(values) if values else None,
+        "mean": mean(values) if values else None,
         "sd": _sample_sd(values) if values else None,
         "min": min(values) if values else None,
         "max": max(values) if values else None,
@@ -397,7 +374,7 @@ def analysis_payload(directory: Path, batch_id: int | None = None) -> dict:
     for path in sorted(field_paths):
         seen = {_group_key(leaves[path]) for leaves in flat.values() if path in leaves}
         if len(seen) <= 1:
-            constant_fields.append(".".join(path) if path else "(root)")
+            constant_fields.append(_path_label(path) if path else "(root)")
         else:
             varying.append(path)
 
@@ -426,7 +403,7 @@ def analysis_payload(directory: Path, batch_id: int | None = None) -> dict:
         pairs: list[dict[str, Any]] = []
         insufficient = 0
         for path in varying:
-            field_name = ".".join(path)
+            field_name = _path_label(path)
             picked = [
                 (leaves[path], samples[run_id])
                 for run_id, leaves in flat.items()

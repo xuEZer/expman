@@ -1,49 +1,22 @@
 """Sequential composition of user-defined stages."""
 
 import sys
-import warnings
 from collections.abc import Iterable
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
-from time import perf_counter
 from typing import Any
 
 from expman.core.context import RunContext, _name
-from expman.core.dependencies import stage_dependencies
-from expman.core.events import Status
+from expman.core.execution import ManagedStages
 from expman.core.stage import Stage
-from expman.storage.base import Checkpoint, RecoveryWarning
-
-
-def _reuse_completed(scoped, store, completed, position, restore_seconds):
-    """Restore one completed Stage's snapshot and record the reuse."""
-    with scoped.observe(completed["name"], kind="stage", reused=True):
-        output = completed["output"]
-        store.status(
-            position,
-            Status.SUCCEEDED.value,
-            scoped.attempt,
-            reused=True,
-            elapsed_seconds=completed.get("elapsed_seconds"),
-            restore_seconds=restore_seconds,
-        )
-    return output
 
 
 def _module_source_hash(stage: type[Stage[Any, Any]]) -> str | None:
-    """Hash the file a stage's module was loaded from.
+    """Fingerprint the containing module in both the scheduler and fresh workers.
 
-    `inspect.getsource(stage)` is the obvious choice, but it is not stable
-    across worker processes: with `forkserver` / `spawn` (the Linux default
-    from Python 3.14) the entry script runs in the child under a different
-    module name, and `getsource` raises `OSError: source code not available`
-    there. The parent would then hash the class while the worker hashed
-    nothing, and the two derived different shared-cache keys -- every lookup
-    failed with `invalid shared-cache reference`. The module file resolves to
-    the same path on both sides, so hash that instead. The granularity is
-    coarser -- editing anything in the file invalidates every stage it holds --
-    which only ever rebuilds more than strictly needed.
+    Editing the file changes the signature for every Stage defined in it.
+    Dynamic modules without a readable file contribute only the class identity.
     """
     module = sys.modules.get(stage.__module__)
     path = getattr(module, "__file__", None)
@@ -60,7 +33,8 @@ class Pipeline:
 
     An empty pipeline returns its input unchanged. Adjacent stage input/output
     compatibility is the caller's responsibility, as Python values may be
-    arbitrary objects. Each execution constructs fresh, zero-argument stages.
+    arbitrary objects. Each Stage that needs to compute an output is
+    constructed without arguments. A restored output skips construction.
     """
 
     def __init__(
@@ -110,127 +84,19 @@ class Pipeline:
             invocation = context._pipeline_calls.get(base, 0)
             context._pipeline_calls[base] = invocation + 1
             base = (*base, invocation)
-        if context._store is not None:
-            context._store.bind_pipeline(base, self.signature())
-        shared = (
-            context._store.shared if context._store is not None and not base else None
+        managed = (
+            ManagedStages(context._store, base, self.signature())
+            if context._store is not None
+            else None
         )
-        parent = "root"
-        lookup = True
+        stages = self.stages if stop_after is None else self.stages[: stop_after + 1]
         with context.observe(self.name, kind="pipeline") as pipeline_context:
-            for index, stage_type in enumerate(self.stages):
-                position = (*base, index)
+            for index, stage in enumerate(stages):
                 scoped = replace(
-                    pipeline_context,
-                    stage_id=index,
-                    _stage_path=position,
-                    _checkpoint=None,
+                    pipeline_context, stage_id=index, _stage_path=(*base, index)
                 )
-                store = scoped._store
-                if store is not None and shared is not None:
-                    store.cache_position = position
-                    store.cache_parent = parent
-                restore_started = perf_counter()
-                completed = None
-                if store is not None:
-                    completed = store.completed(position)
-                if store is not None and completed is not None:
-                    store.restore_random(completed)
-                    data = _reuse_completed(
-                        scoped,
-                        store,
-                        completed,
-                        position,
-                        perf_counter() - restore_started,
-                    )
-                    if shared is not None:
-                        reference = completed.get("_cache_ref")
-                        parent = reference[2] if reference is not None else None
-                        lookup = lookup and completed.get("_shared_reused", False)
-                    if stop_after == index:
-                        return data
-                    continue
-                if store is not None and shared is not None and lookup:
-                    # Own in-progress work has priority over another run's result.
-                    started = (store.stage_dir(position) / "status.pkl").exists()
-                    if not started and not store.checkpoints(position):
-                        restore_started = perf_counter()
-                        candidate = shared.find(parent, position, scoped.cfg)
-                        if candidate is not None:
-                            reference, completed = candidate
-                            store.restore_random(completed)
-                            store.restore_metrics(
-                                context.attempt, completed.get("metrics", [])
-                            )
-                            store.reference(position, reference, reused=True)
-                            data = _reuse_completed(
-                                scoped,
-                                store,
-                                completed,
-                                position,
-                                perf_counter() - restore_started,
-                            )
-                            parent = reference[2]
-                            if stop_after == index:
-                                return data
-                            continue
-                    lookup = False
-                checkpoint = None
-                try:
-                    if store is not None:
-                        dependencies = stage_dependencies(stage_type, scoped.cfg)
-                        store.status(position, Status.RUNNING.value, context.attempt)
-                        checkpoint = store.latest(position, config=scoped.cfg)
-                        if checkpoint is not None:
-                            scoped._pipeline_calls.update(
-                                checkpoint.get("pipeline_calls", {})
-                            )
-                        scoped = replace(
-                            scoped,
-                            _checkpoint_record=checkpoint,
-                            _checkpoint=Checkpoint(
-                                store,
-                                position,
-                                scoped._pipeline_calls,
-                                dependencies,
-                            ),
-                        )
-                    if store is not None:
-                        store.start_timing(position, checkpoint)
-                    stage = stage_type()
-                    data = stage.run(data, scoped)
-                    if store is not None:
-                        store.status(
-                            position,
-                            Status.SUCCEEDED.value,
-                            context.attempt,
-                            elapsed_seconds=store.saved_seconds(position),
-                        )
-                        if shared is not None:
-                            reference = store.completed_reference(position)
-                            parent = reference[2] if reference is not None else None
-                        if stop_after == index:
-                            return data
-                except BaseException as error:
-                    if store is not None:
-                        status = (
-                            Status.FAILED
-                            if isinstance(error, Exception)
-                            else Status.CANCELLED
-                        )
-                        try:
-                            store.status(position, status.value, context.attempt)
-                        except Exception as storage_error:
-                            warnings.warn(
-                                f"cannot record stage status: {storage_error}",
-                                RecoveryWarning,
-                                stacklevel=2,
-                            )
-                    raise
-                finally:
-                    if store is not None:
-                        store.stop_timing(position)
-                        if shared is not None:
-                            store.cache_position = None
-                            store.cache_parent = None
-            return data
+                if managed is None:
+                    data = stage().run(data, scoped)
+                else:
+                    data = managed.run(stage, data, scoped)
+        return data

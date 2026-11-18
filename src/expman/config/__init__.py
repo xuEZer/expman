@@ -1,19 +1,6 @@
-"""Configuration loading and device selection."""
+"""YAML experiment definitions and expansion into concrete configurations."""
 
-from expman.config._config import ConfigError, MissingConfigWarning, load_configs
-from expman.config.devices import (
-    DeviceMemory,
-    MeminfoMonitor,
-    NvidiaMemory,
-    configured_devices,
-)
+from expman.config.loader import MissingConfigWarning, load_configs
+from expman.config.schema import ConfigError, configured_devices
 
-__all__ = [
-    "ConfigError",
-    "DeviceMemory",
-    "MeminfoMonitor",
-    "MissingConfigWarning",
-    "NvidiaMemory",
-    "configured_devices",
-    "load_configs",
-]
+__all__ = ["ConfigError", "MissingConfigWarning", "configured_devices", "load_configs"]

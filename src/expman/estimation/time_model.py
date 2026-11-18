@@ -2,7 +2,7 @@
 
 import hashlib
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,16 +10,16 @@ MAX_COLUMNS = 48
 
 
 def _flatten(value, path=()):
-    if isinstance(value, Mapping) and value:
+    if isinstance(value, Mapping):
         result = {}
         for key, item in value.items():
             result.update(_flatten(item, (*path, ("key", str(key)))))
-        return result
-    if isinstance(value, (list, tuple)) and value:
+        return result or {path: {}}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         result = {}
         for index, item in enumerate(value):
             result.update(_flatten(item, (*path, ("index", index))))
-        return result
+        return result or {path: []}
     return {path: value}
 
 
@@ -27,7 +27,7 @@ def _token(value):
     if type(value) is int:
         return ("int", format(value, "x"))
     if isinstance(value, (set, frozenset)):
-        return (type(value).__name__, repr(sorted(_token(item) for item in value)))
+        return ("set", repr(sorted(_token(item) for item in value)))
     return (type(value).__name__, repr(value))
 
 
@@ -110,7 +110,7 @@ def encode(configs) -> Encoding:
 
 
 def variable_distance(encoding: Encoding, left, right) -> float:
-    """Mean per-variable disagreement between two encoded rows, in ``[0, 1]``.
+    """Mean disagreement between two encoded rows.
 
     Distance is averaged over the declared variables rather than over encoded
     columns, so a variable contributes the same weight no matter how many columns
@@ -120,7 +120,8 @@ def variable_distance(encoding: Encoding, left, right) -> float:
     agree on what "nearby" means.
 
     Once columns are hashed together the grouping is gone and only per-column
-    differences remain.
+    differences remain. Collisions in a hashed column can produce distances
+    above one.
     """
     variables = encoding.variables
     if variables is None:

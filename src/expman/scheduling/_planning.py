@@ -1,18 +1,33 @@
 """Pure helper functions for the scheduler packing plan."""
 
-PLAN_CANDIDATES_PER_STAGE = 32
+from dataclasses import dataclass
+
+from expman.estimation.duration_model import StageDuration
+
 PLAN_BEAM_WIDTH = 128
 
 
-def _interleave(groups):
-    """Round-robin candidates so one Stage cannot consume beam search first."""
-    items = []
-    longest = max((len(group) for group in groups), default=0)
-    for index in range(longest):
-        for group in groups:
-            if index < len(group):
-                items.append(group[index])
-    return items
+@dataclass(frozen=True)
+class Candidate:
+    """One ready Stage with its resource reservations for this scheduling tick."""
+
+    run_id: str
+    stage_index: int
+    host_reserve_kb: float
+    gpu_reserve_kb: float
+    gpu_cap_kb: float
+    expected: StageDuration | None
+    novelty: float
+
+
+@dataclass(frozen=True)
+class Plan:
+    """A feasible placement of ready Stage candidates on the selected cards."""
+
+    host_left_kb: float
+    gpu_left_kb: tuple[float, ...]
+    placements: tuple[tuple[Candidate, int], ...] = ()
+    novelty: float = 0.0
 
 
 def _plan_score(plan, host_capacity, gpu_totals):
@@ -29,3 +44,32 @@ def _plan_score(plan, host_capacity, gpu_totals):
     )
     # Parameter diversity only breaks materially equivalent packing choices.
     return -unused + 1e-6 * plan.novelty
+
+
+def pack_candidates(candidates, host_capacity, devices, gpu_capacities, gpu_totals):
+    """Choose placements for the current headroom, balancing load against card totals."""
+    plans = [Plan(host_capacity, gpu_capacities)]
+    for candidate in candidates:
+        expanded = list(plans)
+        for plan in plans:
+            if candidate.host_reserve_kb > plan.host_left_kb:
+                continue
+            for index, gpu_left in enumerate(plan.gpu_left_kb):
+                if candidate.gpu_reserve_kb > gpu_left:
+                    continue
+                left = list(plan.gpu_left_kb)
+                left[index] -= candidate.gpu_reserve_kb
+                expanded.append(
+                    Plan(
+                        plan.host_left_kb - candidate.host_reserve_kb,
+                        tuple(left),
+                        (*plan.placements, (candidate, devices[index])),
+                        plan.novelty + candidate.novelty,
+                    )
+                )
+        plans = sorted(
+            expanded,
+            key=lambda plan: _plan_score(plan, host_capacity, gpu_totals),
+            reverse=True,
+        )[:PLAN_BEAM_WIDTH]
+    return plans[0].placements

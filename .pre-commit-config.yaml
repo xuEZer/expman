@@ -17,13 +17,14 @@ repos:
         pass_filenames: false
       - id: pyright
         name: Pyright type check
-        entry: uv run pyright
+        entry: uv run --no-sync pyright
         language: system
         always_run: true
         pass_filenames: false
       - id: pytest
         name: Pytest test suite
-        entry: uv run pytest
+        entry: uv run --no-sync pytest -rs
+        verbose: true
         language: system
         always_run: true
         pass_filenames: false

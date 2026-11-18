@@ -66,9 +66,9 @@ class BatchProgress:
     def _snapshot(self):
         with self.batch._state_lock:
             scheduler = self.batch._scheduler
-            stages = None if scheduler is None else scheduler.stage_completion()
+            stages = None if scheduler is None else scheduler.stages.completion()
             cards = " ".join(
-                f"GPU{device}:{sum(value == device for value in self.batch._active_gpu.values())}运行"
+                f"GPU{device}:{sum(value == device for value in self.batch.state.active_gpu.values())}运行"
                 for device in self.batch.devices
             )
             return stages, cards

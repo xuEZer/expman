@@ -8,9 +8,8 @@ is the natural center.
 Choosing a fixed number of nearest configurations makes the estimate jump
 whenever a sample crosses the neighborhood boundary, so every completed sample
 contributes instead through a Gaussian kernel. Its bandwidth is the distance of
-roughly the ``n / NEIGHBORHOOD``-th nearest sample, which keeps the effective
-neighborhood about constant as samples accumulate while leaving the weights
-continuous instead of cutting off at a rank.
+the ``max(2, ceil(n / NEIGHBORHOOD))``-th positive distance, capped at the
+number of distinct-from-query samples. Exact matches retain full weight.
 
 The interval is multiplicative: the residual distribution of the center estimate
 is read at the empirical order statistic single-sided conformal prediction asks
@@ -18,9 +17,8 @@ for, and applied to the prediction, so a Stage that takes hours gets an interval
 in hours rather than one inherited from a Stage that takes seconds. Residuals are
 leave-one-out and measured at each sample's *own* configuration, because the
 error a sample carries is its own; measuring it at the query would fold the
-configuration distance into the width. Only completed attempts calibrate the
-interval: a cancelled one measured a lower bound, so its residual is a lower
-bound too and belongs on the lower side alone.
+configuration distance into the width. Completed attempts set the center and upper residual quantile. A cancelled
+attempt contributes a lower bound to the residual pool for the lower endpoint.
 """
 
 import math
@@ -29,8 +27,7 @@ from typing import NamedTuple
 
 from expman.estimation.time_model import Encoding, variable_distance
 
-# Neighborhood size as a fraction of the sample count: the bandwidth is the
-# distance of the ``n / NEIGHBORHOOD``-th nearest sample.
+# Bandwidth rank scales with the sample count.
 NEIGHBORHOOD = 8
 
 
@@ -122,7 +119,7 @@ class DurationModel:
         """Leave-one-out log residuals, each measured at its own configuration."""
         if self._calibrated is None:
             samples = self._completed
-            self._calibrated = []
+            calibrated = []
             for index, sample in enumerate(samples):
                 others = [
                     other for position, other in enumerate(samples) if position != index
@@ -133,7 +130,8 @@ class DurationModel:
                     self._weights(sample.row, others), others, others[0]
                 )
                 if prediction is not None:
-                    self._calibrated.append(sample.log_seconds - math.log(prediction))
+                    calibrated.append(sample.log_seconds - math.log(prediction))
+            self._calibrated = calibrated
         return self._calibrated
 
     def _censored_residuals(self) -> list[float]:
@@ -147,7 +145,7 @@ class DurationModel:
                 residuals.append(sample.log_seconds - math.log(prediction))
         return residuals
 
-    def predict(self, run_id) -> StageDuration | None:
+    def predict(self, run_id, *, coverage: float | None = None) -> StageDuration | None:
         """Estimate one Stage duration, or ``None`` without a completed sample."""
         query = self.indices.get(run_id)
         if query is None or not self._completed:
@@ -165,7 +163,7 @@ class DurationModel:
         lower_residuals = upper_residuals + self._censored_residuals()
         if not upper_residuals or not lower_residuals:
             return StageDuration(center, center, center)
-        alpha = 1.0 - self.coverage
+        alpha = 1.0 - (self.coverage if coverage is None else coverage)
         lower = center * math.exp(_order_statistic(lower_residuals, alpha / 2))
         upper = center * math.exp(_order_statistic(upper_residuals, 1 - alpha / 2))
         return StageDuration(
