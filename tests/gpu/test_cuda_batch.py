@@ -1,6 +1,7 @@
 """End-to-end CLI tests on a reserved physical CUDA/MPS device."""
 
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -8,7 +9,12 @@ from time import monotonic, sleep
 
 import pytest
 
-from expman import Batch, Pipeline, Stage, Status
+from expman import Pipeline, Stage
+from expman.observation.registry import ensure_ids
+from expman.observation.status import RecordedBatch
+from expman.storage.batch import BatchStore
+from expman.storage.prefix_cache import PrefixCache
+from expman.storage.run import RunStore
 
 
 class SumSquares(Stage):
@@ -64,6 +70,23 @@ def cli_env():
     return env
 
 
+def read_outputs(directory, batch):
+    """Resolve each run's final stage snapshot, including shared prefixes."""
+    store = BatchStore(directory)
+    signature = batch.manifest["pipeline"]
+    outputs = []
+    for run in batch.runs:
+        seed = store.load_config(run.run_id)["seed"]
+        snapshots = RunStore(directory / "experiments" / run.run_id)
+        snapshots.shared = PrefixCache(
+            directory / "cache", signature, seed, store.serializer
+        )
+        final = snapshots.completed((len(signature) - 1,))
+        assert final is not None
+        outputs.append(final["output"])
+    return outputs
+
+
 def test_cuda_batch_reuses_prefix_and_recovers_checkpoint(
     tmp_path, cli_env, gpu_device
 ):
@@ -71,44 +94,43 @@ def test_cuda_batch_reuses_prefix_and_recovers_checkpoint(
     config.write_text(
         f"device: [{gpu_device}]\nseed: 42\nfactor: 2\ngrid:\n  factor: [2, 3]\n"
     )
-    directory = tmp_path / "batch"
     subprocess.run(
         [
             *CLI,
             "run",
             f"{__name__}:cuda_pipeline",
             str(config),
-            "-o",
-            str(directory),
+            "--batches-dir",
+            str(tmp_path),
         ],
         cwd=tmp_path,
         env=cli_env,
         check=True,
         timeout=150,
     )
-    batch = Batch.resume(cuda_pipeline, directory)
-    results = batch.results
-
-    assert all(result.status == Status.SUCCEEDED for result in results), results
+    directory = ensure_ids(tmp_path)[0]
+    batch = RecordedBatch.read(directory)
+    assert [run.state for run in batch.runs] == ["succeeded", "succeeded"]
     expected = [sum(i * i for i in range(256)) * factor for factor in (2, 3)]
-    assert [result.output for result in results] == expected
-    for result in results:
-        assert [a.error_message for a in result.attempts] == [
+    assert read_outputs(directory, batch) == expected
+    for run in batch.runs:
+        assert [attempt["error_message"] for attempt in run.attempts] == [
             "retry from checkpoint",
             None,
         ]
 
-    history = batch.state.stage_history
+    history = batch.manifest["stage_history"]
     assert sum(row["reused"] for row in history if row["stage"] == 0) == 1
     workers = [row for row in history if not row["reused"]]
     assert all(
         row["gpu_limit_verified"] and row["device"] == gpu_device for row in workers
     )
-    for result in results:
+    for run in batch.runs:
         measured = sum(
-            row["duration"] for row in workers if row["run_id"] == result.run_id
+            row["duration"] for row in workers if row["run_id"] == run.run_id
         )
-        assert result.duration_seconds == pytest.approx(measured)
+        elapsed = sum(attempt["duration_seconds"] for attempt in run.attempts)
+        assert elapsed == pytest.approx(measured)
 
 
 def test_stop_and_resume_from_a_committed_cuda_checkpoint(
@@ -117,10 +139,19 @@ def test_stop_and_resume_from_a_committed_cuda_checkpoint(
     ready = tmp_path / "first-checkpoint"
     config = tmp_path / "experiment.yaml"
     config.write_text(f"device: [{gpu_device}]\nseed: 42\nready: {ready}\n")
-    directory = tmp_path / "batch"
+    parent = tmp_path / "training batches"
     where = {"cwd": tmp_path, "env": cli_env}
     owner = subprocess.Popen(
-        [*CLI, "run", f"{__name__}:pause_pipeline", str(config), "-o", str(directory)],
+        [
+            *CLI,
+            "run",
+            f"{__name__}:pause_pipeline",
+            str(config),
+            "--batches-dir",
+            str(parent),
+        ],
+        stderr=subprocess.PIPE,
+        text=True,
         **where,
     )
     try:
@@ -129,23 +160,34 @@ def test_stop_and_resume_from_a_committed_cuda_checkpoint(
             assert owner.poll() is None, "the batch exited before its checkpoint"
             assert monotonic() < deadline, "the worker did not publish a checkpoint"
             sleep(0.1)
-        subprocess.run([*CLI, "stop", str(directory)], **where, check=True, timeout=15)
-        assert owner.wait(timeout=30) == 143
+        subprocess.run(
+            [*CLI, "stop", "0", "--batches-dir", str(parent)],
+            **where,
+            check=True,
+            timeout=15,
+        )
+        _, stderr = owner.communicate(timeout=30)
+        assert owner.returncode == 143
     finally:
         if owner.poll() is None:
             owner.kill()
             owner.wait(timeout=10)
 
-    subprocess.run([*CLI, "resume", str(directory)], **where, check=True, timeout=90)
-    batch = Batch.resume(pause_pipeline, directory)
-    (result,) = batch.results
-    assert [attempt.status for attempt in result.attempts] == [
-        Status.CANCELLED,
-        Status.SUCCEEDED,
-    ]
-    assert result.output == 21
-    assert [row["attempt"] for row in batch.state.stage_history] == [1, 2]
+    hint = next(
+        line
+        for line in stderr.splitlines()
+        if line.startswith("Stopped; resume with: ")
+    )
+    resume = shlex.split(hint.removeprefix("Stopped; resume with: "))
+    assert resume == ["expman", "resume", "0", "--batches-dir", str(parent)]
+    subprocess.run([*CLI, *resume[1:]], **where, check=True, timeout=90)
+    directory = ensure_ids(parent)[0]
+    batch = RecordedBatch.read(directory)
+    (run,) = batch.runs
+    assert [attempt["status"] for attempt in run.attempts] == ["cancelled", "succeeded"]
+    assert read_outputs(directory, batch) == [21]
+    history = batch.manifest["stage_history"]
+    assert [row["attempt"] for row in history] == [1, 2]
     assert all(
-        row["device"] == gpu_device and row["gpu_limit_verified"]
-        for row in batch.state.stage_history
+        row["device"] == gpu_device and row["gpu_limit_verified"] for row in history
     )

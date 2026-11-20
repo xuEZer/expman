@@ -42,8 +42,8 @@ pytest 和提交 hook 默认运行 `tests/cpu/` 和 `tests/gpu/`。后者需要 
 uv run --no-sync pytest tests/gpu/
 ```
 
-提交 hook 和上面的命令都使用已安装的项目环境，避免提交时自动替换 PyTorch。
+提交 hook 中的 Pyright 和 pytest 均使用 `uv run --no-sync`，保留项目环境中已安装的 PyTorch。
 
 测试检查主机剩余内存，并在 `CUDA_VISIBLE_DEVICES` 可见、空闲显存能容纳初始 worker 限额的物理卡中，选择 `nvidia-smi` 采样利用率最低的一张。正在运行其他计算任务的卡也参与排序。利用率相同时优先选空闲显存更多的卡，显存也相同时选物理编号较小的卡。
 
-并发测试按 GPU UUID 加锁，在同一 Linux 网络命名空间中各自领取一张卡，直到本次真卡用例结束。测试输出选中的物理卡编号和 UUID。硬件条件不足或 CUDA/MPS 用例执行出错都会使测试和提交检查失败。
+第一次运行真卡用例时，pytest 按上述顺序尝试预留一张卡，并输出物理卡编号和 UUID。同一 Linux 网络命名空间内的并发 pytest 进程按 UUID 互斥，每个进程持有预留直到自己的测试会话结束。所有候选卡都已被其他测试预留、硬件条件不足或 CUDA/MPS 用例执行出错时，检查会失败。

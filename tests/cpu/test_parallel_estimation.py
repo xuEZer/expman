@@ -1,12 +1,11 @@
-import io
 from types import SimpleNamespace
 
 import pytest
+from batch_helpers import make_batch, restore_batch
 
-from expman import Batch, Pipeline, Stage, Status
+from expman import Pipeline, Stage, Status
 from expman.observation.snapshot import _remaining
 from expman.resources.devices import MemoryObservationError
-from expman.scheduling.progress import BatchProgress
 from expman.scheduling.scheduler import GpuScheduler
 from expman.storage.base import read_record
 
@@ -32,7 +31,7 @@ class Second(Stage):
 def test_eta_counts_only_unmaterialized_stage_parameter_groups(tmp_path):
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text("device: [0]\nseed: 0\nitem: 0\ngrid:\n  item: [0, 1, 2]\n")
-    batch = Batch(Pipeline([First, Second]), cfg, output_dir=tmp_path / "batch")
+    batch = make_batch(Pipeline([First, Second]), cfg, output_dir=tmp_path / "batch")
     first = batch.experiments[0]
     batch.state.queue.remove(first.run_id)
     batch.state.stage_history.extend(
@@ -69,10 +68,7 @@ def test_eta_counts_only_unmaterialized_stage_parameter_groups(tmp_path):
     assert estimate.completed_samples == 2
     assert estimate.remaining_experiments == 2
     assert batch._scheduler is scheduler
-    progress = BatchProgress(batch, enabled=True, interval=1)
-    progress.stream = io.StringIO()
-    progress._render()
-    assert "Stage0:1/1 Stage1:1/3" in progress.stream.getvalue()
+    assert scheduler.stages.completion() == ((0, 1, 1), (1, 1, 3))
 
 
 def _running_batch(tmp_path, monkeypatch, *, elapsed, devices=(0,), items=(0,)):
@@ -80,7 +76,7 @@ def _running_batch(tmp_path, monkeypatch, *, elapsed, devices=(0,), items=(0,)):
     cfg.write_text(
         f"device: {list(devices)}\nseed: 0\nitem: 0\ngrid:\n  item: {list(items)}\n"
     )
-    batch = Batch(Pipeline([First, Second]), cfg, output_dir=tmp_path / "batch")
+    batch = make_batch(Pipeline([First, Second]), cfg, output_dir=tmp_path / "batch")
     run_id = batch.experiments[0].run_id
     batch.state.queue.remove(run_id)
     batch.state.active_gpu[run_id] = devices[0]
@@ -127,7 +123,7 @@ def test_overdue_running_stage_invalidates_cached_eta(tmp_path, monkeypatch, ela
     assert estimate.upper_seconds is None
     assert estimate.remaining_experiments == 2
     assert str(estimate) == "??:??:??～??:??:??"
-    assert batch._display_estimate() == estimate
+    assert batch._snapshot_estimate() == estimate
     remaining = _remaining(batch)
     assert remaining["lower_seconds"] is None
     assert remaining["upper_seconds"] is None
@@ -142,7 +138,8 @@ def test_overdue_running_stage_invalidates_cached_eta(tmp_path, monkeypatch, ela
     timing = read_record(batch.output_dir / "timing.pkl", batch.store.serializer)
     assert timing["estimate"] is None
     assert (
-        Batch.resume(Pipeline([First, Second]), batch.output_dir)._last_estimate is None
+        restore_batch(Pipeline([First, Second]), batch.output_dir)._last_estimate
+        is None
     )
 
 
@@ -228,7 +225,7 @@ def test_explicit_coverage_reprices_the_stage_without_replacing_the_dashboard(
     cfg.write_text(
         "device: [0]\nseed: 0\nitem: 0\ngrid:\n  item: [0, 1, 2, 3, 4, 5, 6]\n"
     )
-    batch = Batch(Pipeline([Second]), cfg, output_dir=tmp_path / "batch")
+    batch = make_batch(Pipeline([Second]), cfg, output_dir=tmp_path / "batch")
     for seconds in [10, 12, 11, 18, 15, 13]:
         batch.state.stage_history.append(
             {
@@ -262,14 +259,14 @@ def test_explicit_coverage_reprices_the_stage_without_replacing_the_dashboard(
     expected = scheduler.stages.duration(run_id, 0, coverage=0.5)
     assert narrow.lower_seconds == pytest.approx(expected.lower - elapsed)
     assert narrow.upper_seconds == pytest.approx(expected.upper - elapsed)
-    assert batch._display_estimate() == default
+    assert batch._snapshot_estimate() == default
     assert batch.live.schedule_view is view
 
 
 def test_greedy_scenarios_can_finish_in_the_opposite_order(tmp_path, monkeypatch):
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text("device: [0, 1]\nseed: 0\nitem: 0\ngrid:\n  item: [0, 1, 2]\n")
-    batch = Batch(Pipeline([Second, Second]), cfg, output_dir=tmp_path / "batch")
+    batch = make_batch(Pipeline([Second, Second]), cfg, output_dir=tmp_path / "batch")
     first, second, third = batch.by_id
     batch.state.stage_progress.update({second: 1, third: 1})
     spans = {

@@ -2,6 +2,7 @@ import json
 import os
 import socket
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Barrier
 from time import perf_counter, sleep, time
 from types import SimpleNamespace
@@ -9,10 +10,11 @@ from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import batch_helpers
 import pytest
 import yaml
 
-from expman import Batch, Pipeline, Stage, Status, devices
+from expman import Pipeline, Stage, Status, devices
 from expman.cli import _parser
 from expman.core.context import RunContext
 from expman.core.events import ProgressEvent
@@ -63,7 +65,7 @@ class Host:
 
 
 class Broken:
-    """A stand-in for a Batch whose attributes cannot be read at all."""
+    """A stand-in for a batch whose attributes cannot be read at all."""
 
     def __init__(self, output_dir):
         self.output_dir = output_dir
@@ -80,7 +82,7 @@ def make_batch(root, *, count=2, delay=0.0):
     cfg = {"device": [0], "seed": 0, "markers": str(root), "delay": delay, "item": 0}
     path = root / "experiments.yaml"
     path.write_text(yaml.safe_dump(cfg) + f"grid:\n  item: {list(range(count))}\n")
-    return Batch(Pipeline([Work]), path, output_dir=root / "batch")
+    return batch_helpers.make_batch(Pipeline([Work]), path, output_dir=root / "batch")
 
 
 def seed_finished_first(batch, *, duration=2.0):
@@ -177,7 +179,7 @@ def write_batch_dir(root, name, *, runs=2, status="succeeded", stages=1):
         "pipeline": [
             {"class": f"demo.Stage{index}", "source": None} for index in range(stages)
         ],
-        "pipeline_spec": None,
+        "pipeline_spec": "demo:train",
         "max_retries": 1,
         "experiments": experiments,
         "queue": [entry["run_id"] for entry in experiments] if pending else [],
@@ -240,7 +242,7 @@ def write_live(directory, *, age=0.0, **batch):
 @pytest.mark.simulated_gpu
 def test_the_snapshot_places_every_recorded_attempt_on_the_batch_clock(tmp_path):
     batch = make_batch(tmp_path)
-    batch.run(progress=False)
+    batch.run()
 
     snapshot = build_snapshot(batch)
 
@@ -353,7 +355,7 @@ def test_the_archived_path_exposes_the_folds_it_recorded(tmp_path):
 @pytest.mark.simulated_gpu
 def test_a_finished_batch_reports_stage_and_resource_facts(tmp_path):
     batch = make_batch(tmp_path)
-    batch.run(progress=False)
+    batch.run()
 
     snapshot = build_snapshot(batch)
 
@@ -596,7 +598,7 @@ def test_publishing_degrades_instead_of_raising(tmp_path):
 def test_a_batch_publishes_live_state_while_it_runs(tmp_path):
     batch = make_batch(tmp_path)
 
-    batch.run(progress=False)
+    batch.run()
 
     payload = json.loads((batch.output_dir / LIVE_FILE).read_text())
     assert payload["schema"] == SCHEMA
@@ -610,7 +612,7 @@ def test_publishing_is_skipped_when_switched_off(tmp_path, monkeypatch):
     monkeypatch.setenv("EXPMAN_LIVE", "off")
     batch = make_batch(tmp_path)
 
-    batch.run(progress=False)
+    batch.run()
 
     assert not (batch.output_dir / LIVE_FILE).exists()
 
@@ -619,7 +621,7 @@ def test_publishing_is_skipped_when_switched_off(tmp_path, monkeypatch):
 @pytest.mark.simulated_gpu
 def test_a_finished_batch_reads_back_from_the_snapshot_it_left(tmp_path):
     batch = make_batch(tmp_path)
-    batch.run(progress=False)
+    batch.run()
 
     snapshot = read_batch(batch.output_dir, 3)
 
@@ -732,18 +734,18 @@ def test_the_list_entry_carries_what_the_table_renders(tmp_path):
 
 
 def test_only_directories_holding_records_become_batches(tmp_path):
-    root = tmp_path / "runs"
+    root = tmp_path / "batches"
     assert ensure_ids(root) == {}
     assert not root.exists()
     root.mkdir()
     assert ensure_ids(root) == {}
     assert not list(root.iterdir())
 
-    write_batch_dir(tmp_path / "runs", "run_a")
-    write_batch_dir(tmp_path / "runs", "run_b")
-    (tmp_path / "runs" / "notes").mkdir()
+    write_batch_dir(root, "run_a")
+    write_batch_dir(root, "run_b")
+    (root / "notes").mkdir()
 
-    ids = ensure_ids(tmp_path / "runs")
+    ids = ensure_ids(root)
 
     assert sorted(ids) == [0, 1]
     assert {directory.name for directory in ids.values()} == {"run_a", "run_b"}
@@ -788,7 +790,7 @@ class TestDashboard:
     @pytest.fixture
     def runs(self, tmp_path):
         """Give run_a the earlier mtime so the first discovery assigns it ID 0."""
-        root = tmp_path / "runs"
+        root = tmp_path / "batches"
         write_batch_dir(root, "run_a", runs=3)
         write_batch_dir(root, "run_b", runs=1, status="failed")
         now = time()
@@ -919,6 +921,9 @@ class TestDashboard:
         with patch.object(Workspace, "collect", return_value=([], {})):
             stream.refresh()
         assert json.loads(stream.frame(0))["batch"]["id"] == 0
+        (runs / "run_a").rename(runs.parent / "removed")
+        stream.refresh()
+        assert json.loads(stream.frame(0))["batch"] is None
 
     def test_a_failed_build_does_not_empty_the_open_pages(self, runs):
         stream = Stream(Workspace(runs), interval=1.0)
@@ -929,29 +934,23 @@ class TestDashboard:
         assert json.loads(stream.frame(0))["batch"]["id"] == 0
         assert "boom" in json.loads(stream.frame(""))["degraded"]
 
-    def test_a_read_only_dashboard_refuses_to_stop(self, runs):
-        dashboard = serve(runs, port=0, interval=1.0, allow_stop=False)
-        try:
-            status, _body, _headers = self.get(
-                Request(dashboard.url + "api/stop/0", method="POST")
-            )
-            assert status == 403
-        finally:
-            dashboard.close()
-
     def test_stopping_writes_to_the_running_batch_channel(self, runs):
         endpoint = runs / "run_a" / STOP_FIFO
         os.mkfifo(endpoint)
         # Restore the intended discovery order before the first registry scan.
         now = time()
         os.utime(runs / "run_a", (now - 10, now - 10))
-        dashboard = serve(runs, port=0, interval=1.0, allow_stop=True)
+        dashboard = serve(runs, port=0)
         try:
             with os.fdopen(
                 os.open(endpoint, os.O_RDONLY | os.O_NONBLOCK), "rb"
             ) as reader:
+                stale = Request(
+                    dashboard.url + "api/stop/0?name=removed", method="POST"
+                )
+                assert self.get(stale)[0] == 409
                 status, body, _headers = self.get(
-                    Request(dashboard.url + "api/stop/0", method="POST")
+                    Request(dashboard.url + "api/stop/0?name=run_a", method="POST")
                 )
                 assert status == 200
                 assert json.loads(body)["status"] == "stopping"
@@ -960,7 +959,7 @@ class TestDashboard:
             dashboard.close()
 
     def test_stopping_an_idle_batch_is_refused(self, runs):
-        dashboard = serve(runs, port=0, interval=1.0, allow_stop=True)
+        dashboard = serve(runs, port=0)
         try:
             status, body, _headers = self.get(
                 Request(dashboard.url + "api/stop/0", method="POST")
@@ -974,12 +973,12 @@ class TestDashboard:
         finally:
             dashboard.close()
 
-    def test_the_health_endpoint_reports_the_stop_capability(self, runs):
-        dashboard = serve(runs, port=0, interval=1.0, allow_stop=False)
+    def test_health_reports_status_and_schema(self, runs):
+        dashboard = serve(runs, port=0)
         try:
             status, body, _headers = self.get(dashboard.url + "api/health")
             assert status == 200
-            assert json.loads(body) == {"status": "ok", "schema": SCHEMA, "stop": False}
+            assert json.loads(body) == {"status": "ok", "schema": SCHEMA}
         finally:
             dashboard.close()
 
@@ -1025,7 +1024,6 @@ class TestDashboard:
             {"interval": 0},
             {"interval": float("inf")},
             {"interval": True},
-            {"allow_stop": "yes"},
         ],
     )
     def test_invalid_settings_are_refused(self, tmp_path, kwargs):
@@ -1039,10 +1037,14 @@ class TestDashboard:
 
 
 def test_web_command_settings():
-    args = _parser().parse_args(["web", "--port", "0"])
+    parser = _parser()
+    args = parser.parse_args(["web", "--port", "0"])
+    assert args.batches_dir == Path("batches")
     assert args.port == 0
     assert args.host == "127.0.0.1"
-    assert args.read_only is False
+    assert parser.parse_args(["web", "--batches-dir", "results"]).batches_dir == Path(
+        "results"
+    )
 
 
 def test_a_sleeping_dashboard_can_be_closed_while_it_waits(tmp_path):
@@ -1063,7 +1065,9 @@ def test_nested_progress_flows_from_worker_ipc_to_snapshot(tmp_path):
 
     config = tmp_path / "nested.yaml"
     config.write_text("device: [0]\nseed: 0\nmarkers: test\ndelay: 0\nitem: 0\n")
-    batch = Batch(Pipeline([Work, Work]), config, output_dir=tmp_path / "batch")
+    batch = batch_helpers.make_batch(
+        Pipeline([Work, Work]), config, output_dir=tmp_path / "batch"
+    )
     scheduler = GpuScheduler(batch)
     run_id = batch.experiments[0].run_id
     live_worker(batch, run_id)

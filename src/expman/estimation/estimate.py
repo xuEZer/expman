@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from numbers import Real
 from typing import TypeGuard
 
-UNKNOWN_CLOCK = "??:??:??～??:??:??"
-
 
 def valid_seconds(value: object) -> TypeGuard[float]:
     return (

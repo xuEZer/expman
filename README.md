@@ -8,7 +8,7 @@
 
 从一次实验看，`Stage.process` 完成一步计算，`Pipeline` 定义这些步骤的顺序。一份具体配置对应一个 `Experiment`。直接调用 `Pipeline.run` 可以在当前进程运行这条流程。
 
-批量运行从 `Batch.run` 或 `expman run` 进入。调度器把每个需要计算的顶层 Stage 派发到独立工作进程，并负责 GPU 分配、资源限制、重试与恢复。匹配的已完成前缀可直接复用。运行环境要求 **Linux 与支持 MPS 的 NVIDIA GPU**（需要 `nvidia-smi`、`nvidia-cuda-mps-control` 和 CUDA 驱动）；每份实验配置必须显式提供 `device`（GPU 编号列表）和根部 `seed`。各配置使用同一份物理 GPU 列表。
+批次通过 `expman run` 创建并启动，通过 `expman resume ID` 恢复。调度器把每个需要计算的顶层 Stage 派发到独立工作进程，并负责 GPU 分配、资源限制和重试。匹配的已完成前缀可直接复用。运行环境要求 **Linux 与支持 MPS 的 NVIDIA GPU**（需要 `nvidia-smi`、`nvidia-cuda-mps-control` 和 CUDA 驱动）。每份实验配置必须显式提供 `device`（GPU 编号列表）和根部 `seed`。各配置使用同一份物理 GPU 列表。
 
 接手源码可从批次创建、派发一个阶段、保存结果这三步读起。[架构与源码阅读顺序](DESIGN.md)
 
@@ -21,7 +21,7 @@ uv sync
 source .venv/bin/activate
 ```
 
-运行与恢复见《命令行》一节：`expman run <module:attr> <config>`。
+在项目的 `pipeline.py` 中定义 `train` 后，可用 `expman run train experiments.yaml` 启动实验。运行与恢复的完整示例见[命令行](#命令行)。
 
 ## 定义实验阶段
 
@@ -58,7 +58,7 @@ for event in recorder.events:
 - 重写 `config_dependencies(cfg)` 声明阶段结果依赖的配置位置（见「同 Batch 连续前缀复用」）；默认返回 `True`，保守依赖完整配置。
 - 阶段可以独立调用 `stage.run(data, ctx)`。省略 `ctx` 时，每次顶层调用创建新的运行上下文。
 - `ctx.report_metric("loss", 0.1, step=10)` 记录有限实数指标；`ctx.report_progress(10, total=100, unit="batch")` 上报绝对进度。总量未知时省略 `total`。
-- 默认记录器将事件保存在内存。长实验可实现 `Recorder.record(event)`，将事件写入文件或数据库。记录器的普通异常会通过 Python logging 报告，业务执行继续。
+- 默认记录器将事件保存在内存。直接执行流程时，可将实现了 `record(event)` 的记录器传给 `RunContext(recorder=...)`。记录器的普通异常会通过 Python logging 报告，业务执行继续。批次内要持久化数值指标时使用 `ctx.log_metrics()`。
 
 耗时采用单调时钟，表示主机端经过时间。执行期间的内部上报和子阶段监测开销包含在内；GPU 异步计算的精确计时需要用户在业务代码中建立同步边界。
 
@@ -246,10 +246,10 @@ d_model: 128
 
 ## 执行实验集合
 
-将上面含有 `models` 的 `grid` 示例保存为 `experiment.yaml`。下面的脚本定义一个 Stage，并在主进程中启动 Batch。worker 会重新加载这个脚本以查找 Stage 类，因此启动代码放在 `if __name__ == "__main__":` 中。
+将上面含有 `models` 的 `grid` 示例保存为 `experiment.yaml`，在同一目录的 `pipeline.py` 中定义流程。
 
 ```python
-from expman import Batch, Pipeline, Stage
+from expman import Pipeline, Stage
 
 
 class ModelSummary(Stage):
@@ -260,32 +260,25 @@ class ModelSummary(Stage):
         }
 
 
-if __name__ == "__main__":
-    pipeline = Pipeline([ModelSummary])
-    batch = Batch(pipeline, cfg="experiment.yaml", max_retries=1)
-    print(batch.output_dir)
-    for result in batch.run():
-        print(result.run_id, result.status.value, result.output)
-        for attempt in result.attempts:
-            print(attempt.attempt, attempt.status.value, attempt.error_message)
+summary = Pipeline([ModelSummary])
 ```
 
+在该目录运行 `expman run summary experiment.yaml`。命令导入 `pipeline.summary`，为展开后的 8 份配置各创建一个 run，并在开始调度时打印批次 ID 和目录。
+
 - 首次执行初始数据为 `None`。由 Batch 执行时，每个阶段自动保存返回值与显式 checkpoint 状态（无 checkpoint 时为空状态）；重试跳过已完成阶段，恢复其输出和状态。
-- 普通阶段失败会记录错误，在该顶层阶段的预算内重新入队。默认额外重试一次。`max_retries=0` 关闭普通失败的重试，取消和资源限额触发的重新调度单独处理。
+- 普通阶段失败会记录错误，在该顶层阶段的预算内重新入队。默认额外重试一次。在流程模块中调用 `expman.set(retries=0)` 可关闭普通失败的重试，取消和资源限额触发的重新调度单独处理。
 - 重试保留 `run_id`。`ctx.attempt` 是当前顶层阶段的尝试编号，从 1 开始。`ctx.cfg` 深层只读，跨尝试的业务状态由 `ctx.checkpoint()` 显式保存。
 - 中断主进程会结束调度并回收 worker。业务代码在 worker 内抛出 `KeyboardInterrupt` 或 `SystemExit` 时，该阶段记作取消并重新入队。
-- 新 Stage 按参数异质性和资源装箱选择启动顺序；返回结果按配置顺序排列，每个结果保留全部尝试的状态、耗时和错误摘要；`output` 是最终成功尝试的返回值。事件可通过 `batch.recorder` 获取，支持传入自定义 Recorder。
-- 成功结果保留最终快照的位置，每次访问 `result.output` 都从磁盘读取。失败或取消的尝试返回 `None`。主进程仍保留尝试摘要、阶段历史和记录器接收的事件。
-- Batch 对象执行一次；继续已有实验使用 `Batch.resume()`，重新开始使用新的 Batch。也可以传入一份具体配置字典，创建只有一个实验的集合。
+- 阶段的启动顺序取决于配置差异和当前可用资源。命令结束时按配置展开顺序打印各 run 的 ID 和最终状态。`expman status ID` 可查看该批次各 run 的阶段和尝试记录。
 
 每次实际计算使用独立 worker。尝试摘要保存错误类型和消息。对文件、数据库或外部服务的写入可能在重试时再次发生，由业务代码处理。
 
 ## 命令行
 
-终端运行与恢复共用 `module:attr` 定位流程。将一个 `Pipeline` 实例赋给模块属性即可。
+在当前目录的 `pipeline.py` 中定义 `train` 后，命令行中的 `train` 等同于 `pipeline:train`。流程定义在其他模块时，写成 `module:attr`，例如 `mypkg.pipelines:train`。
 
 ```python
-# mypkg/pipelines.py
+# pipeline.py
 import expman
 from expman import Pipeline
 from mypkg.stages import LoadData, Train, Eval
@@ -297,39 +290,38 @@ train = Pipeline([LoadData, Train, Eval])
 ```
 
 ```bash
-# 创建并运行；pipeline 定位会记入 manifest；
-# 默认输出目录 runs/<pipeline名>_<config名>，重名时追加 _2、_3……
-expman run mypkg.pipelines:train experiments.yaml
+# 新建批次，打印 ID 和批次目录的绝对路径
+expman run train experiments.yaml
 
-# 独立启动运行看板，扫描 runs/ 下全部批次（运行中显示实时指标，已停止显示为已停止）
-expman web
-
-# 查看持久化进度与剩余时间区间（按 ID 或路径；只读，不影响运行中的 Batch）
-expman status 0
-
-# 不带参数：持续刷新 runs/ 下所有 Batch 的总览，直到 Ctrl+C
+# 在另一终端查看 ./batches/ 的总览，每个批次占一行
 expman status
 
-# 优雅停止运行中的 Batch：向运行进程发送 SIGTERM，
-# worker 被终止、尝试记录为 cancelled、状态落盘后退出（退出码 143）
+# 查看批次 0 的详情，每个 run 占一行
+expman status 0
+
+# 在独立看板中查看 ./batches/ 下的批次
+expman web
+
+# 停止批次 0，运行进程收到 SIGTERM 后保存状态，以退出码 143 结束
 expman stop 0
 
-# 从停止或中断处恢复；从 manifest 重新导入 pipeline，
-# 恢复时会校验阶段顺序、类名与可获取的模块源码摘要
+# 从停止处恢复批次 0，根据 manifest 导入流程并校验阶段顺序、类名和可获取的模块源码摘要
 expman resume 0
 ```
 
-- `runs/` 下每个 Batch 在 `runs/.batches.sqlite3` 中登记一个从 0 开始的稳定整数 ID。首次发现的批次按目录修改时间排序登记，移除批目录后保留其编号。`status` / `stop` / `resume` 都接受 ID 或目录路径。
-- 在 pipeline 模块里调用 `expman.set(retries=..., coverage=...)` 可设置新建 Batch 的默认值，初始值分别为 1 和 0.8。Python 构造参数可以覆盖默认值。恢复时沿用批次清单里保存的设置。
-- 进度显示默认关闭，需要时加 `--progress`；`run` 可用 `-o` 覆盖默认输出目录。
-- CLI 的 `run` 和 `resume` 持有批次执行锁时会打开 `stop.fifo`。同一系统用户运行的 CLI 或看板可通过它探测批次是否仍在运行。向管道写入停止请求后，Linux 内核向持有读端的批次进程发送 SIGTERM。Python 调用可在主线程使用 `batch.run(handle_sigterm=True)` 启用相同机制。
-- `run` 和 `resume` 会打印每个 run 的状态。批次全部成功时退出码为 0，有 run 最终失败时为 1，收到停止请求并中断时为 143。
-- `resume` 要求 manifest 记录过 pipeline 定位（由 CLI 创建的 Batch 都会记录）；库 API 创建的目录请继续用 `Batch.resume(pipeline, ...)`。
-- 看板是独立命令 `expman web`，扫描 `runs/` 下全部批次并常驻服务，与实验进程互不依赖；可选 `--port`（默认 `8765`，`0` 由系统分配、被占时最多尝试连续 10 个端口）、`--host`（默认仅回环）、`--root`、`--read-only`；详见[运行看板](#运行看板)。
+- 所有子命令都用 `--batches-dir` 选择批次父目录，默认为 `./batches/`。`run` 的子目录名为 `<pipeline-attr>_<config-stem>_<YYYYMMDDHHMMSS>`，依次使用流程属性名、去掉最后一个扩展名的配置文件名和精确到秒的本地时间。同一父目录中若已存在该名称，命令会报错退出。
+- CLI 和看板共用批次父目录中的 `.batches.sqlite3` 登记表。同时发现多个新批次时，按目录修改时间先后登记，时间相同则按目录名排序。每次取该表中最小的空闲非负整数 ID。例如，删除 `[0, 1, 2]` 中的批次 `1` 后，原批次 `2` 保留编号，下一个新批次得到 `1`。
+- `expman status --batches-dir results` 显示 `results/` 下所有批次的总览。`expman status 0 --batches-dir results` 显示批次 0 中每个 run 的状态、阶段和尝试记录。两种视图每两秒刷新一次，批次结束后也会继续刷新。在运行 `status` 的终端按 Ctrl+C 只会退出查看。若批次清单无法读取，命令报错并结束刷新。
+- `stop` 和 `resume` 都要求提供批次 ID。在自定义目录中操作时使用同一父目录，例如 `expman stop 0 --batches-dir results`、`expman resume 0 --batches-dir results`。
+- `expman delete 1` 删除批次 `1` 的整个目录（含运行结果和检查点）及其 ID 登记记录。自定义父目录时可用 `expman delete 1 --batches-dir results`。运行中的批次须先用 `stop` 请求停止，等运行进程退出后再删除。手动移走批次目录后，登记表仍保留该 ID，直到用 `delete` 清除记录。
+- 在流程模块里调用 `expman.set(retries=..., coverage=...)` 可设置新批次的默认值。`retries` 是每个 run 的每个顶层阶段普通失败后可额外重试的次数，默认为 1。`coverage` 是单阶段耗时区间的名义覆盖率，默认为 0.8。恢复时沿用批次清单里保存的设置。
+- `run` 和 `resume` 持有批次执行锁时会打开 `stop.fifo`。同一系统用户运行的 CLI 或看板可通过它探测批次是否仍在运行。向管道写入停止请求后，Linux 内核向持有读端的批次进程发送 SIGTERM。
+- `run` 和 `resume` 启动时打印批次 ID 和目录，执行结束后打印每个 run 的最终状态。批次全部成功时退出码为 0，有 run 最终失败时为 1，收到停止请求并中断时为 143。
+- `expman web` 启动独立看板。可用 `--host` 指定绑定地址（默认仅回环），用 `--port` 指定端口（默认 `8765`，`0` 由系统分配，指定端口被占时最多尝试连续 10 个端口）。详见[运行看板](#运行看板)。
 
 ## 运行看板
 
-看板是一个**独立进程**，与实验进程互不依赖：它不训练模型、不参与调度，启动后扫描 `runs/` 下的**全部**批次，一次呈现所有历史与在飞实验。实验进程可以不存在，看板仍然可用；看板启动前后，实验也可以随时起停。
+看板在**独立进程**中扫描所选父目录（默认 `./batches/`），显示运行中和已结束的批次。实验和看板可以分别启动或停止。
 
 ```bash
 # 在项目根目录启动看板，默认 127.0.0.1:8765（从指定端口起最多尝试 10 个端口）
@@ -338,17 +330,18 @@ expman web
 # 指定端口与绑定地址（0 由系统分配；默认仅回环）
 expman web --port 8899 --host 127.0.0.1
 
-# 指向别处的 runs/，或只读运行（禁用停止按钮）
-expman web --root /path/to/runs --read-only
+# 查看其他父目录中的批次
+expman web --batches-dir results
 ```
 
 启动时终端打印看板地址。`/` 列出批次 ID、名称、状态、各类 run 的数量、已用与剩余时间。`/b/<ID>/` 展示该批次的阶段、worker、调度和资源详情。页面会注明数据来源。
 
 | 情形 | 判定 | 显示 |
 | --- | --- | --- |
-| 运行中 | 进程存活且心跳新鲜 | 实时指标：调度、进度、逐卡「分配 vs 实际」、事件流 |
-| 最后读数 | 有快照，停止管道未响应或心跳已过期，批次清单也没有更新 | 展示最近一次成功发布的读数，并标记数据来源 |
-| 归档 | 没有可用快照，或最后一次采样后批次清单已有更新 | 从 `batch.pkl` / `timing.pkl` 重建的历史状态，实时面板置空 |
+| 实时 | 批次停止管道可连接，快照时间与当前时间相差不超过 3 秒 | 实时指标：调度、进度、逐卡「分配 vs 实际」、事件流 |
+| 最后读数 | 快照可读但未达到实时条件，且没有更新的可读批次清单 | 展示最近一次成功发布的读数，并标记数据来源 |
+| 归档 | 没有可用快照，或最后读数之后有更新的可读批次清单 | 从 `batch.pkl` 重建历史状态，耗时和 ETA 取自可用的 `timing.pkl` |
+| 记录不可读 | 既无可用快照，也无法读取批次清单 | 显示批次名称，实时面板为空 |
 
 看板展示四类信息：
 
@@ -357,9 +350,9 @@ expman web --root /path/to/runs --read-only
 - **调度任务**。页面显示待定与运行计数、本轮主机和显存是否允许派发、实际派发数，以及启动、减载、完成和复用事件。逐阶段的队列分布和完整装箱计划保存在 `live.json`。
 - **内存与显存**。主机与每张卡分别展示调度预算和采样占用，采样年龄 `age_seconds` 超过 2.5 秒时资源条变灰。每个 worker 的预算条另行标出可显示的主机或 MPS 限额。
 
-实验进程默认约每秒把观测快照原子写入批次目录的 `live.json`，退出时再尝试发布一次。`EXPMAN_LIVE=off` 可关闭发布。发布线程在锁内读取调度状态和阶段进度，文件写入在锁外完成。看板优先读取这份快照。停止管道可连接且快照时间距现在不超过 3 秒时，来源标记为实时。快照缺失、不可用或最后读数早于最新批次清单时，看板从 `batch.pkl` 和 `timing.pkl` 重建归档视图。
+实验进程默认约每秒把观测快照原子写入批次目录的 `live.json`，退出时再尝试发布一次。`EXPMAN_LIVE=off` 可关闭发布。发布线程在锁内读取调度状态和阶段进度，文件写入在锁外完成。
 
-看板默认仅绑定回环地址，允许通过 `POST /api/stop/<id>` 请求停止。使用 `--read-only` 可禁用该操作。发现新批次时，服务会在根目录登记编号。运行记录使用 pickle，只应向看板提供可信目录。页面静态资源随包提供。
+看板默认仅绑定回环地址。访问者可以在运行中批次的详情页点击“停止实验”，确认后页面通过 `POST /api/stop/<id>?name=<批次目录名>` 请求停止。如果该 ID 已分配给另一个目录名，服务返回 HTTP 409。发现新批次时，服务会在根目录登记编号。运行记录使用 pickle，只应向看板提供可信目录。页面静态资源随包提供。
 
 ### 结果分析
 
@@ -371,7 +364,7 @@ expman web --root /path/to/runs --read-only
 - **跳过规则**：所有 Run 取值相同的常量项在页首列出一次、不参与比较；有效样本不足（<3）的配置项只计数不展示；每个取值只有一个样本时只列各组均值、不算影响力。
 - **结果排序**：指标卡片按最大影响力排序，卡片内配置项也按影响力排序，直接回答「哪个配置项最影响这个指标」。
 
-耗时以 `run_duration_seconds` 参与分析，汇总多次尝试。与它重名的业务指标，以及多个阶段记录的同名指标，用阶段路径区分。含点的字面键用引号区分，例如 `"train.loss"` 与嵌套的 `train.loss`。分析由 `GET /api/analysis/<id>` 提供，结果按批次输入文件的指纹缓存。点「重新分析」会重新请求，指纹变化时服务重新计算。这些都是对观测数据的描述（相关与分组差异），不是因果结论。
+耗时以 `run_duration_seconds` 参与分析，汇总多次尝试。与它重名的业务指标，以及多个阶段记录的同名指标，用阶段路径区分。含点的字面键用引号区分，例如 `"train.loss"` 与嵌套的 `train.loss`。分析由 `GET /api/analysis/<id>` 提供，服务按批次目录和输入文件的指纹复用分析结果。点「重新分析」会重新请求，指纹变化时服务重新计算。这些都是对观测数据的描述（相关与分组差异），不是因果结论。
 
 ## 工作进程环境
 
@@ -423,25 +416,15 @@ class Train(Stage):
 
 对于 dataloader、文件句柄等进程绑定资源，应在 worker 中重新创建，并在 checkpoint 里保存重建所需的数据。
 
-Python 创建 Batch 时默认目录为 `runs/<随机 UUID>/`，可通过 `output_dir=` 指定一个尚不存在的目录。配置在 Experiment 创建时保存一次，运行中的映射和列表使用只读包装；读取、索引、遍历照常，可变数据（张量、计数器等）定义为状态量。
+配置在每个 run 创建时保存一次。运行中的映射和列表支持只读访问，可变数据（张量、计数器等）通过 checkpoint 保存。
 
-```python
-# 原进程中创建并运行
-batch = Batch(pipeline, "experiment.yaml", output_dir="runs/my-batch")
-batch.run()
+`expman resume ID` 从批次清单读取流程位置并重新导入，沿用已保存的配置、run ID、尝试历史和待执行队列。原 YAML 可以移走，流程模块须保持可导入。中断不消耗失败重试机会。主进程突然退出时，恢复会把清单中仍标为运行中的尝试记作 `cancelled` 并重新入队。该次尝试的耗时只计入清单里已累计的 worker 时长，尚未记录的部分无法还原。恢复时校验阶段类、顺序及可获取的模块源码摘要。外部依赖和动态生成的代码由用户管理。同一目录只允许一个进程执行。
 
-# Ctrl+C 或进程退出后，在新进程中提供相同的流程定义
-batch = Batch.resume(pipeline, "runs/my-batch")
-results = batch.run()
-```
-
-恢复使用持久化配置、实验 ID、尝试历史和待执行队列，不依赖原 YAML。中断不消耗失败重试机会；突然退出的未结束尝试记录为 cancelled，无法获知的耗时记为 0。恢复检查阶段类、顺序及可获取的模块源码摘要。外部依赖和动态生成的代码由用户管理。同一目录只允许一个进程执行。
-
-默认保存器 `PickleSerializer` 支持可 pickle 的 Python 对象，**只加载可信的本地快照**，并保持兼容的 Python、依赖及设备环境。文件句柄、生成器等不保证可保存。可实现 `Serializer.dump/load` 并在创建和恢复 Batch 时传入同一种 `serializer`。阶段、checkpoint 和 Batch 清单保存失败会报错；可选 Recorder 的普通故障会记录日志，默认指标事件只存在于当前进程内存中。
+批次使用 `PickleSerializer` 保存可 pickle 的 Python 对象。**只加载可信的本地快照**，并保持兼容的 Python、依赖及设备环境。文件句柄、生成器等进程资源需在 worker 中重建。阶段快照、checkpoint 或批次清单保存失败会报错。
 
 ## 持久化数值指标
 
-在由 `Batch` 管理的阶段内，使用 `ctx.log_metrics()` 保存嵌套指标：
+在批次的阶段内，使用 `ctx.log_metrics()` 保存嵌套指标。
 
 ```python
 ctx.log_metrics(
@@ -457,39 +440,25 @@ Batch 内所有实验共用输出目录中的 `metrics.sqlite3`。数据库在�
 
 唯一键为实验 ID、完整阶段位置路径、step 和完整指标路径。同键写入覆盖数值、尝试编号和 UTC 更新时间；本次未传入的指标保留。恢复时保留所有旧记录，包括 checkpoint 之后的指标，重新运行到相同位置时再覆盖。恢复本 run 的已完成快照时沿用已有指标。跨 run 复用共享前缀时，框架把节点中的指标写入目标 run。
 
-可使用 SQLite 工具或 Python 查询 `metrics` 表：
+可以在命令打印的批次目录中运行以下 Python 代码，读取各 run 的指标。
 
 ```python
 import sqlite3
 
-with sqlite3.connect(batch.output_dir / "metrics.sqlite3") as db:
+with sqlite3.connect("file:metrics.sqlite3?mode=ro", uri=True) as db:
     rows = db.execute(
         "SELECT run_id, stage_path, step, metric_path, value, attempt, updated_at "
-        "FROM metrics WHERE run_id = ? ORDER BY stage_path, step, metric_path",
-        (batch.experiments[0].run_id,),
+        "FROM metrics ORDER BY run_id, stage_path, step, metric_path"
     ).fetchall()
 ```
 
 `stage_path` 和 `metric_path` 保存为 JSON 数组文本，例如 `[0]` 和 `["train", "mse"]`，可用 `json.loads()` 解码。嵌套 Pipeline 的位置路径包含调用序号，避免阶段冲突。省略 step 的汇总指标在数据库中使用 `-1`。`report_metric()` 仍用于向 Recorder 上报观测事件；持久化数值使用 `log_metrics()`。
 
-## 进度与剩余时间
+## 耗时与剩余时间
 
-```python
-batch = Batch(pipeline, cfg="experiment.yaml", estimate_coverage=0.8)
-print(batch.estimate())  # 有待执行阶段，尚无耗时样本
-results = batch.run(refresh_interval=1.0)
-print(batch.estimate())  # 全部结束时为 00:00:00～00:00:00
-```
+运行期间可在另一终端用 `expman status ID` 查看该批次的耗时与剩余时间。时间采用 `DD:HH:MM`，例如 `00:00:35` 表示 35 分钟。批次累计运行时间跨 resume 延续，两次运行之间的停机时间排除在外。批次约每 5 秒保存累计时间与当前可用的 ETA，正常收尾时也会保存。进程意外退出时，以最近一次成功写入的记录为准。
 
-Python 的 `Batch.run()` 默认向标准错误输出进度，CLI 的 `run`、`resume` 通过 `--progress` 开启。每个阶段显示已完成组数与总组数，每张卡显示活跃的 worker 数。下面的示例中，两个配置共享阶段 0，阶段 1 还剩一组。
-
-```text
-运行中 | Stage0:1/1 Stage1:1/2 | GPU0:1运行 | 已运行 00:00:35 | 预计剩余 00:00:02～00:00:04
-```
-
-耗时采用 `DD:HH:MM`。例如 `00:00:35` 表示 35 分钟。批次累计运行时间跨 resume 延续，两次运行之间的停机时间排除在外。批次约每 5 秒保存累计时间与当前可用的 ETA，正常收尾时也会保存。进程意外退出时，以最近一次成功写入的记录为准。
-
-`batch.estimate(coverage=0.95)` 计算未完成阶段组的完工时间区间。覆盖参数须大于 0 且小于 1，用于校准单阶段耗时区间。单次查询后，进度显示和看板仍使用批次配置的覆盖率。模型用配置距离加权的历史对数耗时估计中心，用留一残差估计区间。取消的样本提供耗时下界。并行估计考虑阶段依赖和可用槽位，分别用各阶段的耗时下界、上界进行贪心排程。整批区间取两次排程完工时间中的较小值与较大值。缺少必要的耗时数据时显示问号，全部结束时显示零。[调度与估时的源码导读](DESIGN.md)
+例如，在流程模块中调用 `expman.set(coverage=0.95)`，新建批次就按 95% 的名义覆盖率校准单阶段耗时区间。覆盖率须大于 0 且小于 1。模型用配置距离加权的历史对数耗时估计中心，用留一残差估计区间。取消的样本提供耗时下界。并行估计考虑阶段依赖和可用槽位，分别用各阶段的耗时下界、上界进行贪心排程。整批区间取两次排程完工时间中的较小值与较大值。缺少必要的耗时数据时显示问号，全部结束时显示零。[调度与估时的源码导读](DESIGN.md)
 
 ## GPU 派发与资源限制
 
@@ -497,7 +466,7 @@ Python 的 `Batch.run()` 默认向标准错误输出进度，CLI 的 `run`、`re
 - 调度器每轮采集主机可用内存与设备空闲显存，扣除主机预留量和已有 worker 尚未占用的预算，再选择可同时运行的任务。主机预留 1 GiB。没有相应峰值样本时，主机和显存的初始预算分别为 1 GiB。[资源默认值](src/expman/resources/devices.py)
 - worker 的资源上限在估计峰值上留有余量。显存上限通过 MPS 请求，主机内存上限取决于可用的 cgroup 机制。缺少独立 cgroup 读数时，worker 尝试读取自身的 RSS 和历史峰值。看板区分预算、实际采样和已核验的上限。
 - 调度器根据采样结果决定是否暂停派发或减载。被确认为资源限额导致的失败会重新估价并入队。每次尝试的标准输出和错误输出位于 `experiments/<run_id>/attempts/stage-<index>/<attempt>/output.log`。
-- worker 需要可导入的顶层 Stage 类。入口脚本使用 `if __name__ == "__main__":` 保护启动代码，Pipeline 和自定义 serializer 需能通过 pickle 传入子进程。worker 的标准输入用于检测父进程退出。
+- worker 通过 pickle 接收 Pipeline。请在可导入的模块顶层定义 Stage 类，并把 Pipeline 实例赋给 `expman run` 指定的模块属性。worker 的标准输入用于检测父进程退出。
 
 ## 随机种子与随机状态恢复
 
@@ -554,7 +523,7 @@ Batch 记录各次尝试占用 worker 的时长，包括有记录的失败和中
 
 ## 开发与验证
 
-默认测试和提交检查都会运行两项真实 CUDA/MPS 测试，自动选择可见且显存足够的 GPU 中利用率最低的一张。单独运行这两项测试可执行
+默认测试和提交检查都会运行两项真实 CUDA/MPS 测试。测试从可见、显存足够且未被其他测试预留的 GPU 中选择利用率最低的一张。单独运行这两项测试可执行
 
 ```bash
 uv run --no-sync pytest tests/gpu/

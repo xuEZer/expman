@@ -8,7 +8,7 @@ expman 把一条 Python 实验流程应用到多份配置上，在一台 Linux �
 
 ```mermaid
 flowchart LR
-    CLI["expman run 或 Python API"] --> B["Batch 与 BatchState"]
+    CLI["expman run / expman resume"] --> B["批次调度与 BatchState"]
     CFG["YAML 展开的配置"] --> B
     B --> G["GpuScheduler 主进程"]
     G -->|派发一个顶层阶段| W["worker 独立解释器"]
@@ -26,14 +26,14 @@ flowchart LR
     V --> UI
 ```
 
-1. **创建批次。** CLI 将 `module:attr` 解析为 Pipeline。Python 用户可以直接构造 `Batch(pipeline, cfg)`。YAML 展开为一组配置，直接传入一个字典则创建一个 run。Batch 校验设备和种子，创建 run 目录，并保存初始队列。[CLI](src/expman/cli.py) · [Batch](src/expman/scheduling/batch.py)
+1. **创建批次。** `expman run` 按 `module:attr` 导入 Pipeline，省略模块名时从 `pipeline` 模块读取属性。命令把 YAML 展开为一组配置，批次调度代码校验设备和种子，为每份配置创建一个 run 目录，把流程位置和初始队列写入批次清单。[CLI](src/expman/cli.py) · [批次调度](src/expman/scheduling/batch.py)
 2. **选择任务。** 主进程取每个 run 当前就绪的顶层阶段。可以共享前缀的成员按组处理。命中缓存时，主进程只读元数据，把指标和快照引用写到目标 run，推进它的阶段位置。需要计算时，主进程根据内存余量选择候选和设备，在启动 worker 前持久化该成员的活动状态。[调度循环](src/expman/scheduling/scheduler.py) · [阶段分组](src/expman/scheduling/_stages.py)
 3. **计算一个阶段。** worker 在独立解释器内核验 MPS 客户端，加载用户模块和本次尝试的输入，重建 Experiment。执行第 `i` 个阶段前，`run_stage(i)` 检查前置阶段都已有完成记录。Pipeline 从头走到 `i`，依次恢复已有阶段的输出和随机状态，再构造需要执行的 Stage 调用其 `process(data, ctx)`。相邻阶段可以运行在不同进程，跨进程传值依赖磁盘快照。[worker 入口](src/expman/scheduling/_worker.py) · [Experiment](src/expman/core/experiment.py) · [托管阶段执行](src/expman/core/execution.py)
-4. **收集结果。** worker 通过本地 socket 把完成摘要传给主进程。主进程记录历史，释放占用，安排下一阶段或重试。最后 `Batch.run()` 按配置建立顺序返回 `ExperimentResult`。成功结果保存最终快照的位置，访问 `result.output` 时才反序列化，读取大型输出时应计入这次 I/O。[进程间通信](src/expman/scheduling/ipc.py) · [结果对象](src/expman/core/experiment.py)
+4. **收集结果。** worker 通过本地 socket 把完成摘要传给主进程。主进程记录历史，释放占用，安排下一阶段或重试。成功结果保存最终快照的位置。调度结束后，CLI 按配置展开顺序打印每个 run 的 ID 和最终状态。[进程间通信](src/expman/scheduling/ipc.py) · [结果对象](src/expman/core/experiment.py)
 
 ## 定义一条流程
 
-`Stage` 是用户扩展点。Pipeline 接收 **Stage 类**的序列，每个实际执行的位置都无参构造一个新实例，上一步的输出作为下一步的输入。第一步在 Batch 内收到 `None`。阶段可以返回任意能由选定 serializer 保存的 Python 值。Stage 的泛型描述单个阶段的输入输出，相邻阶段的类型兼容由流程作者负责。[Stage](src/expman/core/stage.py) · [Pipeline](src/expman/core/pipeline.py)
+`Stage` 是用户扩展点。Pipeline 接收 **Stage 类**的序列，每个实际执行的位置都无参构造一个新实例，上一步的输出作为下一步的输入。批次内的第一步收到 `None`，阶段返回值须能通过 pickle 保存在快照中。Stage 的泛型描述单个阶段的输入输出，相邻阶段的类型兼容由流程作者负责。[Stage](src/expman/core/stage.py) · [Pipeline](src/expman/core/pipeline.py)
 
 有两种常用的执行方式。调试单个转换时可调用 `stage.run(data)` 或 `pipeline.run(data)`，在调用者进程内同步执行。交给 Batch 托管时，同一个 `process` 会收到带存储服务的 `RunContext`。用户因此可以在循环内写 checkpoint、记录持久化指标。两种路径共用阶段的开始、结束、异常和父子事件语义。[运行上下文](src/expman/core/context.py) · [执行作用域](src/expman/core/execution.py)
 
@@ -55,11 +55,11 @@ flowchart LR
 
 ## 哪些状态保存在哪里
 
-下表的路径相对于批次目录。默认 serializer 使用 pickle，快照和共享缓存属于需要一起保留的**可信本地记录**。Batch 恢复时从目录内的清单和配置重建实验。每次原子保存都生成新的修订标识，执行前持锁核对该标识，防止一个较早打开的会话覆盖后来保存的进度。
+下表的路径相对于批次目录。批次使用 pickle 保存快照和共享缓存，读取时应使用**可信本地记录**。`expman resume ID` 从批次清单中读取流程的导入位置，并用各 run 已保存的配置重建实验。每次写入批次清单都会生成新的修订标识。执行前，调度器取得批次锁并核对该标识，防止较早打开的会话覆盖后来保存的进度。
 
 | 位置 | 内容和使用者 |
 |---|---|
-| `batch.pkl`、`timing.pkl` | BatchStore 保存队列、活动成员、阶段游标、各次尝试、阶段历史和 Pipeline 签名。单独的 timing 记录批次累计墙钟时间与最近的有效 ETA。 |
+| `batch.pkl`、`timing.pkl` | 批次清单保存流程的导入位置和签名、重试及估时设置、队列、活动成员、阶段游标、尝试摘要和阶段历史。`timing.pkl` 单独记录批次累计墙钟时间和当前 ETA，估计区间未知时存为空值。 |
 | `experiments/<run_id>/config.pkl`、`rng_initial.pkl` | 具体配置与 run 的初始随机状态。 |
 | `experiments/<run_id>/stages/<位置>/` | `status.pkl` 是阶段状态，`checkpoint.pkl` 是最近一次成功保存的中间进度，`completed.pkl` 是完成快照或共享节点引用。每次 Pipeline 调用所在路径还有用于校验定义的 `pipeline.pkl`。 |
 | `cache/<key>/<父节点>/<节点>/` | `snapshot.pkl` 保存大输出及状态，`metadata.pkl` 保存依赖、指标和耗时。调度器据元数据推进等价 run，下游 worker 再读取输出。 |
@@ -69,7 +69,7 @@ flowchart LR
 
 [批次文件](src/expman/storage/batch.py) · [原子写和互斥锁](src/expman/storage/base.py) · [阶段文件](src/expman/storage/run.py) · [共享前缀](src/expman/storage/prefix_cache.py) · [指标库](src/expman/storage/metrics.py)
 
-**恢复从三个粒度看。** Batch 用 `BatchState` 区分待调度、已派发及每个 run 的下一阶段。恢复会检查清单和 Pipeline 签名，重新登记上次未收尾的活动成员。在 run 内，已有完成快照的阶段由 worker 恢复。中途失败的阶段从它最后一次成功写入的 checkpoint 开始。进程结束时才保存在内存中的对象需要由用户的 `process` 重建。[批次状态](src/expman/scheduling/state.py) · [托管执行](src/expman/core/execution.py)
+**恢复从三个粒度看。** `BatchState` 记录待调度的 run、已派发的 run 及每个 run 的下一阶段。恢复时先检查清单和 Pipeline 签名，将上次仍标为活动的 run 放回队首，并把中断的尝试记为取消。在 run 内，worker 读取已完成阶段的快照。中途失败的阶段从最后一个有效 checkpoint 继续。进程结束时仅保存在内存中的对象需要由用户的 `process` 重建。[批次状态](src/expman/scheduling/state.py) · [托管执行](src/expman/core/execution.py)
 
 **阶段位置决定恢复哪条记录。** 一个顶层 Stage 的位置是它在 Pipeline 中的索引。嵌套 Pipeline 在父位置后加上调用序号和子阶段索引。checkpoint 同步保存调用计数、位置、业务状态、累计阶段耗时、配置依赖和随机状态。一个训练循环多次调用同一个验证 Pipeline 时，各轮因此能找到各自的输出。临时文件写入、刷新并同步成功后才原子替换目标。完成快照提交后清理该阶段的 checkpoint。损坏或依赖不匹配的 checkpoint 会告警并退回阶段入口。无法读取本 run 已完成的输出则报告存储错误。
 
@@ -96,9 +96,13 @@ ETA 同样按剩余的**阶段组**估算。耗时模型根据配置距离给成
 
 ## 观测与查错入口
 
+CLI 和 Web 看板共用所选批次父目录下的 `.batches.sqlite3`，默认位置是 `./batches/.batches.sqlite3`。每个父目录独立分配批次 ID，每次选择登记表中最小的空闲非负整数。手动移除批次目录后，登记表仍保留该 ID。`expman delete ID` 在清除批次文件后释放登记记录，运行中的批次受执行锁保护。[批次登记](src/expman/observation/registry.py)
+
+`expman status` 每两秒枚举一次当前父目录中的批次。`expman status ID` 通过登记表定位该批次，每两秒重读其运行记录并刷新详情。两种视图都由 Ctrl+C 退出。`resume` 和 `stop` 使用同一登记表定位批次。[命令入口](src/expman/cli.py)
+
 `expman status` 与归档页面从批次文件重建状态。实验主进程另有旁路线程，把在锁内读到的调度状态和阶段完成组数整理为实时快照并原子写入 `live.json`，写入失败不会中断实验。`expman web` 在独立进程内通过 HTTP 和 SSE 提供这些数据。读取端在批次停止管道可连接且快照足够新鲜时标为实时。历史快照早于最新批次清单或快照不可用时，从持久化记录重建。页面查询不会触发训练或资源调度。[归档读取](src/expman/observation/status.py) · [快照构建](src/expman/observation/snapshot.py) · [来源判定](src/expman/observation/archive.py) · [Web 服务](src/expman/webui/server.py)
 
-CLI 的 run、resume 在持有批次执行锁期间监听 `stop.fifo`。Python 调用可在主线程通过 `handle_sigterm=True` 启用相同行为。CLI 和 Web 向管道写入请求后，内核向持有读端的进程发送 SIGTERM，调度器收尾并保存进度。Web 的 `--read-only` 禁用停止操作。[进程控制](src/expman/process_control.py)
+`expman run` 和 `expman resume` 在持有批次执行锁期间监听 `stop.fifo`。`expman stop` 和看板的“停止实验”按钮共用同一条停止管道。请求写入后，内核向持有读端的进程发送 SIGTERM，调度器收尾并保存进度。[进程控制](src/expman/process_control.py)
 
 结果分析用 run ID 联结配置、尝试摘要及 SQLite 指标。一个指标优先采用汇总步，否则取该指标的最大 step。缺值按指标分别计数，失败或未完成的 run 计入覆盖度。数值参数可计算 Spearman 秩相关，类别参数按组汇总并计算效应量。[结果分析](src/expman/observation/analysis.py)
 

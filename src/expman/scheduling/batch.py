@@ -1,27 +1,25 @@
 """Create, run and reopen a durable batch of experiment configurations."""
 
 import warnings
-from contextlib import nullcontext
 from pathlib import Path
 from threading import Event, RLock, Thread
 from time import monotonic
 from typing import Any
 from uuid import uuid4
 
-from expman.config import configured_devices, load_configs
+from expman.config import configured_devices
 from expman.core import settings
 from expman.core.context import _nonnegative_integer
 from expman.core.events import Status
 from expman.core.experiment import AttemptResult, Experiment, ExperimentResult
 from expman.core.pipeline import Pipeline
 from expman.core.randomness import validate_seed
-from expman.core.recorders import InMemoryRecorder, Recorder
+from expman.core.recorders import InMemoryRecorder
 from expman.estimation.estimate import TimeEstimate, valid_seconds, validate_coverage
 from expman.process_control import stop_on_sigterm
 from expman.scheduling.environment import validate as validate_environment
-from expman.scheduling.progress import BatchProgress
 from expman.scheduling.state import BatchState, LiveObservations
-from expman.storage.base import RecoveryWarning, Serializer, StorageError, run_lock
+from expman.storage.base import RecoveryWarning, StorageError, run_lock
 from expman.storage.batch import BatchStore
 
 TIMING_SAVE_INTERVAL = 5.0
@@ -37,69 +35,64 @@ def _attempt_record(result: AttemptResult) -> dict:
     }
 
 
-class Batch:
-    """One pipeline and its runs. A single process may execute the batch at a time."""
+class _Batch:
+    """The CLI's execution state for one pipeline and its runs."""
 
     def __init__(
         self,
         pipeline: Pipeline,
-        cfg: str | Path | dict[str, Any],
-        *,
-        max_retries: int | None = None,
-        estimate_coverage: float | None = None,
-        recorder: Recorder | None = None,
-        output_dir: str | Path | None = None,
-        serializer: Serializer | None = None,
-        _pipeline_spec: str | None = None,
+        store: BatchStore,
+        retries: object,
+        coverage: object,
+        pipeline_spec: str,
     ) -> None:
+        self.pipeline = pipeline
+        self.store = store
+        self.output_dir = self.store.directory
+        self.max_retries = _nonnegative_integer(retries, "max_retries")
+        self.estimate_coverage = validate_coverage(coverage)
+        self._pipeline_spec = pipeline_spec
+        self._signature = pipeline.signature()
+        self.by_id: dict[str, Experiment] = {}
+        self.devices: tuple[int, ...]
+        self.state: BatchState
+        self.recorder = InMemoryRecorder()
+        self.live = LiveObservations()
+        self._state_lock = RLock()
+        self._scheduler = None
+        self._elapsed_seconds = 0.0
+        self._session_started = None
+        self._last_estimate = None
+
+    @classmethod
+    def create(
+        cls,
+        pipeline: Pipeline,
+        configs: list[dict[str, Any]],
+        *,
+        output_dir: Path,
+        pipeline_spec: str,
+    ) -> "_Batch":
         validate_environment()
-        root = Path("runs") / uuid4().hex if output_dir is None else Path(output_dir)
-        self._initialize(
+        batch = cls(
             pipeline,
-            BatchStore(root.resolve(), serializer),
-            recorder,
-            settings.get("retries") if max_retries is None else max_retries,
-            settings.get("coverage")
-            if estimate_coverage is None
-            else estimate_coverage,
-            _pipeline_spec,
+            BatchStore(output_dir.parent.resolve() / output_dir.name),
+            settings.get("retries"),
+            settings.get("coverage"),
+            pipeline_spec,
         )
-        if not isinstance(cfg, (str, Path, dict)):
-            raise TypeError(
-                "cfg must be a YAML path or a concrete configuration dictionary"
-            )
-        configs = [cfg] if isinstance(cfg, dict) else load_configs(cfg)
-        self.devices = configured_devices(configs)
+        batch.devices = configured_devices(configs)
         for config in configs:
             if "seed" not in config:
                 raise ValueError("seed is required")
             validate_seed(config["seed"])
-        self.output_dir.mkdir(parents=True, exist_ok=False)
-        self.by_id = {}
+        batch.output_dir.mkdir(parents=True, exist_ok=False)
         for config in configs:
             run_id = uuid4().hex
-            self.by_id[run_id] = self._experiment(run_id, config, resume=False)
-        self.state = BatchState.new(self.by_id)
-        self._save()
-
-    def _initialize(self, pipeline, store, recorder, retries, coverage, spec):
-        if not isinstance(pipeline, Pipeline):
-            raise TypeError("pipeline must be a Pipeline")
-        self.pipeline = pipeline
-        self.store: BatchStore = store
-        self.output_dir = self.store.directory
-        self.max_retries = _nonnegative_integer(retries, "max_retries")
-        self.estimate_coverage = validate_coverage(coverage)
-        self._pipeline_spec: str | None = spec
-        self._signature = pipeline.signature()
-        self.recorder = InMemoryRecorder() if recorder is None else recorder
-        self.live = LiveObservations()
-        self._state_lock = RLock()
-        self._scheduler = None
-        self._started = False
-        self._elapsed_seconds = 0.0
-        self._session_started = None
-        self._last_estimate = None
+            batch.by_id[run_id] = batch._experiment(run_id, config, resume=False)
+        batch.state = BatchState.new(batch.by_id)
+        batch._save()
+        return batch
 
     def _experiment(self, run_id, cfg, *, resume):
         return Experiment(
@@ -158,40 +151,33 @@ class Batch:
     def resume(
         cls,
         pipeline: Pipeline,
-        output_dir: str | Path,
-        *,
-        recorder: Recorder | None = None,
-        serializer: Serializer | None = None,
-    ) -> "Batch":
-        store = BatchStore(Path(output_dir).resolve(), serializer)
-        manifest = store.read_manifest()
-        self = cls.__new__(cls)
+        store: BatchStore,
+        manifest: dict,
+    ) -> "_Batch":
         try:
-            self._initialize(
+            batch = cls(
                 pipeline,
                 store,
-                recorder,
                 manifest["max_retries"],
                 manifest["estimate_coverage"],
                 manifest["pipeline_spec"],
             )
-            if manifest["pipeline"] != self._signature:
+            if manifest["pipeline"] != batch._signature:
                 raise StorageError(
                     "pipeline classes, order or available source code changed"
                 )
-            self._revision = manifest["revision"]
-            self.by_id = {}
+            batch._revision = manifest["revision"]
             for entry in manifest["experiments"]:
                 run_id = entry["run_id"]
                 if (
                     not isinstance(run_id, str)
                     or len(run_id) != 32
                     or any(c not in "0123456789abcdef" for c in run_id)
-                    or run_id in self.by_id
+                    or run_id in batch.by_id
                 ):
                     raise StorageError("invalid or duplicate experiment ID in manifest")
-                run = self._experiment(run_id, store.load_config(run_id), resume=True)
-                self.by_id[run_id] = run
+                run = batch._experiment(run_id, store.load_config(run_id), resume=True)
+                batch.by_id[run_id] = run
                 for index, saved in enumerate(entry["attempts"], start=1):
                     if saved["attempt"] != index or not valid_seconds(
                         saved["duration_seconds"]
@@ -203,21 +189,26 @@ class Batch:
                         error_type=saved["error_type"],
                         error_message=saved["error_message"],
                     )
-            self.devices = configured_devices([run.cfg for run in self.by_id.values()])
-            self.state = BatchState.from_record(
-                manifest, set(self.by_id), self.devices, len(pipeline.stages)
+            batch.devices = configured_devices(
+                [run.cfg for run in batch.by_id.values()]
+            )
+            batch.state = BatchState.from_record(
+                manifest, set(batch.by_id), batch.devices, len(pipeline.stages)
             )
         except (KeyError, TypeError, ValueError) as error:
             raise StorageError("invalid batch manifest") from error
-        for run_id in self.state.recover_active():
-            self.record_attempt(
+        for run_id in batch.state.recover_active():
+            batch.record_attempt(
                 run_id,
                 Status.CANCELLED,
                 error_type="InterruptedRun",
                 error_message="previous process ended before recording attempt completion",
             )
-        self._elapsed_seconds, self._last_estimate = store.read_timing() or (0.0, None)
-        return self
+        batch._elapsed_seconds, batch._last_estimate = store.read_timing() or (
+            0.0,
+            None,
+        )
+        return batch
 
     @property
     def elapsed_seconds(self) -> float:
@@ -245,8 +236,8 @@ class Batch:
                 self._last_estimate = estimate
         return estimate
 
-    def _display_estimate(self):
-        """Read the latest estimate without fitting on the display thread."""
+    def _snapshot_estimate(self):
+        """Get the latest default-coverage estimate for a live snapshot."""
         with self._state_lock:
             pending = len(self.state.queue) + len(self.state.active_gpu)
             if not pending:
@@ -279,26 +270,13 @@ class Batch:
         while not stopped.wait(TIMING_SAVE_INTERVAL):
             self._update_timing()
 
-    def run(
-        self,
-        *,
-        progress: bool = True,
-        refresh_interval: float = 1.0,
-        handle_sigterm: bool = False,
-    ) -> tuple[ExperimentResult, ...]:
-        """Run the batch. Enable handle_sigterm on the main thread for CLI stop control."""
+    def run(self) -> tuple[ExperimentResult, ...]:
+        """Execute the batch while accepting CLI and dashboard stop requests."""
         from expman.scheduling.scheduler import GpuScheduler
 
-        display = BatchProgress(self, enabled=progress, interval=refresh_interval)
-        control = stop_on_sigterm(self.output_dir) if handle_sigterm else nullcontext()
-        with run_lock(self.output_dir), control:
-            if self._started:
-                raise RuntimeError(
-                    "a Batch can only run once; use Batch.resume to continue"
-                )
+        with run_lock(self.output_dir), stop_on_sigterm(self.output_dir):
             if self.store.read_manifest()["revision"] != self._revision:
-                raise StorageError("batch records changed; reload with Batch.resume")
-            self._started = True
+                raise StorageError("batch records changed; retry expman resume")
             if self._elapsed_seconds > 0:
                 self.state.session_marks.append(round(self._elapsed_seconds, 2))
                 self._save()
@@ -312,9 +290,7 @@ class Batch:
             )
             timer.start()
             live = self._start_live()
-            error = None
             try:
-                display.start()
                 if not self.pipeline.stages:
                     with self._state_lock:
                         while self.state.queue:
@@ -324,9 +300,6 @@ class Batch:
                         self._save()
                     return self.results
                 return GpuScheduler(self).run()
-            except BaseException as caught:
-                error = caught
-                raise
             finally:
                 stopped.set()
                 timer.join()
@@ -334,7 +307,6 @@ class Batch:
                     self._elapsed_seconds = self.elapsed_seconds
                     self._session_started = None
                 self._update_timing()
-                display.stop(error)
                 if live is not None:
                     live.close()
 

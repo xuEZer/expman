@@ -33,6 +33,13 @@ class BatchStore:
             raise StorageError("unsupported or invalid batch manifest")
         return manifest
 
+    def read_resumable_manifest(self) -> dict:
+        manifest = self.read_manifest()
+        spec = manifest.get("pipeline_spec")
+        if not isinstance(spec, str) or not spec:
+            raise StorageError(f"{self.directory} has no recorded pipeline location")
+        return manifest
+
     def save_manifest(self, manifest: dict) -> str:
         revision = uuid4().hex
         write_record(

@@ -16,7 +16,6 @@ const state = {
   analysisError: null,
   throttle: 1,
   lastPaint: 0,
-  stopAllowed: false,
   connected: false,
 };
 
@@ -160,11 +159,11 @@ function renderList(s) {
 
 /* -------------------------------------------------------------- detail page */
 
-function topBar(s, detail) {
+function topBar(detail) {
   const name = detail ? (detail.batch || {}).name || "batch" : "批次 " + BATCH_ID;
   const buttons = controls();
-  const stopButton = detail && detail.running && state.stopAllowed
-    ? '<button class="danger" data-act="stop">停止实验</button>' : "";
+  const stopButton = detail && detail.running
+    ? '<button class="danger" data-act="stop" data-name="' + esc(name) + '">停止实验</button>' : "";
   return '<div class="top">' +
     '<a class="pill" href="/">← 全部批次</a>' +
     '<span class="title">' + esc(name) + "</span>" +
@@ -450,11 +449,13 @@ function events(s) {
 
 function loadAnalysis(force) {
   if (state.analysisState === "loading") return;
-  const counts = JSON.stringify(state.snapshot?.batch?.counts || {});
+  const batch = state.snapshot?.batch?.batch;
+  if (!batch) return;
+  const counts = JSON.stringify(batch.counts || {});
   if (state.analysisState === "ready" && !force && counts === state.analysisCounts) return;
   state.analysisState = "loading";
   render(true);
-  fetch("/api/analysis/" + BATCH_ID)
+  fetch("/api/analysis/" + BATCH_ID + "?name=" + encodeURIComponent(batch.name))
     .then((response) => response.json().then((body) => ({ good: response.ok, body })))
     .then(({ good, body }) => {
       if (good && body && Array.isArray(body.metrics)) {
@@ -574,7 +575,7 @@ function statusBody(detail) {
 
 function renderBatch(s) {
   const detail = s.batch;
-  let html = notices(s) + topBar(s, detail);
+  let html = notices(s) + topBar(detail);
   if (!detail) {
     // A starting frame, an error, or a workspace overview can reach the page
     // before its first batch detail. Keep waiting for the next SSE frame.
@@ -622,8 +623,9 @@ function wire() {
     };
     if (act === "reload-analysis") node.onclick = () => loadAnalysis(true);
     if (act === "stop") node.onclick = () => {
-      if (!window.confirm("停止批次 " + BATCH_ID + " 正在运行的实验？已完成的阶段会保留，可以之后 resume。")) return;
-      fetch("/api/stop/" + BATCH_ID, { method: "POST" }).then(() => setTimeout(() => location.reload(), 1500));
+      const name = node.dataset.name;
+      if (!window.confirm("停止批次 " + BATCH_ID + "（" + name + "）正在运行的实验？已完成的阶段会保留，可以之后 resume。")) return;
+      fetch("/api/stop/" + BATCH_ID + "?name=" + encodeURIComponent(name), { method: "POST" }).then(() => setTimeout(() => location.reload(), 1500));
     };
   });
 }
@@ -635,17 +637,17 @@ function connect() {
   source.onerror = () => { state.connected = false; render(); };
   source.onmessage = (message) => {
     state.connected = true;
+    const previousName = state.snapshot?.batch?.batch?.name;
     try { state.snapshot = JSON.parse(message.data); } catch (error) { return; }
+    if (previousName && state.snapshot.batch?.batch?.name !== previousName) {
+      location.reload();
+      return;
+    }
     if (state.tab === "analysis" && state.analysisState === "ready" && !state.paused) loadAnalysis(false);
     render();
   };
 }
 
 document.title = PAGE === "batch" ? "expman 看板 · 批次 " + BATCH_ID : "expman 运行看板";
-
-fetch("/api/health").then((response) => response.json()).then((health) => {
-  state.stopAllowed = Boolean(health.stop);
-  render(true);
-}).catch(() => {});
 
 connect();

@@ -1,8 +1,9 @@
 """Framework-set worker environment: the thread ceiling and the HF mirror."""
 
 import pytest
+from batch_helpers import make_batch
 
-from expman import environment
+from expman import Pipeline, Stage, environment
 
 
 @pytest.fixture(autouse=True)
@@ -76,8 +77,6 @@ def test_blank_overrides_are_not_overrides(monkeypatch, value):
 
 
 def test_a_bad_override_fails_before_the_batch_directory_exists(tmp_path, monkeypatch):
-    """The mistake is reported while nothing has been created yet."""
-    from expman import Batch, Pipeline, Stage
 
     class Trivial(Stage):
         def process(self, data, ctx):
@@ -89,6 +88,6 @@ def test_a_bad_override_fails_before_the_batch_directory_exists(tmp_path, monkey
     monkeypatch.setenv(environment.THREADS_OVERRIDE, "abc")
 
     with pytest.raises(ValueError, match="EXPMAN_THREADS"):
-        Batch(Pipeline([Trivial]), config, output_dir=output)
+        make_batch(Pipeline([Trivial]), config, output_dir=output)
 
     assert not output.exists()

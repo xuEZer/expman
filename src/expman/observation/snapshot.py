@@ -47,7 +47,7 @@ def remaining_interval(estimate):
 def _remaining(batch):
     """The current batch interval from the latest scheduler estimate."""
     try:
-        estimate = batch._display_estimate()
+        estimate = batch._snapshot_estimate()
     except Exception:
         return None
     return remaining_interval(estimate)
@@ -236,10 +236,9 @@ def stage_record(
 ):
     """One Stage's row in a snapshot, shared by both reading paths.
 
-    ``known`` is False until the scheduler has reported the Stage at all, and
-    ``unit`` is the scheduler's unit interval, which only a live batch holds.
-    The archived path passes nothing there and marks the row approximate
-    instead, so both paths serialize the same keys.
+    Live rows have known group counts when the scheduler reports them and can
+    include its per-group time interval. Archived rows use completed run
+    counts as an approximation and leave the interval empty.
     """
     unit = unit or {}
     return {

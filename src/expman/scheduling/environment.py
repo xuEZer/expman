@@ -72,11 +72,7 @@ def hf_endpoint() -> str | None:
 
 
 def validate() -> None:
-    """Check the overrides the shell carries, before anything has a side effect.
-
-    A malformed value is a configuration mistake, so it is reported while the
-    Batch is still being constructed rather than at the first worker launch.
-    """
+    """Check worker environment overrides before creating a new batch directory."""
     thread_budget()
     hf_endpoint()
 

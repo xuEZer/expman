@@ -1,4 +1,4 @@
-"""Composable experiment execution with optional progress reporting."""
+"""Run resumable experiment pipelines in GPU-scheduled batches."""
 
 import expman.resources.devices as devices
 from expman.config import (
@@ -19,7 +19,6 @@ from expman.observation import cleanup
 from expman.resources import limits
 from expman.resources.devices import DeviceMemory, MeminfoMonitor, NvidiaMemory
 from expman.scheduling import environment
-from expman.scheduling.batch import Batch
 from expman.storage.base import (
     PickleSerializer,
     RecoveryWarning,
@@ -30,7 +29,6 @@ from expman.storage.run import Checkpoint
 
 __all__ = [
     "AttemptResult",
-    "Batch",
     "Checkpoint",
     "ConfigError",
     "DeviceMemory",

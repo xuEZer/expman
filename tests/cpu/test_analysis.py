@@ -19,7 +19,7 @@ def make_batch(root, runs, name="batch-a", *, active=(), queue=()):
     ``metric_rows`` items are ``(stage, step, name, value)`` tuples; ``stage``
     is the stage-path tuple and ``name`` the metric-path tuple.
     """
-    directory = root / "runs" / name
+    directory = root / "batches" / name
     experiments = []
     for run in runs:
         exp_dir = directory / "experiments" / run["run_id"]
@@ -470,7 +470,7 @@ def test_a_reversed_trend_gets_a_negative_rank_correlation(root):
 
 def test_a_directory_without_a_manifest_is_rejected(root):
     with pytest.raises(AnalysisError):
-        analysis_payload(root / "runs" / "nothing")
+        analysis_payload(root / "batches" / "nothing")
 
 
 def test_two_stage_names_and_lists_are_categorical_leaves(root):

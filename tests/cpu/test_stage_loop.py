@@ -4,8 +4,9 @@ import random
 from pathlib import Path
 
 import pytest
+from batch_helpers import make_batch
 
-from expman import Batch, Pipeline, Stage, Status
+from expman import Pipeline, Stage, Status
 from expman.core.context import RunContext
 from expman.core.experiment import Experiment
 from expman.core.randomness import RandomStateManager
@@ -180,7 +181,7 @@ def test_both_cache_readers_compare_the_target_stage_declaration(tmp_path):
 
     path = tmp_path / "experiments.yaml"
     path.write_text("seed: 42\ndevice: [0]\ninput_x: 2\ncombines: [{}, {input_y: 5}]")
-    batch = Batch(Pipeline([SumInputs]), path, output_dir=tmp_path / "batch")
+    batch = make_batch(Pipeline([SumInputs]), path, output_dir=tmp_path / "batch")
     first, second = batch.experiments
     assert first.run_stage(0, attempt=1).status is Status.SUCCEEDED
     assert first._store.completed((0,))["output"] == 2

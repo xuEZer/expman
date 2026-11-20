@@ -14,5 +14,6 @@ htmlcov/
 .env.*
 !.env.example
 /runs/
+/batches/
 .DS_Store
 Thumbs.db

@@ -57,8 +57,8 @@ def _stage_name(spec: object) -> str | None:
 def _stages(manifest: dict) -> list[dict]:
     """Per-Stage progress as the durable records describe it.
 
-    Count runs that completed each Stage, including cache reuses. Unit intervals need the
-    scheduler's samples, which are live-only, and stay unknown here.
+    Count runs that completed each Stage, including cache reuses. The manifest
+    stores stage history. Only the live scheduler computes per-group time intervals.
     """
     signature = manifest.get("pipeline") or []
     runs = len(manifest.get("experiments") or [])

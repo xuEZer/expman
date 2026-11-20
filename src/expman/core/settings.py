@@ -1,7 +1,7 @@
 """Process-wide Batch defaults, configured in code with ``expman.set``.
 
-The CLI imports the Pipeline module before constructing a new Batch, so it
-sees defaults set in that module. Explicit Batch arguments take precedence.
+The CLI imports the pipeline module before creating a batch, so settings
+declared alongside the pipeline apply to its new batches.
 Resume restores the settings saved in the batch manifest.
 """
 

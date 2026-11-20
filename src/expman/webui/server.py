@@ -2,7 +2,7 @@
 
 Workspace discovery registers new batch names in the shared ID database.
 The server reads snapshots or durable batch records, serves bundled static
-assets, and forwards stop requests when allow_stop is enabled.
+assets, and forwards stop requests to running batches.
 """
 
 import json
@@ -30,11 +30,12 @@ STATIC_FILES = {
 HEARTBEAT_SECONDS = 15.0
 # A taken port is not an experiment failure: try the next few numbers.
 PORT_ATTEMPTS = 10
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
 
 class Workspace:
-    """Every batch under one runs/ tree, read from disk on demand."""
+    """Every batch under the selected batches directory, read from disk on demand."""
 
     def __init__(self, root: Path | None = None) -> None:
         self.root = root
@@ -42,9 +43,9 @@ class Workspace:
     def collect(self) -> tuple[list[dict], dict[int, dict]]:
         """Summaries for the list page and full snapshots keyed by batch ID.
 
-        Each refresh checks the batch control FIFO and the latest published snapshot. The
-        archive reader opens the batch manifest when the snapshot is absent
-        or unusable.
+        Each refresh checks the batch control FIFO and the latest published
+        snapshot. The archive reader uses durable records if the snapshot is
+        missing or unreadable, or if a stale snapshot predates the manifest.
         """
         summaries = []
         details: dict[int, dict] = {}
@@ -118,7 +119,7 @@ class Stream:
     def refresh(self) -> None:
         """Refresh the overview and watched details.
 
-        Keep the previous detail frame when discovery skips a watched batch.
+        Keep a skipped batch's previous detail only while the ID names that directory.
         A failed refresh publishes the error on the overview frame.
         """
         try:
@@ -131,8 +132,11 @@ class Stream:
             for batch_id in watched:
                 detail = details.get(batch_id)
                 if detail is None and batch_id in previous:
-                    frames[batch_id] = previous[batch_id]
-                    continue
+                    last = json.loads(previous[batch_id]).get("batch")
+                    if last and last["batch"].get("dir") == str(
+                        self.workspace.directory(batch_id)
+                    ):
+                        detail = last
                 frames[batch_id] = json.dumps({**base, "batch": detail}, default=str)
         except Exception as error:
             with self.condition:
@@ -199,27 +203,34 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            parts = _parts(urlparse(self.path).path)
+            request = urlparse(self.path)
+            parts = _parts(request.path)
             if (
                 len(parts) != 3
                 or parts[:2] != ["api", "stop"]
                 or not parts[2].isdigit()
             ):
                 self._error(404, "no such endpoint")
-            elif not self.dashboard.allow_stop:
-                self._error(403, "this dashboard is read-only")
             else:
-                self._stop(int(parts[2]))
+                self._stop(int(parts[2]), parse_qs(request.query).get("name"))
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
         except Exception as error:
             with suppress(Exception):
                 self._error(500, f"{type(error).__name__}: {error}")
 
-    def _stop(self, batch_id):
+    def _directory(self, batch_id, names=None):
         directory = self.dashboard.workspace.directory(batch_id)
         if directory is None:
             self._error(404, f"no batch {batch_id}")
+        elif names is not None and names != [directory.name]:
+            self._error(409, f"batch ID {batch_id} now names a different batch")
+            return None
+        return directory
+
+    def _stop(self, batch_id, names):
+        directory = self._directory(batch_id, names)
+        if directory is None:
             return
         ok, message = request_stop(directory)
         self._body({"status": "stopping" if ok else "refused", "message": message})
@@ -239,36 +250,28 @@ class Handler(BaseHTTPRequestHandler):
         elif (
             len(parts) == 3 and parts[:2] == ["api", "analysis"] and parts[2].isdigit()
         ):
-            self._analysis(int(parts[2]))
+            self._analysis(int(parts[2]), query.get("name"))
         elif path == "/api/stream":
             self._stream(_batch_key(query))
         elif path == "/api/health":
-            self._body(
-                {
-                    "status": "ok",
-                    "schema": SCHEMA,
-                    "stop": self.dashboard.allow_stop,
-                }
-            )
+            self._body({"status": "ok", "schema": SCHEMA})
         else:
             self._error(404, "no such endpoint")
 
     def _detail(self, batch_id):
         """One batch's full snapshot, built on this thread for a direct hit."""
-        directory = self.dashboard.workspace.directory(batch_id)
+        directory = self._directory(batch_id)
         if directory is None:
-            self._error(404, f"no batch {batch_id}")
             return
         try:
             self._body(read_batch(directory, batch_id))
         except Exception as error:
             self._error(500, f"{type(error).__name__}: {error}")
 
-    def _analysis(self, batch_id):
+    def _analysis(self, batch_id, names):
         """One batch's result analysis, computed on demand and cached."""
-        directory = self.dashboard.workspace.directory(batch_id)
+        directory = self._directory(batch_id, names)
         if directory is None:
-            self._error(404, f"no batch {batch_id}")
             return
         try:
             self._body(self.dashboard.analysis(batch_id, directory))
@@ -355,18 +358,17 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, workspace, *, interval, allow_stop):
+    def __init__(self, address, workspace, *, interval):
         super().__init__(address, Handler)
         self.workspace = workspace
         self.stream = Stream(workspace, interval)
-        self.allow_stop = allow_stop
         self.analysis_cache: dict[int, tuple[tuple, dict]] = {}
         self.analysis_lock = threading.Lock()
         self.host, self.port = self.server_address[0], self.server_address[1]
 
     def analysis(self, batch_id: int, directory: Path) -> dict:
         """The analysis payload for one batch, cached until its inputs change."""
-        mark = fingerprint(directory)
+        mark = (directory, fingerprint(directory))
         with self.analysis_lock:
             cached = self.analysis_cache.get(batch_id)
             if cached is not None and cached[0] == mark:
@@ -378,7 +380,7 @@ class DashboardServer(ThreadingHTTPServer):
 
 
 class WebUI:
-    """A running dashboard over one runs/ tree."""
+    """A running dashboard over one batches directory."""
 
     def __init__(self, server: DashboardServer, display_host: str):
         self._server = server
@@ -417,7 +419,7 @@ class WebUI:
             self._server.server_close()
 
 
-def _check(host, port, interval, allow_stop):
+def _check(host, port, interval):
     if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
         raise ValueError("port must be an integer between 0 and 65535")
     if not isinstance(host, str) or not host:
@@ -430,35 +432,29 @@ def _check(host, port, interval, allow_stop):
         raise ValueError(
             "interval must be greater than zero and less than 3600 seconds"
         )
-    if not isinstance(allow_stop, bool):
-        raise ValueError("allow_stop must be a boolean")
 
 
 def serve(
     root: Path | None = None,
     *,
-    host: str = "127.0.0.1",
+    host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     interval: float = 1.0,
-    allow_stop: bool = True,
 ) -> WebUI:
-    """Start a dashboard over ``root`` (``runs/`` by default) and return it.
+    """Start a dashboard over ``root`` (``./batches/`` by default) and return it.
 
     The dashboard runs in daemon threads, so it also disappears with the
     process that started it.  Binding the loopback address is the default;
     exposing it to a network requires passing a host explicitly.
     """
-    _check(host, port, interval, allow_stop)
+    _check(host, port, interval)
     workspace = Workspace(root)
     last = None
     last_port = min(port + PORT_ATTEMPTS - 1, 65535) if port else 0
     for candidate in range(port, last_port + 1):
         try:
             server = DashboardServer(
-                (host, candidate),
-                workspace,
-                interval=float(interval),
-                allow_stop=allow_stop,
+                (host, candidate), workspace, interval=float(interval)
             )
         except OSError as error:
             last = error

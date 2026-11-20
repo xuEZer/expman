@@ -1,11 +1,11 @@
-"""Command-line interface: run, resume, inspect and stop experiment Batches.
+"""Command-line interface: run, resume, inspect, stop and delete experiment Batches.
 
-The pipeline is located as ``module:attr`` on the command line and recorded
-in the Batch manifest, so ``expman resume`` can rebuild it without the user
-repeating it. Every batch directory under ``runs/`` gets a small integer ID
-recorded in ``runs/.batches.sqlite3``: ``expman status`` without arguments keeps
-redrawing a live overview of all of them until Ctrl+C, and the same ID is a
-shortcut for ``expman stop`` and ``expman resume``. ``expman web`` serves a
+The pipeline is located as ``module:attr`` or by an attribute of the default
+``pipeline`` module. The Batch manifest records that location for
+``expman resume``. Each batches directory (default ``./batches/``) has its own
+integer IDs recorded in ``.batches.sqlite3``. ``expman status`` refreshes the
+directory overview or the selected batch's details until Ctrl+C. An ID also
+selects a batch for ``stop``, ``resume`` or ``delete``. ``expman web`` serves a
 dashboard over the same IDs from its own process, independent of any batch
 it watches. Retry counts and interval coverage are process-wide settings
 configured in code with ``expman.set(...)`` next to the Pipeline, not
@@ -14,29 +14,36 @@ command-line flags.
 
 import argparse
 import importlib
+import shlex
 import sys
+from functools import partial
 from pathlib import Path
-from time import sleep
+from time import sleep, strftime
 
+from expman.config import load_configs
 from expman.core.events import Status
 from expman.core.pipeline import Pipeline
 from expman.estimation.estimate import _clock as _fmt_elapsed
-from expman.observation.registry import RUNS_DIR, ensure_ids
+from expman.observation.registry import BATCHES_DIR, delete_batch, ensure_ids
 from expman.observation.status import RecordedBatch
 from expman.process_control import request_stop
-from expman.scheduling.batch import Batch
-from expman.storage.base import StorageError
+from expman.scheduling.batch import _Batch
 from expman.storage.batch import BatchStore
-from expman.webui.server import DEFAULT_PORT, serve
+from expman.webui.server import DEFAULT_HOST, DEFAULT_PORT, serve
 
 _STATUS_INTERVAL = 2.0
+DEFAULT_PIPELINE_MODULE = "pipeline"
 
 
 def _resolve_pipeline(spec: str) -> Pipeline:
-    """Import the Pipeline object named by ``module:attr``."""
+    """Import a pipeline by attribute name or by an explicit module:attr."""
     module_name, separator, attr_name = spec.rpartition(":")
-    if not module_name or not separator or not attr_name:
-        raise SystemExit(f"pipeline must look like 'module:attr', got {spec!r}")
+    if not separator:
+        module_name = DEFAULT_PIPELINE_MODULE
+    if not module_name or not attr_name or Path(attr_name).name != attr_name:
+        raise SystemExit(
+            f"pipeline must look like 'attr' or 'module:attr', got {spec!r}"
+        )
     if "" not in sys.path:
         sys.path.insert(0, "")
     try:
@@ -56,31 +63,19 @@ def _resolve_pipeline(spec: str) -> Pipeline:
     return attribute
 
 
-def _default_output_dir(spec: str, config: str) -> Path:
-    """runs/<pipeline-attr>_<config-stem>, suffixed _2, _3... on collisions."""
-    attr = spec.rpartition(":")[2] or "batch"
-    stem = Path(config).stem or "cfg"
-    base = f"{attr}_{stem}"
-    candidate = RUNS_DIR / base
-    suffix = 2
-    while candidate.exists():
-        candidate = RUNS_DIR / f"{base}_{suffix}"
-        suffix += 1
-    return candidate
+def _command_hint(command: str, batches_dir: Path, *arguments: str) -> str:
+    words = ["expman", command, *arguments]
+    if batches_dir.resolve() != BATCHES_DIR.resolve():
+        words.extend(["--batches-dir", str(batches_dir.resolve())])
+    return shlex.join(words)
 
 
-def _resolve_directory(token: str) -> Path:
-    """Interpret the argument as a batch ID (``0``, ``1``, ...) or a path."""
-    if token.isdigit():
-        ids = ensure_ids()
-        directory = ids.get(int(token))
-        if directory is None:
-            known = ", ".join(str(i) for i in sorted(ids)) or "none"
-            raise SystemExit(
-                f"unknown batch ID {token} (known: {known}); see expman status"
-            )
-        return directory
-    return Path(token)
+def _batch_directory(batches_dir: Path, batch_id: int) -> Path:
+    directory = ensure_ids(batches_dir).get(batch_id)
+    if directory is None:
+        hint = _command_hint("status", batches_dir)
+        raise SystemExit(f"unknown batch ID {batch_id} under {batches_dir}; see {hint}")
+    return directory
 
 
 def _timing(report: RecordedBatch) -> tuple[str, str]:
@@ -89,18 +84,16 @@ def _timing(report: RecordedBatch) -> tuple[str, str]:
     return elapsed, remaining
 
 
-def _execute(batch: Batch, *, progress: bool, resume_command: str) -> int:
+def _execute(batch: _Batch, *, batch_id: int) -> int:
     """Run the batch; a stop signal maps to a resume hint and exit 143."""
-    print(f"Batch directory: {batch.output_dir}", flush=True)
+    print(f"Batch ID: {batch_id}\nBatch directory: {batch.output_dir}", flush=True)
 
     try:
-        results = batch.run(progress=progress, handle_sigterm=True)
+        results = batch.run()
     except KeyboardInterrupt:
+        resume_command = _command_hint("resume", batch.output_dir.parent, str(batch_id))
         print(f"Stopped; resume with: {resume_command}", file=sys.stderr)
         return 143
-    except StorageError as error:
-        print(error, file=sys.stderr)
-        return 1
     for result in results:
         print(f"{result.run_id}: {result.status.value}")
 
@@ -109,60 +102,34 @@ def _execute(batch: Batch, *, progress: bool, resume_command: str) -> int:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     pipeline = _resolve_pipeline(args.pipeline)
-    output_dir = (
-        Path(args.output_dir)
-        if args.output_dir is not None
-        else _default_output_dir(args.pipeline, args.config)
-    )
-    batch = Batch(
+    attr = args.pipeline.rpartition(":")[2]
+    stem = Path(args.config).stem
+    timestamp = strftime("%Y%m%d%H%M%S")
+    directory = args.batches_dir / f"{attr}_{stem}_{timestamp}"
+    batch = _Batch.create(
         pipeline,
-        args.config,
-        output_dir=output_dir,
-        _pipeline_spec=args.pipeline,
+        load_configs(args.config),
+        output_dir=directory,
+        pipeline_spec=args.pipeline,
     )
-    ids = ensure_ids()
-    batch_id = next(
-        (i for i, directory in ids.items() if directory == batch.output_dir), None
-    )
-    display = str(batch_id) if batch_id is not None else str(batch.output_dir)
-    return _execute(
-        batch,
-        progress=args.progress,
-        resume_command=f"expman resume {display}",
-    )
+    ids = ensure_ids(batch.output_dir.parent)
+    batch_id = next(i for i, path in ids.items() if path == batch.output_dir)
+    return _execute(batch, batch_id=batch_id)
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
-    directory = _resolve_directory(args.directory)
-    try:
-        manifest = BatchStore(directory).read_manifest()
-    except StorageError as error:
-        raise SystemExit(str(error)) from None
-    spec = manifest.get("pipeline_spec")
-    if not isinstance(spec, str):
-        raise SystemExit(
-            f"{directory} records no pipeline location; resume it from Python "
-            "with Batch.resume(pipeline, ...)"
-        )
-    pipeline = _resolve_pipeline(spec)
-    batch = Batch.resume(pipeline, directory)
-    return _execute(
-        batch,
-        progress=args.progress,
-        resume_command=f"expman resume {args.directory}",
-    )
+    directory = _batch_directory(args.batches_dir, args.ID)
+    store = BatchStore(directory)
+    manifest = store.read_resumable_manifest()
+    pipeline = _resolve_pipeline(manifest["pipeline_spec"])
+    batch = _Batch.resume(pipeline, store, manifest)
+    return _execute(batch, batch_id=args.ID)
 
 
-def _cmd_status(args: argparse.Namespace) -> int:
-    if args.directory is None:
-        return _live_overview()
-    directory = _resolve_directory(args.directory)
-    try:
-        report = RecordedBatch.read(directory)
-    except StorageError as error:
-        raise SystemExit(str(error)) from None
+def _print_detail(directory: Path, batch_id: int) -> None:
+    report = RecordedBatch.read(directory)
     total = report.stage_count
-    print(f"Batch {directory} | stages: {total} | runs: {len(report.runs)}")
+    print(f"Batch {batch_id}: {directory} | stages: {total} | runs: {len(report.runs)}")
     for run in report.runs:
         stage = run.stage + 1 if run.stage is not None and total else "-"
         history = " ".join(str(item["status"]).lower() for item in run.attempts)
@@ -172,18 +139,15 @@ def _cmd_status(args: argparse.Namespace) -> int:
         )
     elapsed, remaining = _timing(report)
     print(f"elapsed: {elapsed} | remaining: {remaining}")
-    if args.directory.isdigit():
-        print(f"detail page: `expman web`, then /b/{args.directory}")
-    return 0
+    print(
+        f"detail page: `{_command_hint('web', directory.parent)}`, then /b/{batch_id}"
+    )
 
 
 def _overview_line(batch_id: int, directory: Path) -> str:
-    """One summary line of the runs/ overview, tolerating live rewriting."""
-    name = str(RUNS_DIR / directory.name)
-    try:
-        report = RecordedBatch.read(directory)
-    except StorageError:
-        return f"{batch_id:>2}  {name:<30} unreadable records"
+    """Format one batch's saved state for the status overview."""
+    name = str(directory)
+    report = RecordedBatch.read(directory)
     counts = report.counts
     reached = max(
         (run.stage for run in report.runs if run.stage is not None), default=None
@@ -199,12 +163,9 @@ def _overview_line(batch_id: int, directory: Path) -> str:
     )
 
 
-def _print_overview() -> None:
-    ids = ensure_ids()
-    print(
-        f"batches under {RUNS_DIR}/"
-        f" (refreshing every {_STATUS_INTERVAL:g}s; Ctrl+C to exit)"
-    )
+def _print_overview(batches_dir: Path) -> None:
+    ids = ensure_ids(batches_dir)
+    print(f"batches under {batches_dir}")
     if not ids:
         print("  no batches yet")
         return
@@ -213,15 +174,23 @@ def _print_overview() -> None:
         f" {'DONE':>4} {'FAIL':>4} {'STOP':>4}  {'STAGE':<8}{'ELAPSED':<10}REMAINING"
     )
     for batch_id, directory in sorted(ids.items()):
-        print(_overview_line(batch_id, directory))
+        print(_overview_line(batch_id, batches_dir / directory.name))
 
 
-def _live_overview() -> int:
-    """Keep redrawing the runs/ overview until the user presses Ctrl+C."""
+def _cmd_status(args: argparse.Namespace) -> int:
+    """Refresh the overview or a single batch's records until Ctrl+C."""
     try:
+        if args.ID is None:
+            print_frame = partial(_print_overview, args.batches_dir)
+        else:
+            directory = _batch_directory(args.batches_dir, args.ID)
+            print_frame = partial(_print_detail, directory, args.ID)
         while True:
-            print("\033[2J\033[H", end="", flush=True)
-            _print_overview()
+            print("\033[2J\033[H", end="")
+            print_frame()
+            print(
+                f"Refreshing every {_STATUS_INTERVAL:g}s; Ctrl+C to exit.", flush=True
+            )
             sleep(_STATUS_INTERVAL)
     except KeyboardInterrupt:
         pass
@@ -229,10 +198,16 @@ def _live_overview() -> int:
 
 
 def _cmd_stop(args: argparse.Namespace) -> int:
-    directory = _resolve_directory(args.directory)
+    directory = _batch_directory(args.batches_dir, args.ID)
     success, message = request_stop(directory)
     print(message, file=sys.stderr if not success else None)
     return 0 if success else 1
+
+
+def _cmd_delete(args: argparse.Namespace) -> int:
+    directory = delete_batch(args.batches_dir, args.ID)
+    print(f"Deleted batch {args.ID}: {directory}")
+    return 0
 
 
 def _cmd_web(args: argparse.Namespace) -> int:
@@ -241,15 +216,9 @@ def _cmd_web(args: argparse.Namespace) -> int:
     The dashboard is its own process on purpose: it outlives every batch it
     watches, and batches started later show up without restarting it.
     """
-    root = None if args.root is None else Path(args.root)
-    try:
-        dashboard = serve(
-            root, host=args.host, port=args.port, allow_stop=not args.read_only
-        )
-    except (OSError, ValueError) as error:
-        raise SystemExit(f"could not start the dashboard: {error}") from None
+    dashboard = serve(args.batches_dir, host=args.host, port=args.port)
     print(f"Dashboard: {dashboard.url}", flush=True)
-    print(f"Watching batches under {root or RUNS_DIR}; Ctrl+C to stop.", flush=True)
+    print(f"Watching batches under {args.batches_dir}; Ctrl+C to stop.", flush=True)
     try:
         dashboard.wait()
     finally:
@@ -264,28 +233,19 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     run = commands.add_parser("run", help="create and run a new Batch")
-    run.add_argument("pipeline", help="pipeline location as 'module:attr'")
-    run.add_argument("config", help="experiment YAML path")
     run.add_argument(
-        "-o",
-        "--output-dir",
-        default=None,
-        help="batch directory (default: runs/<pipeline>_<config>)",
+        "pipeline",
+        help=f"pipeline attribute or 'module:attr' (default module: {DEFAULT_PIPELINE_MODULE})",
     )
+    run.add_argument("config", help="experiment YAML path")
     resume = commands.add_parser("resume", help="continue a stopped Batch")
-    resume.add_argument("directory", help="batch ID from expman status, or a path")
-    for command in (run, resume):
-        command.add_argument(
-            "--progress",
-            action="store_true",
-            help="show live progress while running (off by default)",
-        )
+    resume.add_argument("ID", type=int, help="batch ID from expman status")
     run.set_defaults(handler=_cmd_run)
     resume.set_defaults(handler=_cmd_resume)
 
     web = commands.add_parser(
         "web",
-        help="serve the dashboard for every batch under runs/",
+        help="serve the dashboard for every batch under the selected root",
     )
     web.add_argument(
         "--port",
@@ -295,36 +255,41 @@ def _parser() -> argparse.ArgumentParser:
     )
     web.add_argument(
         "--host",
-        default="127.0.0.1",
-        help="dashboard bind address (default: loopback only)",
-    )
-    web.add_argument(
-        "--root",
-        default=None,
-        help="directory holding the batches (default: runs/)",
-    )
-    web.add_argument(
-        "--read-only",
-        action="store_true",
-        help="refuse stop requests and hide the stop button",
+        default=DEFAULT_HOST,
+        help="dashboard bind address (default: %(default)s)",
     )
     web.set_defaults(handler=_cmd_web)
 
     status = commands.add_parser(
         "status",
-        help="show progress; without an ID, watch every batch under runs/",
+        help="watch all batches or one batch until Ctrl+C",
     )
     status.add_argument(
-        "directory",
+        "ID",
+        type=int,
         nargs="?",
-        default=None,
-        help="batch ID or path; omit to watch runs/ until Ctrl+C",
+        help="watch this batch's runs; omit to watch all batches",
     )
     status.set_defaults(handler=_cmd_status)
 
     stop = commands.add_parser("stop", help="gracefully stop a running Batch")
-    stop.add_argument("directory", help="batch ID from expman status, or a path")
+    stop.add_argument("ID", type=int, help="batch ID from expman status")
     stop.set_defaults(handler=_cmd_stop)
+
+    delete = commands.add_parser(
+        "delete", help="delete an idle batch directory and release its ID"
+    )
+    delete.add_argument("ID", type=int, help="batch ID from expman status")
+    delete.set_defaults(handler=_cmd_delete)
+
+    for command in (run, resume, web, status, stop, delete):
+        command.add_argument(
+            "--batches-dir",
+            type=Path,
+            default=BATCHES_DIR,
+            metavar="DIR",
+            help="parent directory holding the batches (default: %(default)s)",
+        )
     return parser
 
 
