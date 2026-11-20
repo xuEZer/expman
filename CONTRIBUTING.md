@@ -25,7 +25,7 @@ CI 的真卡测试使用 `expman-gpu` 标签。该标签用于每个作业独立
 
 ## 分支与提交
 
-- `main` 保存通过验证的代码。功能、修复和文档分支分别使用 `feat/<name>`、`fix/<name>` 和 `docs/<name>`。
+- 本项目由一人维护。日常开发直接在 `main` 上进行，检查通过后提交。
 - 一次提交围绕一个目的，一起提交实现、相应的行为测试和接口说明。提交消息采用 Conventional Commits，例如 `fix: preserve checkpoints on retry`。
 - 提交前用 `git diff --check` 和 `git status --short` 核对改动。正常提交须经过仓库的 pre-commit 检查。
 
