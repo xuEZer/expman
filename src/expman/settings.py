@@ -135,21 +135,18 @@ def get(key: str) -> Value:
 
 
 def _project_values() -> dict[str, Value]:
-    cwd = Path.cwd()
-    for directory in (cwd, *cwd.parents):
-        path = directory / "pyproject.toml"
-        if not path.is_file():
-            continue
-        try:
-            with path.open("rb") as stream:
-                tool = tomllib.load(stream).get("tool", {})
-            options = tool.get("expman", {}) if isinstance(tool, dict) else {}
-            if not isinstance(options, dict):
-                raise ValueError("[tool.expman] must be a table")
-            return {key: _value(key, value) for key, value in options.items()}
-        except (OSError, ValueError) as error:
-            raise ValueError(f"{path}: {error}") from error
-    return {}
+    path = Path.cwd() / "pyproject.toml"
+    if not path.is_file():
+        return {}
+    try:
+        with path.open("rb") as stream:
+            tool = tomllib.load(stream).get("tool", {})
+        options = tool.get("expman", {}) if isinstance(tool, dict) else {}
+        if not isinstance(options, dict):
+            raise ValueError("[tool.expman] must be a table")
+        return {key: _value(key, value) for key, value in options.items()}
+    except (OSError, ValueError) as error:
+        raise ValueError(f"{path}: {error}") from error
 
 
 @contextmanager

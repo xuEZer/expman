@@ -4,21 +4,22 @@
 
 ### Breaking changes
 
+- 从实验项目根目录执行 `expman run` 时，配置参数使用省略 `.yaml` 扩展名的配置名。例如，`expman run train baseline` 读取 `./configs/baseline.yaml`。YAML 的 `defaults` 按字段路径从 `./configs/` 读取，各条 CLI 命令的项目设置只读取 `./pyproject.toml` 中的 `[tool.expman]`。
 - 非空 `Pipeline` 在构造时检查最后一个 Stage 的 `process()` 定义。叶子须为同步普通方法，只允许自然结束、`return` 和 `return None`。该约束也适用于独立和嵌套的 Pipeline。批次中的标量结果可通过 `ctx.log_metrics()` 保存，模型等产物由实验代码显式写入。尝试和实验结果移除按需读取最终返回值的 `output` 属性。
-- 移除 Python 的 `Batch(pipeline, cfg)` 和 `Batch.resume(...)` 接口。批次统一通过 `expman run train config.yaml` 创建并运行，通过 `expman resume ID` 恢复。缺少流程位置的批次无法通过 CLI 恢复。
+- 移除 Python 的 `Batch(pipeline, cfg)` 和 `Batch.resume(...)` 接口。批次统一通过 `expman run train config` 创建并运行，通过 `expman resume ID` 恢复。缺少流程位置的批次无法通过 CLI 恢复。
 - 批次默认父目录由 `./runs/` 改为 `./batches/`。CLI 各子命令统一使用 `--batches-dir` 指定父目录，移除 `run` 的 `-o` / `--output-dir` 和 `web` 的 `--root`。CLI 新建批次时使用 `<pipeline-attr>_<config-stem>_<YYYYMMDDHHMMSS>` 命名子目录，并打印批次 ID 和目录。时间戳采用本地时间，精确到秒，目录重名时命令报错退出。
 - `status`、`resume` 和 `stop` 的位置参数改为所选父目录中的整数批次 ID。`status` 省略 ID 时显示总览，指定 ID 时显示单批次详情。两种视图默认每两秒刷新一次，按 Ctrl+C 退出查看。批次清单读取失败时，命令报错并退出。`resume` 和 `stop` 要求提供 ID。
 - 移除 `run` 和 `resume` 的 `--progress` 选项。运行期间可在另一终端用 `expman status` 或 Web 看板查看状态。
 - 移除 `expman web --read-only` 和 Python 看板服务的 `allow_stop` 参数。所有看板均允许访问者请求停止运行中的批次，`GET /api/health` 的响应也移除了 `stop` 字段。
 - 批次清单 `batch.pkl` 使用 v2 格式。旧批次如需续跑，请使用创建它的代码环境。用当前代码从头运行时，`expman run` 会创建按时间戳命名的新批次目录。
-- `expman run module:attr config.yaml` 要求该属性是 `Pipeline` 实例。原先导出阶段列表或零参工厂的模块，可分别写成 `train = Pipeline(stages)` 或 `train = make_pipeline()`，再用 `expman run module:train config.yaml` 启动。
+- `expman run module:attr config` 要求该属性是 `Pipeline` 实例。原先导出阶段列表或零参工厂的模块，可分别写成 `train = Pipeline(stages)` 或 `train = make_pipeline()`，再用 `expman run module:train config` 启动。
 - CLI 和 Web 看板共用批次父目录下的 `.batches.sqlite3` 登记批次。新批次分配当前最小的空闲非负整数 ID，其余已登记批次保留原编号。从旧 JSON 登记表切换后，可用 `expman status --batches-dir <父目录>` 核对编号。
 
 ### Added
 
 - 运行参数集中在 `src/expman/settings.py`。各条 CLI 命令可以共用项目 `pyproject.toml` 的 `[tool.expman]` 配置，Python 调用者可以用 `expman.set(...)` 和 `expman.get(key)` 覆盖或读取当前进程的设置。支持设置批次目录、看板端口、刷新间隔、资源预算和 worker 环境。
 - 新增 `expman delete ID`，可删除指定批次的目录及登记记录并释放 ID。命令支持 `--batches-dir`，也可清除已手动移走目录的批次记录。运行中的批次须先停止。
-- `expman run` 支持省略流程模块名。例如 `expman run train experiments.yaml` 会从默认模块 `pipeline` 导入 `train`。
+- `expman run` 支持省略流程模块名。例如 `expman run train experiments` 会从默认模块 `pipeline` 导入 `train`。
 - 默认 pytest 和提交检查均要求真实 CUDA/MPS 测试通过。测试从可见、显存足够且未被其他测试预留的物理 GPU 中选择利用率最低的一张，已有计算任务的卡也可入选。
 - 运行看板新增「结果分析」页签：对单个批次做简单的自变量—因变量分析。数据取自 `batch.pkl`（Run 清单/状态/累计耗时）、每个 Run 的 `config.pkl` 与 `metrics.sqlite3`（`step=-1` 汇总值优先，多 Stage 同名指标自动消歧），耗时以 `run_duration_seconds` 伪指标参与。批次不必跑完：配置不可读的 Run 跳过并标注原因，失败/未完成 Run 排除但计入覆盖度，每个指标各自计 `n`、缺值 Run 按 pairwise 跳过。数值配置项（≥3 个不同取值）报 Spearman 秩相关、绝对值即影响力；其余按取值分组报每组均值与最佳取值，影响力取组间平方和占比（η²）；常量项与样本不足项跳过并显式标注。指标与配置项均按影响力排序，`GET /api/analysis/<id>` 按批次清单、指标库、各 run 配置文件的指纹及两项分析阈值缓存。分析只描述观测到的关系，不做显著性检验与因果断言。
 - 运行看板由独立进程 `expman web` 提供。实验进程定期把只读快照写入 `live.json`，看板通过 HTTP 和 SSE 展示运行状态、调度与资源观测。支持指定地址、端口和批次根目录，并为发现的批次登记稳定编号。
@@ -39,7 +40,7 @@
 - `Serializer` / `PickleSerializer`、`StorageError`、`RecoveryWarning` 及运行目录互斥锁。
 - 实验批次支持按配置创建 run、隔离各次尝试的状态并汇总结果。普通失败的阶段默认可重试一次，重试任务重新入队。
 - `ctx.cfg` 完整配置、`ctx.attempt` 尝试编号，以及关联实验、Pipeline 和 Stage 的观测事件。
-- `load_configs()`：YAML 实验集合加载、按 `grid` / `scan` 展开配置组合、按 `defaults` 字段路径自动加载并合并默认参数。
+- 实验 YAML 支持按 `grid`、`scan` 展开配置组合，并按 `defaults` 所在字段的路径加载和合并默认参数。
 - `ConfigError` 和 `MissingConfigWarning`，以及独立 Run 配置、双模型 YAML 示例与配置行为测试。
 - 同步顺序执行的 Pipeline 和泛型 Stage 基类。
 - RunContext，以及带父子执行标识的生命周期、指标和进度事件。
@@ -97,5 +98,4 @@
 - 调度准入同时观察逐卡显存与主机内存：每个 tick 重新查询两者，查询超时（默认 3 秒）或失败按主机内存紧张处理并暂停派发；已发出的预留若无法兑现——主机余量连零字节都放不下，或某卡上未兑现的预留超过空闲显存——则撤销最近启动的一个尝试（带冷却；只有一个 worker 时只暂停派发、不撤销）。准入由主机余量与逐卡未兑现预留联合决定，压力消失后自然恢复；swap 只观测；并发 ETA 在压力期间只保留已占用的槽位。
 - 调度主循环轮流从各阶段取候选，仅按剩余主机内存和各卡剩余显存为可行的装箱方案打分。批次计时线程更新并保存 ETA。
 - Batch 持久化累计运行时间及当前剩余时间区间，区间未知时记录为空。resume 沿用累计时间，调度恢复后更新预测。
-- 命名默认配置按字段路径从项目根目录的 configs 读取。
 - checkpoint 原子保存并按声明的配置依赖恢复，避免下游无关参数变化导致前缀重算。

@@ -1,4 +1,8 @@
-"""Experiment configuration keys and batch-wide GPU selection."""
+"""Experiment configuration paths, keys and batch-wide GPU selection."""
+
+from pathlib import Path
+
+CONFIGS_DIR = Path("configs")
 
 COMBINES_KEY = "combines"
 GRID_KEY = "grid"
@@ -10,6 +14,15 @@ CONTROL_KEYS = (COMBINES_KEY, GRID_KEY, SCAN_KEY)
 
 class ConfigError(ValueError):
     """Experiment configuration or its YAML source violates a configuration rule."""
+
+
+def _safe_segment(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and value not in (".", "..")
+        and not any(character in value for character in ("/", "\\", "\0"))
+    )
 
 
 def configured_devices(configs) -> tuple[int, ...]:

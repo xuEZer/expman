@@ -6,7 +6,8 @@ from datetime import date
 
 import pytest
 
-from expman import ConfigError, MissingConfigWarning, load_configs
+from expman import ConfigError, MissingConfigWarning
+from expman.config.loader import _load_configs
 
 
 def write(root, name, content):
@@ -17,8 +18,8 @@ def write(root, name, content):
 
 
 @pytest.fixture
-def root(tmp_path):
-    (tmp_path / "pyproject.toml").touch()
+def root(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     return tmp_path
 
 
@@ -33,7 +34,7 @@ def load(root, experiment):
         for name, body in (files or {}).items():
             write(root, name, body)
         write(root, "experiment.yaml", content)
-        return load_configs(experiment)
+        return _load_configs(experiment)
 
     return _load
 
@@ -551,33 +552,14 @@ def test_device_validation_uses_the_resolved_configurations(load):
         )
 
 
-def test_defaults_paths_follow_the_project_root_and_field_keys(root):
+def test_defaults_use_working_directory_and_field_keys(root):
     path = write(root, "nested/experiment.yaml", "items: [{defaults: a}]\n")
+    write(root, "nested/pyproject.toml", "")
+    write(root, "nested/configs/items/a.yaml", "value: 99")
+    with pytest.warns(MissingConfigWarning):
+        assert _load_configs(path) == [{"items": [{}]}]
     write(root, "configs/items/a.yaml", "value: 42")
-    assert load_configs(str(path)) == [{"items": [{"value": 42}]}]
-
-
-@pytest.mark.parametrize(
-    "location",
-    ["configs/run.yaml", "configs/experiments/run.yaml", "experiments/run.yaml"],
-)
-def test_data_defaults_use_the_project_root_from_configs_and_nested_yaml(
-    root, location
-):
-    write(root, "configs/data/demo.yaml", "width: 32")
-    write(root, "configs/configs/data/demo.yaml", "width: 99")
-    path = write(root, location, "data: {defaults: demo}")
-    assert load_configs(path)[0]["data"]["width"] == 32
-    path.write_text("data: {defaults: demo, width: 64}")
-    assert load_configs(path)[0]["data"]["width"] == 64
-
-
-def test_a_git_file_identifies_the_project_root(root):
-    (root / "pyproject.toml").unlink()
-    write(root, ".git", "gitdir: somewhere")
-    write(root, "configs/data/demo.yaml", "value: 42")
-    path = write(root, "experiments/run.yaml", "data: {defaults: demo}")
-    assert load_configs(path)[0]["data"]["value"] == 42
+    assert _load_configs(str(path)) == [{"items": [{"value": 42}]}]
 
 
 def test_missing_defaults_warn_once_per_file_and_preserve_explicit(root, load):
@@ -613,7 +595,7 @@ def test_the_defaults_cache_is_local_to_each_load(root, load, experiment):
     path = write(root, "configs/model/a.yaml", "value: 1")
     assert load("model: {defaults: a}")[0]["model"]["value"] == 1
     path.write_text("value: 2")
-    assert load_configs(experiment)[0]["model"]["value"] == 2
+    assert _load_configs(experiment)[0]["model"]["value"] == 2
 
 
 def test_name_is_ordinary_data_when_no_defaults_file_matches(root, load):
@@ -668,7 +650,7 @@ def test_malformed_defaults_are_errors_not_missing_warnings(root, load):
 
 def test_missing_experiment_is_an_error(experiment):
     with pytest.raises(ConfigError) as raised:
-        load_configs(experiment)
+        _load_configs(experiment)
     assert str(experiment) in str(raised.value)
 
 

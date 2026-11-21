@@ -2,15 +2,15 @@
 
 The CLI resolves a bare pipeline name in the configured ``pipeline_module``
 (built-in default ``pipeline``) or accepts an explicit ``module:attr``.
+The run command reads ``./configs/<config>.yaml`` for the given config name.
 The batch manifest records the resolved ``module:attr`` for
 ``expman resume``. Each batches directory (default ``./batches/``) has its own
 integer IDs recorded in ``.batches.sqlite3``. ``expman status`` refreshes the
 directory overview or the selected batch's details until Ctrl+C. An ID also
 selects a batch for ``stop``, ``resume`` or ``delete``. ``expman web`` serves a
 dashboard over the same IDs from its own process, independent of any batch
-it watches. The CLI reads project defaults from ``[tool.expman]`` in the nearest
-``pyproject.toml`` at or above the working directory. The pipeline module can
-override settings when it is imported.
+it watches. The CLI reads ``[tool.expman]`` from the working directory's
+``pyproject.toml``. The pipeline module can override settings when imported.
 """
 
 import argparse
@@ -21,7 +21,8 @@ from functools import partial
 from pathlib import Path
 from time import sleep, strftime
 
-from expman.config import load_configs
+from expman.config.loader import _load_configs
+from expman.config.schema import CONFIGS_DIR, _safe_segment
 from expman.core.events import Status
 from expman.core.pipeline import Pipeline
 from expman.estimation.estimate import _clock as _fmt_elapsed
@@ -60,6 +61,18 @@ def _resolve_pipeline(spec: str, default_module: str) -> tuple[str, Pipeline]:
     if not isinstance(attribute, Pipeline):
         raise SystemExit(f"{spec!r} must be a Pipeline; got {type(attribute).__name__}")
     return f"{module_name}:{attr_name}", attribute
+
+
+def _experiment_yaml(name: str) -> Path:
+    if not _safe_segment(name) or name.lower().endswith((".yaml", ".yml")):
+        raise argparse.ArgumentTypeError(
+            "expected a config name without a directory or YAML extension, e.g. baseline"
+        )
+    directory = CONFIGS_DIR.resolve()
+    path = directory / f"{name}.yaml"
+    if not path.resolve().is_relative_to(directory):
+        raise argparse.ArgumentTypeError(f"{name!r} points outside ./configs/")
+    return path
 
 
 def _command_hint(
@@ -109,13 +122,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     default_dir = settings.batches_dir.resolve()
     spec, pipeline = _resolve_pipeline(args.pipeline, settings.pipeline_module)
     attr = spec.rpartition(":")[2]
-    stem = Path(args.config).stem
+    stem = args.config.stem
     timestamp = strftime("%Y%m%d%H%M%S")
     parent = args.batches_dir if args.batches_dir is not None else settings.batches_dir
     directory = parent / f"{attr}_{stem}_{timestamp}"
     batch = _Batch.create(
         pipeline,
-        load_configs(args.config),
+        _load_configs(args.config),
         output_dir=directory,
         pipeline_spec=spec,
     )
@@ -247,7 +260,12 @@ def _parser() -> argparse.ArgumentParser:
         "pipeline",
         help=f"pipeline attribute or 'module:attr' (default module: {settings.pipeline_module})",
     )
-    run.add_argument("config", help="experiment YAML path")
+    run.add_argument(
+        "config",
+        type=_experiment_yaml,
+        metavar="CONFIG",
+        help="experiment name, e.g. baseline for ./configs/baseline.yaml",
+    )
     resume = commands.add_parser("resume", help="continue a stopped Batch")
     resume.add_argument("ID", type=int, help="batch ID from expman status")
     run.set_defaults(handler=_cmd_run)

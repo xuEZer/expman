@@ -21,7 +21,7 @@ uv sync
 source .venv/bin/activate
 ```
 
-在项目的 `pipeline.py` 中定义 `train` 后，可用 `expman run train experiments.yaml` 启动实验。运行与恢复的完整示例见[命令行](#命令行)。
+在实验项目根目录的 `pipeline.py` 中定义 `train`，将实验配置保存为 `configs/baseline.yaml`。从项目根目录运行 `expman run train baseline` 即可启动批次。运行与恢复的完整示例见[命令行](#命令行)。
 
 ## 定义实验阶段
 
@@ -68,7 +68,7 @@ for event in recorder.events:
 
 ## 配置实验集合
 
-使用 YAML 自由定义配置字段。普通列表始终是一个完整的参数值；需要一次跑多组配置时，加顶层控制键。**形状规则只有一条**——列表表示该节点取其中一个值，映射表示继续往下走——而**跑法由关键字决定**：
+使用 YAML 自由定义配置字段。普通字段中的列表作为一个完整的参数值传给 run。要一次运行多组配置，可以使用以下顶层控制键。在 `grid` 和 `scan` 中，嵌套映射指定字段路径，路径末尾的列表枚举该字段的候选值。
 
 | 控制键 | 取值 | 跑法 |
 | --- | --- | --- |
@@ -77,6 +77,8 @@ for event in recorder.events:
 | `scan` | 映射 | 一次只动一个：每条轴取自己列出的第一个值当基准，其余取值逐个偏离 |
 
 三者是**三层**，由外向内 `combines` → `grid` → `scan`，写几个就乘几层（见「叠加三层控制键」）。
+
+以下四个展开示例都可以单独保存为 `configs/experiment.yaml`。
 
 ### 笛卡尔积：`grid`
 
@@ -98,14 +100,7 @@ grid:                          # seed × imputation × patch_len，2×2×2 = 8 �
       patch_len: [8, 16]
 ```
 
-```python
-from expman import load_configs
-
-configs = load_configs("experiment.yaml")
-assert len(configs) == 8
-assert configs[0]["models"]["imputation"]["name"] == "saits"
-assert configs[0]["models"]["forecasting"]["d_model"] == 128
-```
+共生成 8 份配置。前 4 份使用 `seed: 0`，填补模型名称和预测模型的 `patch_len` 依次取 `(saits, 8)`、`(saits, 16)`、`(brits, 8)`、`(brits, 16)`。后 4 份使用 `seed: 1` 并重复相同组合。每份配置的 `d_model` 都是 128。
 
 - 列出的字段由 `grid` 接管，文件里的取值被替换：上例 `seed` 写的是 0，实际跑的是 0 和 1。
 - 展开顺序由 `grid` 的书写顺序决定，与数据字段的书写顺序无关；多轴时最后一个轴变化最快。
@@ -114,7 +109,7 @@ assert configs[0]["models"]["forecasting"]["d_model"] == 128
 
 ### 单参数扫描：`scan`
 
-`scan` 里的参数**只写在 `scan` 里**，文件不必重复定义。每条轴拿自己列出的**第一个值**当基准，其余取值逐个偏离，其它轴留在基准值：
+`scan` 可以直接声明新字段，也可以覆盖已有字段。每条轴的**第一个值**组成基准配置。随后按顺序改变一条轴的取值，其余轴保持基准值。
 
 ```yaml
 stage: B2
@@ -129,19 +124,11 @@ scan:
     epsilon: [0.00001, 0.001]  # 轴二
 ```
 
-上例 3 个 Run：基准点（rank=2 / epsilon=0.00001 / cone=0.03）打头，然后两条轴各偏离一次——动 `subspace_rank` 时 `epsilon` 停在基准的 0.00001，反之亦然。要一次跑满 2×2 = 4，改用 `grid`。
-
-```python
-from expman import load_configs
-
-configs = load_configs("experiment.yaml")
-assert len(configs) == 3
-assert [cfg["tip"] for cfg in configs] == [
-    {"subspace_rank": 2, "epsilon": 0.00001, "cone_delta": 0.03},
-    {"subspace_rank": 4, "epsilon": 0.00001, "cone_delta": 0.03},
-    {"subspace_rank": 2, "epsilon": 0.001, "cone_delta": 0.03},
-]
-```
+| Run | `subspace_rank` | `epsilon` | `cone_delta` |
+| --- | ---: | ---: | ---: |
+| 基准 | 2 | 0.00001 | 0.03 |
+| 改变 `subspace_rank` | 4 | 0.00001 | 0.03 |
+| 改变 `epsilon` | 2 | 0.001 | 0.03 |
 
 - 基准点永远是第一个 Run，也永远产出，没有开关可以去掉。
 - 基准值是「第一个列出的值」，**不是文件里的值**：同一个字段在文件里写了也会被 `scan` 覆盖。想换基准就把值挪到列表首位，写成 `[3, 2, 4]`。
@@ -153,7 +140,7 @@ assert [cfg["tip"] for cfg in configs] == [
 要让同级字段联动（数据集 A 配模型 a、数据集 B 配模型 b），把每套配置写成 `combines` 上的一项——**列表放在 `combines` 本身的位置**，各项之间不组合，各自作为一个 Run：
 
 ```yaml
-# experiment.yaml：每个数据集各自绑定一个模型，而不是 2×2×2 的全组合
+# 每个数据集各自绑定一个模型
 device: [0]
 seed: 42
 
@@ -166,18 +153,7 @@ combines:
     predictor: {name: Chronos}
 ```
 
-```python
-from expman import load_configs
-
-configs = load_configs("experiment.yaml")
-assert len(configs) == 2
-assert [cfg["dataset"]["name"] for cfg in configs] == [
-    "azure2019_I_5T",
-    "EWELD_Load_15T",
-]
-```
-
-- 上例 2 个 Run，`dataset` / `imputer` / `predictor` 按项配对，而不是 2×2×2。
+- 上例生成两个 Run。第一个用 SAITS 和 Toto2 处理 `azure2019_I_5T`，第二个用 DeepMVI 和 Chronos 处理 `EWELD_Load_15T`。
 - 每项是**稀疏覆盖**：只覆盖它列出的字段，映射也只往下覆盖，其余字段（上例的 `device`、`seed`）沿用文件。
 - 一项可以只写一格字段：`- {seed: 7}` 就是「其余照文件、只把 seed 换成 7」。
 - `combines` 只接受列表，项必须是映射；项里的列表是普通数据，不当作轴。
@@ -202,20 +178,7 @@ scan:
   rank: [2, 4]
 ```
 
-```python
-from expman import load_configs
-
-configs = load_configs("experiment.yaml")
-assert len(configs) == 8
-assert [(cfg["stage"], cfg["seed"], cfg["rank"]) for cfg in configs[:4]] == [
-    ("A", 0, 2),
-    ("A", 0, 4),
-    ("A", 1, 2),
-    ("A", 1, 4),
-]
-```
-
-上例是 2 × 2 × 2 = **8 个 Run**：外层 `combines` 最慢，内层 `scan` 最快。`grid` 的「键必须已存在」检查在它那一层做，所以 `combines` 新引入的字段可以成为 `grid` 的轴。
+上例生成 **8 个 Run**。前 4 个使用 `stage: A`，其 `(seed, rank)` 依次为 `(0, 2)`、`(0, 4)`、`(1, 2)`、`(1, 4)`。后 4 个使用 `stage: B` 并重复相同顺序。`grid` 在各个 `combines` 候选上检查轴的路径，因此可以扫描候选新引入的字段。
 
 ### 共同规则
 
@@ -227,11 +190,15 @@ assert [(cfg["stage"], cfg["seed"], cfg["rank"]) for cfg in configs[:4]] == [
 
 ### 命名默认参数
 
-`defaults` 可以写在任何映射节点上，按字段路径查找项目级默认文件：
+`defaults` 可以写在任何映射节点上。启动批次时，expman 从当前工作目录的 `configs/` 按字段路径读取默认文件。例如，运行 `expman run train baseline` 时，下面的配置会读取 `configs/models/forecasting/patchtst.yaml`。
 
-```text
-models.forecasting.defaults: patchtst
-  → <项目根目录>/configs/models/forecasting/patchtst.yaml
+```yaml
+# configs/baseline.yaml
+device: [0]
+seed: 42
+models:
+  forecasting:
+    defaults: patchtst
 ```
 
 ```yaml
@@ -250,7 +217,7 @@ d_model: 128
 
 ## 执行实验集合
 
-将上面含有 `models` 的 `grid` 示例保存为 `experiment.yaml`，在同一目录的 `pipeline.py` 中定义流程。
+将上面含有 `models` 的 `grid` 示例保存为 `configs/experiment.yaml`，并在项目根目录的 `pipeline.py` 中定义流程。
 
 ```python
 from expman import Pipeline, Stage
@@ -267,7 +234,7 @@ class ModelSummary(Stage[None, None]):
 summary = Pipeline([ModelSummary])
 ```
 
-在该目录运行 `expman run summary experiment.yaml`。命令导入 `pipeline.summary`，为展开后的 8 份配置各创建一个 run，并在开始调度时打印批次 ID 和目录。
+从项目根目录运行 `expman run summary experiment`。命令导入 `pipeline.summary`，为展开后的 8 份配置各创建一个 run，并在开始调度时打印批次 ID 和目录。
 
 示例中的 `-> None` 让 Pyright 可以在编辑时指出 `return 0` 等类型错误。注解可选，`Pipeline([ModelSummary])` 会直接检查叶子方法的定义，因此方法的 Python 源码须可读取。若叶子需要保存模型，可以写 `save_model(model)` 后自然结束。`return save_model(model)` 属于返回表达式，会在构造 Pipeline 时被拒绝。
 
@@ -281,7 +248,7 @@ summary = Pipeline([ModelSummary])
 
 ## 命令行
 
-使用内置默认值时，`expman run train experiments.yaml` 从当前目录的 `pipeline.py` 导入 `train`。流程定义在其他模块时，写成 `module:attr`，例如 `mypkg.pipelines:train`。
+实验 YAML 直接放在项目的 `configs/` 目录下。启动批次时只写配置名，省略 `.yaml` 扩展名。`expman run train baseline` 会打开 `./configs/baseline.yaml`，并按内置默认值从当前目录的 `pipeline.py` 导入 `train`。流程定义在其他模块时，写成 `module:attr`，例如 `mypkg.pipelines:train`。
 
 ```python
 # pipeline.py
@@ -293,7 +260,7 @@ train = Pipeline([LoadData, Train, Eval])
 
 ```bash
 # 新建批次，打印 ID 和批次目录的绝对路径
-expman run train experiments.yaml
+expman run train baseline
 
 # 在另一终端查看 ./batches/ 的总览，每个批次占一行
 expman status
@@ -311,7 +278,7 @@ expman stop 0
 expman resume 0
 ```
 
-- 所有子命令都用 `--batches-dir` 选择批次父目录，默认为 `./batches/`。`run` 的子目录名为 `<pipeline-attr>_<config-stem>_<YYYYMMDDHHMMSS>`，依次使用流程属性名、去掉最后一个扩展名的配置文件名和精确到秒的本地时间。同一父目录中若已存在该名称，命令会报错退出。
+- 所有子命令都用 `--batches-dir` 选择批次父目录，默认为 `./batches/`。`run` 的子目录名为 `<pipeline-attr>_<config-stem>_<YYYYMMDDHHMMSS>`，依次使用流程属性名、命令中的配置名和精确到秒的本地时间。同一父目录中若已存在该名称，命令会报错退出。
 - CLI 和看板共用批次父目录中的 `.batches.sqlite3` 登记表。同时发现多个新批次时，按目录修改时间先后登记，时间相同则按目录名排序。每次取该表中最小的空闲非负整数 ID。例如，删除 `[0, 1, 2]` 中的批次 `1` 后，原批次 `2` 保留编号，下一个新批次得到 `1`。
 - `expman status --batches-dir results` 显示 `results/` 下所有批次的总览。`expman status 0 --batches-dir results` 显示批次 0 中每个 run 的状态、阶段和尝试记录。两种视图默认每两秒刷新一次，批次结束后也会继续刷新。在运行 `status` 的终端按 Ctrl+C 只会退出查看。若批次清单无法读取，命令报错并结束刷新。
 - `stop` 和 `resume` 都要求提供批次 ID。在自定义目录中操作时使用同一父目录，例如 `expman stop 0 --batches-dir results`、`expman resume 0 --batches-dir results`。
@@ -322,7 +289,7 @@ expman resume 0
 
 ## 全局设置
 
-要让 `run`、`status` 和 `web` 等独立命令各自在启动时读到同一份设置，可以在项目的 `pyproject.toml` 中写入需要覆盖的键。
+CLI 从当前工作目录的 `pyproject.toml` 读取 `[tool.expman]`。可以省略整个文件，也可以只写需要覆盖的键。从同一实验项目根目录运行的 `run`、`status` 和 `web` 共用这份设置。
 
 ```toml
 [tool.expman]
@@ -332,7 +299,7 @@ status_interval = 1.0
 worker_threads = 8
 ```
 
-CLI 启动时会从当前工作目录向上查找，读取遇到的第一个 `pyproject.toml`。文件中未填写的键保留程序默认值。上例中，从同一目录执行 `expman run train experiments.yaml` 和 `expman status` 都会使用 `results/`，`expman web` 会从端口 8899 开始监听。显式参数优先，例如 `expman web --port 9000` 会从 9000 开始尝试。和 `--batches-dir` 一样，配置中的相对路径以命令的工作目录为基准。
+上例中，`expman run train baseline` 和 `expman status` 都会使用 `results/`，`expman web` 会从端口 8899 开始监听。显式参数优先，例如 `expman web --port 9000` 会从 9000 开始尝试。和 `--batches-dir` 一样，配置中的相对路径以命令的工作目录为基准。
 
 CLI 使用 `pipeline_module` 查找流程时，流程模块尚未导入。要修改 `expman run train …` 的默认模块，在 `[tool.expman]` 中设置 `pipeline_module`。流程模块导入后，可以用 `expman.set()` 覆盖本次运行的设置，再用 `expman.get()` 查询进程内的值。
 
@@ -404,11 +371,11 @@ expman web --batches-dir results
 shell 已导出的设置优先。设置任一受支持的线程池变量（如 `OMP_NUM_THREADS` 或 `VECLIB_MAXIMUM_THREADS`），框架便保留整组线程设置。已有 `HF_ENDPOINT` 也会保留。还可以用以下环境变量针对单次启动覆盖 expman 的对应设置。
 
 ```bash
-EXPMAN_THREADS=8 expman run mypkg.pipelines:train experiments.yaml   # 改上限
-EXPMAN_THREADS=off expman run ...                                    # 关闭线程上限
-EXPMAN_HF_MIRROR=off expman run ...                                  # 不动 HF_ENDPOINT
-EXPMAN_HF_MIRROR=cn expman run ...                                   # 用默认镜像
-EXPMAN_HF_MIRROR=https://mirror.internal expman run ...              # 指定端点
+EXPMAN_THREADS=8 expman run mypkg.pipelines:train baseline           # 改上限
+EXPMAN_THREADS=off expman run train baseline                         # 关闭线程上限
+EXPMAN_HF_MIRROR=off expman run train baseline                       # 不动 HF_ENDPOINT
+EXPMAN_HF_MIRROR=cn expman run train baseline                        # 用默认镜像
+EXPMAN_HF_MIRROR=https://mirror.internal expman run train baseline   # 指定端点
 ```
 
 本次尝试的 `bootstrap.pkl` 中，`environment` 字段记录 expman 添加的线程池和镜像设置。从 shell 继承的设置可在 worker 的进程环境中查看。`EXPMAN_THREADS` 取值非法时，新建 Batch 会在创建输出目录前报错。

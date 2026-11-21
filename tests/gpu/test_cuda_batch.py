@@ -87,7 +87,8 @@ def recorded_totals(directory, batch):
 def test_cuda_batch_reuses_prefix_and_recovers_checkpoint(
     tmp_path, cli_env, gpu_device
 ):
-    config = tmp_path / "experiment.yaml"
+    config = tmp_path / "configs" / "experiment.yaml"
+    config.parent.mkdir()
     config.write_text(
         f"device: [{gpu_device}]\nseed: 42\nfactor: 2\ngrid:\n  factor: [2, 3]\n"
     )
@@ -96,7 +97,7 @@ def test_cuda_batch_reuses_prefix_and_recovers_checkpoint(
             *CLI,
             "run",
             f"{__name__}:cuda_pipeline",
-            str(config),
+            config.stem,
             "--batches-dir",
             str(tmp_path),
         ],
@@ -135,7 +136,8 @@ def test_stop_and_resume_from_a_committed_cuda_checkpoint(
     tmp_path, cli_env, gpu_device
 ):
     ready = tmp_path / "first-checkpoint"
-    config = tmp_path / "experiment.yaml"
+    config = tmp_path / "configs" / "experiment.yaml"
+    config.parent.mkdir()
     config.write_text(f"device: [{gpu_device}]\nseed: 42\nready: {ready}\n")
     parent = tmp_path / "training batches"
     where = {"cwd": tmp_path, "env": cli_env}
@@ -144,7 +146,7 @@ def test_stop_and_resume_from_a_committed_cuda_checkpoint(
             *CLI,
             "run",
             f"{__name__}:pause_pipeline",
-            str(config),
+            config.stem,
             "--batches-dir",
             str(parent),
         ],

@@ -99,25 +99,25 @@ def prepare_batch_only(monkeypatch):
     return prepared
 
 
-def write_config(tmp_path, *, interrupt_once=False):
-    path = tmp_path / "experiments.yaml"
-    path.write_text(
-        "device: [0]\nseed: 0\nvalues: [1, 2, 3]\n"
-        f"interrupt_once: {'true' if interrupt_once else 'false'}\n"
+def write_config(project, name="baseline", *, values=(1, 2, 3)):
+    directory = project / "configs"
+    directory.mkdir(exist_ok=True)
+    (directory / f"{name}.yaml").write_text(
+        f"device: [0]\nseed: 0\nvalues: {list(values)}\ninterrupt_once: false\n"
     )
-    return path
+    return name
 
 
 @pytest.fixture
 def create_cli_batch(tmp_path, pipeline_module, prepare_batch_only):
     def create(name, root):
-        config = write_config(tmp_path).rename(tmp_path / f"{name}.yaml")
+        config = write_config(tmp_path, name)
         assert (
             main(
                 [
                     "run",
                     f"{pipeline_module}:empty",
-                    str(config),
+                    config,
                     "--batches-dir",
                     str(root),
                 ]
@@ -129,9 +129,13 @@ def create_cli_batch(tmp_path, pipeline_module, prepare_batch_only):
     return create
 
 
-def test_batch_is_not_a_public_python_entry_point():
-    assert not hasattr(expman, "Batch")
-    assert "Batch" not in expman.__all__
+@pytest.mark.parametrize(
+    ("package", "name"),
+    [(expman, "Batch"), (expman, "load_configs"), (expman.config, "load_configs")],
+)
+def test_internal_batch_entry_points_are_not_exported(package, name):
+    assert not hasattr(package, name)
+    assert name not in package.__all__
 
 
 @pytest.mark.parametrize(
@@ -141,8 +145,9 @@ def test_run_creates_a_named_batch_under_the_output_parent(
     tmp_path, pipeline_module, prepare_batch_only, options, parent, monkeypatch
 ):
     monkeypatch.setattr(cli, "strftime", datetime(2026, 1, 2, 3, 4, 5).strftime)
-    config = write_config(tmp_path).rename(tmp_path / "experiment.large.yaml")
-    command = ["run", f"{pipeline_module}:train", str(config), *options]
+    config = write_config(tmp_path, "experiment.large")
+    (tmp_path / f"{config}.yaml").write_text("invalid: project root copy")
+    command = ["run", f"{pipeline_module}:train", config, *options]
 
     assert main(command) == 0
     directory = tmp_path / parent / "train_experiment.large_20260102030405"
@@ -153,6 +158,38 @@ def test_run_creates_a_named_batch_under_the_output_parent(
     assert collision.value.filename == str(directory)
     assert manifest.read_bytes() == original
     assert ensure_ids(tmp_path / parent) == {0: directory}
+
+
+def test_run_requires_a_config_name(tmp_path, pipeline_module):
+    name = write_config(tmp_path)
+    for argument in (
+        str(tmp_path / "configs" / name),
+        f"configs/{name}",
+        f"../{name}",
+        f"{name}.yaml",
+        f"{name}.yml",
+    ):
+        with pytest.raises(SystemExit):
+            main(["run", f"{pipeline_module}:empty", argument])
+    assert not (tmp_path / "batches").exists()
+
+
+def test_run_loads_only_the_yaml_extension(tmp_path, pipeline_module):
+    name = write_config(tmp_path)
+    config = tmp_path / "configs" / f"{name}.yaml"
+    config.rename(config.with_suffix(".yml"))
+    with pytest.raises(expman.ConfigError, match=r"baseline\.yaml"):
+        main(["run", f"{pipeline_module}:empty", name])
+
+
+def test_run_rejects_a_config_symlink_outside_configs(tmp_path, pipeline_module):
+    name = write_config(tmp_path)
+    config = tmp_path / "configs" / f"{name}.yaml"
+    outside = config.rename(tmp_path / config.name)
+    config.symlink_to(outside)
+    with pytest.raises(SystemExit):
+        main(["run", f"{pipeline_module}:empty", name])
+    assert not (tmp_path / "batches").exists()
 
 
 @pytest.mark.parametrize(
@@ -171,7 +208,7 @@ def test_run_reads_settings_set_by_the_pipeline_module(
                 [
                     "run",
                     f"{SETTINGS_MODULE_NAME}:train",
-                    str(write_config(tmp_path)),
+                    write_config(tmp_path),
                     *options,
                 ]
             )
@@ -190,7 +227,7 @@ def test_resume_of_a_short_pipeline_location_uses_its_original_module(tmp_path):
     )
     cli = [sys.executable, "-m", "expman"]
     subprocess.run(
-        [*cli, "run", "train", str(write_config(tmp_path))], cwd=tmp_path, check=True
+        [*cli, "run", "train", write_config(tmp_path)], cwd=tmp_path, check=True
     )
     store = BatchStore(ensure_ids(tmp_path / "batches")[0])
     manifest = store.read_manifest()
@@ -221,7 +258,7 @@ def test_project_defaults_apply_across_cli_processes_and_explicit_arguments_win(
         (["--batches-dir", "custom"], "custom"),
     ]:
         subprocess.run(
-            [*cli, "run", "train", str(config), *options], cwd=tmp_path, check=True
+            [*cli, "run", "train", config, *options], cwd=tmp_path, check=True
         )
         store = BatchStore(ensure_ids(tmp_path / parent)[0])
         assert store.read_manifest()["pipeline_spec"] == "workflows:train"
@@ -244,7 +281,7 @@ def test_run_records_pipeline_spec_and_resume_repeats_it(
     config = write_config(tmp_path)
 
     exit_code = main(
-        ["run", f"{pipeline_module}:train", str(config), "--batches-dir", str(tmp_path)]
+        ["run", f"{pipeline_module}:train", config, "--batches-dir", str(tmp_path)]
     )
 
     assert exit_code == 0
@@ -266,14 +303,13 @@ def test_run_records_pipeline_spec_and_resume_repeats_it(
 def test_run_and_resume_report_terminal_failure_to_the_shell(
     tmp_path, pipeline_module, capsys
 ):
-    config = tmp_path / "failing.yaml"
-    config.write_text("device: [0]\nseed: 0\nvalues: [1, bad]\ninterrupt_once: false\n")
+    config = write_config(tmp_path, "failing", values=(1, "bad"))
     assert (
         main(
             [
                 "run",
                 f"{pipeline_module}:train",
-                str(config),
+                config,
                 "--batches-dir",
                 str(tmp_path),
             ]
@@ -320,7 +356,7 @@ def test_competing_cli_resume_preserves_the_owners_stop_channel(
             [
                 "run",
                 f"{pipeline_module}:empty",
-                str(write_config(tmp_path)),
+                write_config(tmp_path),
                 "--batches-dir",
                 str(tmp_path),
             ]
@@ -356,7 +392,7 @@ def watch_status(monkeypatch, capsys):
 def test_status_detail_rereads_the_batch(
     tmp_path, pipeline_module, prepare_batch_only, watch_status
 ):
-    assert main(["run", f"{pipeline_module}:train", str(write_config(tmp_path))]) == 0
+    assert main(["run", f"{pipeline_module}:train", write_config(tmp_path)]) == 0
     (batch,) = prepare_batch_only
     run_id = batch.experiments[0].run_id
 
@@ -379,7 +415,7 @@ def test_status_detail_rereads_the_batch(
 def test_status_overview_lists_batches_with_ids(
     tmp_path, pipeline_module, prepare_batch_only, watch_status, options, parent
 ):
-    config = str(write_config(tmp_path))
+    config = write_config(tmp_path)
     main(["run", f"{pipeline_module}:train", config, *options])
     first, second = watch_status(
         *options,
@@ -396,7 +432,7 @@ def test_status_overview_lists_batches_with_ids(
 def test_id_zero_selects_different_batches_in_different_parents(
     tmp_path, pipeline_module, prepare_batch_only, watch_status
 ):
-    config = str(write_config(tmp_path))
+    config = write_config(tmp_path)
     main(["run", f"{pipeline_module}:train", config])
     main(["run", f"{pipeline_module}:empty", config, "--batches-dir", "other"])
     assert str(ensure_ids(tmp_path / "batches")[0]) in watch_status("0")[0]
@@ -417,7 +453,7 @@ def test_stop_and_resume_accept_batch_ids(
     tmp_path, pipeline_module, capsys, prepare_batch_only
 ):
     config = write_config(tmp_path)
-    main(["run", f"{pipeline_module}:train", str(config)])
+    main(["run", f"{pipeline_module}:train", config])
     capsys.readouterr()
 
     # The registered ID resolves to the same batch for both commands.
@@ -535,13 +571,13 @@ def test_an_old_stop_writer_cannot_interrupt_the_next_execution(tmp_path):
 def test_resolution_rejects_malformed_and_mistyped_specs(pipeline_module):
     for malformed in (":train", f"{pipeline_module}:"):
         with pytest.raises(SystemExit, match="module:attr"):
-            main(["run", malformed, "unused.yaml"])
+            main(["run", malformed, "unused"])
     with pytest.raises(SystemExit, match="could not import"):
-        main(["run", "no_such_pipeline_module_xyz:train", "unused.yaml"])
+        main(["run", "no_such_pipeline_module_xyz:train", "unused"])
     with pytest.raises(SystemExit, match="defines no attribute"):
-        main(["run", f"{pipeline_module}:missing_attr", "unused.yaml"])
+        main(["run", f"{pipeline_module}:missing_attr", "unused"])
     with pytest.raises(SystemExit, match="must be a Pipeline"):
-        main(["run", f"{pipeline_module}:not_a_pipeline", "unused.yaml"])
+        main(["run", f"{pipeline_module}:not_a_pipeline", "unused"])
 
 
 def test_settings_validate_values():

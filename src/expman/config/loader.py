@@ -11,11 +11,13 @@ from yaml.nodes import MappingNode
 
 from expman.config.schema import (
     COMBINES_KEY,
+    CONFIGS_DIR,
     CONTROL_KEYS,
     DEFAULTS_KEY,
     GRID_KEY,
     SCAN_KEY,
     ConfigError,
+    _safe_segment,
     configured_devices,
 )
 from expman.config.variants import deduplicate, expand, merge
@@ -86,31 +88,10 @@ def _read_yaml(path: Path, *, allow_control: bool) -> dict[str, Any]:
         raise ConfigError(f"{path}: {error}") from error
 
 
-def _safe_segment(value: Any) -> bool:
-    return (
-        isinstance(value, str)
-        and bool(value.strip())
-        and value not in (".", "..")
-        and not any(character in value for character in ("/", "\\", "\0"))
-    )
-
-
-def _project_root(experiment: Path) -> Path:
-    for start in (experiment.parent, Path.cwd().resolve()):
-        for candidate in (start, *start.parents):
-            if (candidate / "pyproject.toml").is_file() or (
-                candidate / ".git"
-            ).exists():
-                return candidate
-    raise ConfigError(
-        f"{experiment}: cannot locate project root (pyproject.toml or .git)"
-    )
-
-
 class _Defaults:
     def __init__(self, experiment: Path) -> None:
         self.experiment = experiment
-        self.root: Path | None = None
+        self.root = CONFIGS_DIR.resolve()
         # A cached entry is what _read_yaml returned, or None when the file is
         # missing.
         self.cache: dict[Path, dict[str, Any] | None] = {}
@@ -160,8 +141,6 @@ class _Defaults:
                 f"{self.experiment}: {location}.{DEFAULTS_KEY} must be a nonempty "
                 "name without separators, '.' or '..'"
             )
-        if self.root is None:
-            self.root = (_project_root(self.experiment) / "configs").resolve()
         if not all(_safe_segment(segment) for segment in keys):
             raise ConfigError(
                 f"{self.experiment}: {location} and its field path must use "
@@ -190,49 +169,8 @@ class _Defaults:
         return self.cache[target], target
 
 
-def load_configs(path: str | Path) -> list[dict[str, Any]]:
-    """Load one experiment YAML into independent, fully resolved run dictionaries.
-
-    A top-level ``combines``, ``grid`` or ``scan`` section turns the document
-    into a collection. They nest from the outside in::
-
-        device: [0]
-        seed: 42
-        model: {width: 64}
-
-        combines:                    # whole candidates: 2 runs
-          - {dataset: {name: A}, model: {name: saits}}
-          - {dataset: {name: B}, model: {name: brits}}
-
-        grid:                        # every combination: 2 x 2 = 4 runs
-          seed: [0, 1]
-          model: {width: [64, 128]}
-
-        scan:                        # one axis at a time: 3 runs
-          model:
-            rank: [2, 4]             # (2, 1e-05), (4, 1e-05), (2, 0.001)
-            epsilon: [0.00001, 0.001]
-
-    ``combines`` takes a list of mappings merged over the file, one run each,
-    and pairs fields that move together. ``grid`` returns the product of its
-    axes in declaration order, the last axis moving fastest, and every path it
-    lists must exist after merging the candidate's defaults. ``scan`` declares
-    its own parameters. Their first values form the reference point. Each
-    remaining value changes one axis while the others stay at the reference.
-
-    Writing several of them multiplies the layers: every candidate is gridded,
-    and every grid point is scanned, so the innermost layer varies fastest. A
-    run whose configuration repeats one already produced once defaults are
-    resolved is not produced again. The example yields 24 distinct runs.
-
-    Any mapping node may carry ``defaults: <name>``, which merges
-    ``<project root>/configs/<field path>/<name>.yaml`` underneath it. Explicit
-    values win, dictionaries merge recursively, and lists/null replace defaults.
-    Project roots are located by pyproject.toml or .git above the YAML, then the
-    working directory. Defaults files cannot declare top-level ``combines``,
-    ``grid`` or ``scan``. Missing defaults warn once per resolved file per call.
-    Parsing errors raise ConfigError.
-    """
+def _load_configs(path: str | Path) -> list[dict[str, Any]]:
+    """Resolve defaults and expand an experiment YAML into distinct run configs."""
     experiment = Path(path).expanduser().resolve()
     try:
         document = _read_yaml(experiment, allow_control=True)

@@ -26,19 +26,20 @@ def test_python_overrides_are_validated_before_any_value_changes(tmp_path, monke
         assert expman.get("web_port") == 0
 
 
-def test_nearest_project_and_explicit_python_defaults(tmp_path, monkeypatch):
-    project = tmp_path / "child"
-    child = project / "src"
-    child.mkdir(parents=True)
-    monkeypatch.chdir(child)
+def test_only_working_directory_settings_apply_and_python_overrides_win(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "experiment"
+    project.mkdir()
+    monkeypatch.chdir(project)
     (tmp_path / "pyproject.toml").write_text("[tool.expman]\nweb_port = 9850\n")
-    nearest = project / "pyproject.toml"
-    nearest.write_text("[project]\nname = 'child'\n")
 
     with project_settings():
         assert expman.get("web_port") == 8765
         expman.set(web_port=8765)
-        nearest.write_text("[tool.expman]\nweb_port = 9000\nworker_threads = 2\n")
+        (project / "pyproject.toml").write_text(
+            "[tool.expman]\nweb_port = 9000\nworker_threads = 2\n"
+        )
         with project_settings():
             assert expman.get("web_port") == 8765
             assert expman.get("worker_threads") == 2

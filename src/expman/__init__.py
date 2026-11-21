@@ -1,11 +1,7 @@
 """Run resumable experiment pipelines in GPU-scheduled batches."""
 
 import expman.resources.devices as devices
-from expman.config import (
-    ConfigError,
-    MissingConfigWarning,
-    load_configs,
-)
+from expman.config import ConfigError, MissingConfigWarning
 from expman.core.context import RunContext
 from expman.core.events import Event, ExecutionEvent, MetricEvent, ProgressEvent, Status
 from expman.core.experiment import AttemptResult, ExperimentResult, StageResult
@@ -57,7 +53,6 @@ __all__ = [
     "environment",
     "get",
     "limits",
-    "load_configs",
     "seed_everything",
     "set",
 ]
