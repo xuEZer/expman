@@ -590,6 +590,28 @@ class TestGpuScheduling:
 
         assert len(candidates) == 1
 
+    def test_stage_shortlist_takes_retries_then_queue_order(
+        self, tmp_path, monkeypatch
+    ):
+        batch = make_batch(tmp_path, count=5, devices=[0])
+        state = batch.state
+        completed, retry, first, second, _ = state.queue
+        for run_id, status in (
+            (completed, Status.SUCCEEDED),
+            (retry, Status.CANCELLED),
+        ):
+            state.start(run_id, 0, 0)
+            state.release(run_id)
+            state.stage_history.append(
+                {"run_id": run_id, "stage": 0, "status": status.value}
+            )
+        state.retry(retry)
+        monkeypatch.setattr(settings, "candidates_per_stage", 3)
+
+        candidates = GpuScheduler(batch).stages.ready_candidates(16 * 1024**2, {})
+
+        assert [candidate.run_id for candidate in candidates] == [retry, first, second]
+
     def test_stage_group_follows_declared_dependencies(self, tmp_path):
         path = tmp_path / "declared.yaml"
         path.write_text(
@@ -693,7 +715,7 @@ class TestGpuScheduling:
         scheduler = GpuScheduler(batch)
         run_id = batch.experiments[0].run_id
         request = 10 * 1024**2
-        candidate = Candidate(run_id, 0, 1024, request, request, None, 0.0)
+        candidate = Candidate(run_id, 0, 1024, request, request, None)
         memory = {
             device: DeviceMemory(f"GPU-{device}", 50 * 1024, 50 * 1024)
             for device in batch.devices
@@ -756,7 +778,7 @@ class TestGpuScheduling:
         scheduler = GpuScheduler(batch)
         request = 10 * 1024**2
         candidate = Candidate(
-            batch.experiments[0].run_id, 0, 1024, request, request, None, 0.0
+            batch.experiments[0].run_id, 0, 1024, request, request, None
         )
         memory = {
             1: DeviceMemory("GPU-1", 50 * 1024, 9 * 1024),
@@ -767,6 +789,22 @@ class TestGpuScheduling:
         ):
             plan = scheduler._launch_plan(memory, Host().sample())
         assert [device for _, device in plan] == [2]
+
+    def test_later_candidate_that_fills_the_card_wins_even_by_one_mib(self, tmp_path):
+        batch = make_batch(tmp_path, count=2, devices=[0])
+        first, second = batch.state.queue
+        scheduler = GpuScheduler(batch)
+        memory = {0: DeviceMemory("GPU-0", 2048, 2048)}
+
+        def peak(run_id, stage_index, field, default):
+            if field == "gpu_process_peak_kb":
+                return (2047 if run_id == first else 2048) * 1024
+            return default
+
+        with patch.object(scheduler.stages, "peak", side_effect=peak):
+            ((candidate, device),) = scheduler._launch_plan(memory, Host().sample())
+
+        assert (candidate.run_id, device) == (second, 0)
 
     @pytest.mark.parametrize(
         ("estimate_gib", "large_free_gib", "expected_device", "expected_cap_gib"),

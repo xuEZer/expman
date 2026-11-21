@@ -27,7 +27,7 @@ flowchart LR
 ```
 
 1. **创建批次。** `expman run` 按 `module:attr` 导入 Pipeline，省略模块名时从 `pipeline_module` 指定的模块读取属性，默认为 `pipeline`。命令把 YAML 展开为一组配置，批次调度代码校验设备和种子，为每份配置创建一个 run 目录，把解析后的 `module:attr` 和初始队列写入批次清单。[CLI](src/expman/cli.py) · [批次调度](src/expman/scheduling/batch.py)
-2. **选择任务。** 主进程取每个 run 当前就绪的顶层阶段。可以共享前缀的成员按组处理。命中缓存时，主进程只读元数据，把指标和快照引用写到目标 run，推进它的阶段位置。需要计算时，主进程根据内存余量选择候选和设备，在启动 worker 前持久化该成员的活动状态。[调度循环](src/expman/scheduling/scheduler.py) · [阶段分组](src/expman/scheduling/_stages.py)
+2. **选择任务。** 主进程取每个 run 当前就绪的顶层阶段。可以共享前缀的成员按组处理。命中缓存时，主进程只读元数据，把指标和快照引用写到目标 run，推进它的阶段位置。需要计算时，主进程从各阶段的就绪队列选取候选，再按主机内存和各卡显存余量决定派发哪些任务及其设备。启动 worker 前先持久化该成员的活动状态。[调度循环](src/expman/scheduling/scheduler.py) · [阶段分组](src/expman/scheduling/_stages.py)
 3. **计算一个阶段。** worker 在独立解释器内核验 MPS 客户端，加载用户模块和本次尝试的输入，重建 Experiment。执行第 `i` 个阶段前，`run_stage(i)` 检查前置阶段都已有完成记录。Pipeline 从头走到 `i`，依次恢复已有阶段的输出和随机状态，再构造需要执行的 Stage 调用其 `process(data, ctx)`。相邻阶段可以运行在不同进程，跨进程传值依赖磁盘快照。[worker 入口](src/expman/scheduling/_worker.py) · [Experiment](src/expman/core/experiment.py) · [托管阶段执行](src/expman/core/execution.py)
 4. **收集结果。** worker 通过本地 socket 把完成摘要传给主进程。主进程记录历史，释放占用，安排下一阶段或重试。成功结果保存最终快照的位置。调度结束后，CLI 按配置展开顺序打印每个 run 的 ID 和最终状态。[进程间通信](src/expman/scheduling/ipc.py) · [结果对象](src/expman/core/experiment.py)
 
@@ -89,9 +89,9 @@ CLI 从当前工作目录向上查找最近的 `pyproject.toml`，在解析命�
 
 | 调度时的问题 | 对应源码 |
 |---|---|
-| 有哪些等价的工作可以复用？哪个阶段是候选？ | `StageWork` 按截至当前阶段的配置依赖和 seed 分组，根据历史为候选估计耗时、主机内存和显存。[阶段工作量](src/expman/scheduling/_stages.py) |
+| 哪些就绪任务进入候选？ | `StageWork` 按截至当前阶段的配置依赖和 seed 分组，跳过已有 worker 在运行的组，其余每组至多选一个代表。同一阶段先取重试任务，再取首次尝试的任务，两者各自保持就绪队列顺序。每阶段最多选 `candidates_per_stage` 个候选，再按阶段编号轮流取一个送入装箱。[阶段工作量](src/expman/scheduling/_stages.py) |
 | 现在还能放多少作业？ | 主进程读取 `/proc/meminfo` 和 NVIDIA 设备读数，扣除主机保留量及活跃 worker 尚未使用的预算。冷启动时采用配置中的主机和 GPU 初始峰值预算，默认均为 1 GiB。资源不足时暂缓派发，压力持续时按规则减载。[设备采样](src/expman/resources/devices.py) · [容量计算](src/expman/scheduling/_resource.py) |
-| 哪些作业放在哪张卡？ | `pack_candidates` 在每轮保留一组可行排布，根据剩余主机内存和各卡相对容量打分。准入消耗估计峰值。单个 worker 的主机或 GPU 硬上限另留余量。主机 cgroup 不能核验时可回退到进程用量采样，展示中会区分预算和已核验上限。[装箱逻辑](src/expman/scheduling/_planning.py) |
+| 哪些作业放在哪张卡？ | `pack_candidates` 按估计峰值为候选预留资源。每考虑一个候选，保留代价最低的若干可行方案。主机剩余预算除以本轮派发前的主机预算，每张卡的剩余显存预算除以该卡物理显存总量。将这些比例分别平方后相加，即为方案代价。单个 worker 的主机或 GPU 硬上限另留余量。主机 cgroup 不能核验时可回退到进程用量采样，展示中会区分预算和已核验上限。[装箱逻辑](src/expman/scheduling/_planning.py) |
 | worker 报了什么？下一步如何处理？ | Worker 封装进程、IPC 消息和资源读数。普通失败按该 Stage 的重试预算处理。CUDA OOM 或主机限额终止用作需求下界，下一次重新估价。调度退出时回收 worker 进程组。[Worker](src/expman/scheduling/_process.py) · [调度循环](src/expman/scheduling/scheduler.py) |
 
 ETA 按剩余的**阶段组**估算。调度器用单调时钟测量每次尝试占用 worker 的时长，历史样本与运行中的计时口径相同。每个顶层 Stage 用同批次实际执行成功的样本估计对数耗时的中心，配置越近权重越大。直接复用结果的阶段跳过采样。留一预测误差用于估计区间，取消尝试的实测时间只参与下界校准。峰值模型使用邻近配置的经验分位数。[峰值模型](src/expman/estimation/memory_model.py)

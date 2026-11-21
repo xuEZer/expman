@@ -152,10 +152,9 @@ class StageWork:
     def duration(self, run_id, stage_index, *, coverage=None):
         """Estimate one Stage duration interval from its dependency samples.
 
-        Models are cached and invalidated only when a Stage result arrives.  Tick
-        processing merely reads the latest model; it never treats elapsed running
-        time as a new sample.  A cancelled attempt measured only a lower bound, so
-        it contributes only to the lower residual quantile.
+        Fit on first use and refit on demand after a Stage result invalidates the
+        cache. Training uses recorded attempts. A cancelled attempt contributes
+        a lower bound to the lower residual quantile.
         """
         # The timing thread and the dispatch loop both request duration models.
         # Publish a fit under the lock used to invalidate it on Stage completion.
@@ -203,64 +202,25 @@ class StageWork:
         ]
 
     def candidates(self, stage_index, gpu_capacity_kb, ready, workers):
-        """Return diverse ready candidates for one Stage and its own history only."""
-        batch = self.batch
-        running = {
+        """Shortlist idle groups in queue order within retries and first attempts.
+
+        Consider retries first and take at most one representative per group.
+        """
+        represented = {
             self.group(run_id, stage_index)
             for run_id, worker in workers.items()
             if worker.stage_index == stage_index
         }
-        representatives = {}
-        for run_id in ready:
-            group = self.group(run_id, stage_index)
-            if group in running:
-                continue
-            previous = representatives.get(group)
-            if previous is None or (
-                f"{run_id}:{stage_index}" in batch.state.stage_attempts
-                and f"{previous}:{stage_index}" not in batch.state.stage_attempts
-            ):
-                representatives[group] = run_id
-        run_ids = list(representatives.values())
-        if not run_ids:
-            return []
-        indices = self._indices
-        rows = self._encoding(stage_index).rows
-        sampled = [
-            indices[entry["run_id"]]
-            for entry in batch.state.stage_history
-            if (
-                entry.get("stage") == stage_index
-                and not entry.get("reused")
-                and entry.get("run_id") in indices
-            )
-        ]
-
-        def novelty(run_id):
-            if not sampled:
-                return 1.0
-            row = rows[indices[run_id]][1:]
-            return min(
-                sum(
-                    (left - right) ** 2
-                    for left, right in zip(row, rows[item][1:], strict=True)
-                )
-                for item in sampled
-            )
-
-        retries, fresh = [], []
-        for run_id in run_ids:
-            if f"{run_id}:{stage_index}" in batch.state.stage_attempts:
-                retries.append(run_id)
-            else:
-                fresh.append(run_id)
-        # Retries remain first within their own Stage.  New combinations then
-        # spread samples across that Stage's dependency-feature space.
-        ordered = retries + sorted(fresh, key=novelty, reverse=True)
+        attempts = self.batch.state.stage_attempts
+        ordered = sorted(
+            ready, key=lambda run_id: f"{run_id}:{stage_index}" not in attempts
+        )
         candidates = []
-        selected = ordered[: settings.candidates_per_stage]
-        denominator = max(1, len(selected) - 1)
-        for rank, run_id in enumerate(selected):
+        for run_id in ordered:
+            group = self.group(run_id, stage_index)
+            if group in represented:
+                continue
+            represented.add(group)
             host_estimate = self.peak(
                 run_id, stage_index, "peak_kb", settings.host_peak_kb_default
             )
@@ -275,7 +235,8 @@ class StageWork:
                     min(gpu_estimate, gpu_capacity_kb),
                     min(limits.cap_kb(gpu_estimate), gpu_capacity_kb),
                     self.duration(run_id, stage_index),
-                    1.0 - rank / denominator,
                 )
             )
+            if len(candidates) == settings.candidates_per_stage:
+                break
         return candidates

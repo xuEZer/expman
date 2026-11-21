@@ -16,7 +16,6 @@ class Candidate:
     gpu_reserve_kb: float
     gpu_cap_kb: float
     expected: StageDuration | None
-    novelty: float
 
 
 @dataclass(frozen=True)
@@ -26,14 +25,14 @@ class Plan:
     host_left_kb: float
     gpu_left_kb: tuple[float, ...]
     placements: tuple[tuple[Candidate, int], ...] = ()
-    novelty: float = 0.0
 
 
-def _plan_score(plan, host_capacity, gpu_totals):
-    """Fill feasible capacity while balancing load against each card's total.
+def _packing_cost(plan, host_capacity, gpu_totals):
+    """Sum the squared fractions of unused host and GPU memory.
 
-    Normalizing by per-tick free space would reward a job for using the busiest
-    card that still fits it. Fixed totals retain both existing and planned load.
+    The host fraction uses the available budget at the start of this tick.
+    Each GPU fraction uses the card's physical capacity so its existing load
+    counts alongside the new placements.
     """
     unused = (plan.host_left_kb / host_capacity) ** 2
     unused += sum(
@@ -41,8 +40,7 @@ def _plan_score(plan, host_capacity, gpu_totals):
         for left, capacity in zip(plan.gpu_left_kb, gpu_totals, strict=True)
         if capacity > 0
     )
-    # Parameter diversity only breaks materially equivalent packing choices.
-    return -unused + 1e-6 * plan.novelty
+    return unused
 
 
 def pack_candidates(candidates, host_capacity, devices, gpu_capacities, gpu_totals):
@@ -63,12 +61,10 @@ def pack_candidates(candidates, host_capacity, devices, gpu_capacities, gpu_tota
                         plan.host_left_kb - candidate.host_reserve_kb,
                         tuple(left),
                         (*plan.placements, (candidate, devices[index])),
-                        plan.novelty + candidate.novelty,
                     )
                 )
         plans = sorted(
             expanded,
-            key=lambda plan: _plan_score(plan, host_capacity, gpu_totals),
-            reverse=True,
+            key=lambda plan: _packing_cost(plan, host_capacity, gpu_totals),
         )[: settings.plan_beam_width]
     return plans[0].placements
