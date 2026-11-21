@@ -43,9 +43,6 @@ class Defaults:
     live_interval: float = _number(1.0)
     live_stale_seconds: float = _number(3.0)
     timing_save_interval: float = _number(5.0)
-    # Minimum paired observations and distinct groups for dashboard comparisons.
-    min_numeric_points: int = _number(3, (lambda n: n >= 2, "at least 2"))
-    min_groups: int = _number(2, (lambda n: n >= 2, "at least 2"))
 
     # Worker environment and hardware scheduling
     worker_threads: int = _number(4)

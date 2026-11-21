@@ -19,11 +19,9 @@ flowchart LR
     P --> D["批次目录中的阶段快照与指标"]
     G --> M["批次清单与运行时间"]
     B --> L["实时快照 live.json"]
-    D --> A["离线分析"]
     M --> V["状态与归档读取"]
     L --> V
-    A --> UI["独立 Web 服务"]
-    V --> UI
+    V --> UI["独立 Web 服务"]
 ```
 
 1. **创建批次。** `expman run` 按 `module:attr` 导入 Pipeline，省略模块名时从 `pipeline_module` 指定的模块读取属性，默认为 `pipeline`。命令把 YAML 展开为一组配置，批次调度代码校验设备和种子，为每份配置创建一个 run 目录，把解析后的 `module:attr` 和初始队列写入批次清单。[CLI](src/expman/cli.py) · [批次调度](src/expman/scheduling/batch.py)
@@ -42,7 +40,7 @@ flowchart LR
 | 本次参数 | `ctx.cfg` 是当前 run 的只读配置。Stage 可以用 `config_dependencies(cfg)` 声明哪些配置路径会影响结果，默认依赖整份配置。 |
 | 继续循环 | 将**下一次要执行的位置**和业务状态传给 `ctx.checkpoint(position, state)`。重试时 `ctx.checkpoint_state` 返回保存值，`ctx.resume_range(start, stop)` 从 `max(start, position)` 接续。 |
 | 临时进度和事件 | `report_progress`、`report_metric` 送给 Recorder。普通 Recorder 错误被记录并隔离。各次调用有独立的执行 ID，事件可按父 ID 还原调用层次。 |
-| 用于后续分析的指标 | `ctx.log_metrics(mapping, step=...)` 将整批有限实数指标写入 SQLite。持久化失败会使当前阶段失败。 |
+| 持久化的实验指标 | `ctx.log_metrics(mapping, step=...)` 将整批有限实数指标写入 SQLite。持久化失败会使当前阶段失败。 |
 | 嵌套子流程 | `Pipeline([Child]).run(data, ctx)` 为子阶段分配独立存储位置。直接调用 `Child().run(data, ctx)` 只建立观测作用域。在该子调用中使用 `ctx.checkpoint()` 会抛出 `RuntimeError`，外层的 checkpoint 仍属于外层阶段。 |
 
 ## 框架设置与实验配置
@@ -113,8 +111,6 @@ CLI 和 Web 看板共用所选批次父目录下的 `.batches.sqlite3`，默认�
 `expman status` 与归档页面从批次文件重建状态。实验主进程另有旁路线程，把在锁内读到的调度状态和阶段完成组数整理为实时快照并原子写入 `live.json`，写入失败不会中断实验。`expman web` 在独立进程内通过 HTTP 和 SSE 提供这些数据。读取端在批次停止管道可连接且快照足够新鲜时标为实时。历史快照早于最新批次清单或快照不可用时，从持久化记录重建。页面查询不会触发训练或资源调度。[归档读取](src/expman/observation/status.py) · [快照构建](src/expman/observation/snapshot.py) · [来源判定](src/expman/observation/archive.py) · [Web 服务](src/expman/webui/server.py)
 
 `expman run` 和 `expman resume` 在持有批次执行锁期间监听 `stop.fifo`。`expman stop` 和看板的“停止实验”按钮共用同一条停止管道。请求写入后，内核向持有读端的进程发送 SIGTERM，调度器收尾并保存进度。[进程控制](src/expman/process_control.py)
-
-结果分析用 run ID 联结配置、尝试摘要及 SQLite 指标。一个指标优先采用汇总步，否则取该指标的最大 step。缺值按指标分别计数，失败或未完成的 run 计入覆盖度。数值参数可计算 Spearman 秩相关，类别参数按组汇总并计算效应量。[结果分析](src/expman/observation/analysis.py)
 
 | 你遇到的现象 | 建议先读的行为测试 |
 |---|---|
