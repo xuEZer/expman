@@ -11,25 +11,26 @@ from contextlib import suppress
 from threading import Event, Thread
 
 from expman.observation.snapshot import build_snapshot
+from expman.settings import settings
 
 LIVE_FILE = "live.json"
-LIVE_INTERVAL = 1.0
 LIVE_ENV = "EXPMAN_LIVE"
 
 _DISABLED = {"off", "0", "no", "false"}
 
 
 def live_enabled() -> bool:
-    """Whether this process publishes live state; ``EXPMAN_LIVE=off`` opts out."""
-    return os.environ.get(LIVE_ENV, "").strip().lower() not in _DISABLED
+    """Read the live publishing setting, honoring an explicit environment override."""
+    override = os.environ.get(LIVE_ENV, "").strip().lower()
+    return override not in _DISABLED if override else settings.live_enabled
 
 
 class LivePublisher:
     """Write one Batch's live snapshot to its directory on a cadence."""
 
-    def __init__(self, batch, interval: float = LIVE_INTERVAL) -> None:
+    def __init__(self, batch, interval: float | None = None) -> None:
         self.batch = batch
-        self.interval = interval
+        self.interval = settings.live_interval if interval is None else interval
         self.path = batch.output_dir / LIVE_FILE
         self.stopped = Event()
         self.thread = Thread(target=self._loop, name="expman-live", daemon=True)

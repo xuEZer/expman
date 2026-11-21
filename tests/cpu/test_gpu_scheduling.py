@@ -1,6 +1,8 @@
 import os
 import sqlite3
 import subprocess
+import sys
+from importlib import import_module
 from itertools import pairwise
 from pathlib import Path
 from time import monotonic, perf_counter, sleep
@@ -14,8 +16,6 @@ from expman import ConfigError, Pipeline, Stage, Status, devices, environment
 from expman.core.context import RunContext
 from expman.core.experiment import Experiment, StageResult
 from expman.resources.devices import (
-    GPU_PEAK_KB_DEFAULT,
-    HOST_RESERVE_KB,
     DeviceMemory,
     HostMemory,
     MeminfoMonitor,
@@ -29,6 +29,7 @@ from expman.scheduling._planning import Candidate
 from expman.scheduling._process import Worker
 from expman.scheduling._resource import _admits
 from expman.scheduling.scheduler import GpuScheduler
+from expman.settings import settings
 from expman.storage.base import PickleSerializer, read_record
 
 IMPORT_DEVICE = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -254,7 +255,7 @@ class TestGpuScheduling:
     def fake_devices(self, monkeypatch):
         monkeypatch.setattr(devices, "NvidiaMemory", Memory)
         monkeypatch.setattr(devices, "MeminfoMonitor", Host)
-        monkeypatch.setattr(devices, "POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(settings, "poll_interval", 0.01)
 
     def test_a_broken_recorder_does_not_drop_the_worker_result(self, tmp_path, caplog):
         batch = make_batch(tmp_path, count=1, devices=[0])
@@ -368,16 +369,49 @@ class TestGpuScheduling:
         envs = _captured_worker_env(batch)
 
         assert envs, "no worker process was launched"
-        assert envs[0]["OMP_NUM_THREADS"] == str(environment.WORKER_THREADS)
-        assert envs[0]["MKL_NUM_THREADS"] == str(environment.WORKER_THREADS)
-        assert envs[0]["HF_ENDPOINT"] == environment.HF_MIRROR
+        assert envs[0]["OMP_NUM_THREADS"] == str(settings.worker_threads)
+        assert envs[0]["MKL_NUM_THREADS"] == str(settings.worker_threads)
+        assert envs[0]["HF_ENDPOINT"] == settings.hf_mirror
         # CUDA_VISIBLE_DEVICES stays the scheduler's own decision.
         assert "expman.scheduling.environment" not in envs[0]
         recorded = read_record(
             next(batch.output_dir.rglob("bootstrap.pkl")), PickleSerializer()
         )["environment"]
-        assert recorded["HF_ENDPOINT"] == environment.HF_MIRROR
-        assert recorded["OMP_NUM_THREADS"] == str(environment.WORKER_THREADS)
+        assert recorded["HF_ENDPOINT"] == settings.hf_mirror
+        assert recorded["OMP_NUM_THREADS"] == str(settings.worker_threads)
+
+    @pytest.mark.simulated_gpu
+    def test_worker_uses_the_parent_settings_after_importing_the_pipeline(
+        self, tmp_path, monkeypatch
+    ):
+        module_name = "worker_settings_stage"
+        (tmp_path / f"{module_name}.py").write_text(
+            "import os\n"
+            "import expman\n"
+            'if "EXPMAN_IPC_FD" in os.environ:\n'
+            "    expman.set(query_timeout=2.0)\n"
+            "class ReadSettings(expman.Stage):\n"
+            "    def process(self, data, ctx):\n"
+            '        return expman.get("query_timeout"), expman.get("retries")\n'
+        )
+        monkeypatch.syspath_prepend(tmp_path)
+        monkeypatch.setattr(settings, "retries", 4)
+        try:
+            stage = import_module(module_name).ReadSettings
+            pipeline = Pipeline([stage])
+            batch = batch_helpers.make_batch(
+                pipeline, {"device": [0], "seed": 0}, output_dir=tmp_path / "batch"
+            )
+            # A new execution session may override its monitor timeout. The batch
+            # keeps the retry count it recorded when it was created.
+            monkeypatch.setattr(settings, "query_timeout", 5.0)
+            monkeypatch.setattr(settings, "retries", 0)
+            resumed = batch_helpers.restore_batch(pipeline, batch.output_dir)
+            (result,) = resumed.run()
+            assert result.status is Status.SUCCEEDED
+            assert result.output == (5.0, 4)
+        finally:
+            sys.modules.pop(module_name, None)
 
     @pytest.mark.simulated_gpu
     def test_multiple_devices_and_metrics_results_are_collected(self, tmp_path):
@@ -473,9 +507,9 @@ class TestGpuScheduling:
                 batch.experiments[1].run_id,
                 0,
                 "gpu_process_peak_kb",
-                GPU_PEAK_KB_DEFAULT,
+                settings.gpu_peak_kb_default,
             )
-            == GPU_PEAK_KB_DEFAULT
+            == settings.gpu_peak_kb_default
         )
 
     def test_gpu_reservations_and_ceilings_never_exceed_card_capacity(self, tmp_path):
@@ -526,7 +560,7 @@ class TestGpuScheduling:
         assert candidates
         assert all(item.gpu_reserve_kb == capacity_kb // 2 for item in candidates)
         assert all(
-            item.gpu_cap_kb == capacity_kb // 2 * devices.CAPACITY_FACTOR
+            item.gpu_cap_kb == capacity_kb // 2 * settings.capacity_factor
             for item in candidates
         )
 
@@ -536,7 +570,7 @@ class TestGpuScheduling:
         scheduler.workers["running"] = Mock(
             started=0.0, peak_kb=0.0, resident_kb=0.0, host_reserve_kb=2 * 1024**2
         )
-        host = HostMemory(64 * 1024**2, HOST_RESERVE_KB + 3 * 1024**2, 0, 0)
+        host = HostMemory(64 * 1024**2, settings.host_reserve_kb + 3 * 1024**2, 0, 0)
 
         assert _admits(scheduler.workers, host, 1024**2)
         assert not _admits(scheduler.workers, host, 2 * 1024**2)
@@ -696,7 +730,7 @@ class TestGpuScheduling:
         assert len(plan) == 3
         assert {device for _, device in plan} == {0, 1, 2}
         assert all(c.host_reserve_kb == c.gpu_reserve_kb == 1024**2 for c, _ in plan)
-        tight = HostMemory(host.total_kb, HOST_RESERVE_KB + 512 * 1024, 0, 0)
+        tight = HostMemory(host.total_kb, settings.host_reserve_kb + 512 * 1024, 0, 0)
         assert not scheduler._launch_plan(memory, tight)
 
     @pytest.mark.simulated_gpu
@@ -840,7 +874,7 @@ class TestGpuScheduling:
                 return (512 if stage == 0 else 1024) * 1024
             return 0.0 if stage == 0 else 1024 * 1024
 
-        host = HostMemory(64 * 1024**2, HOST_RESERVE_KB + 5 * 1024**2, 0, 0)
+        host = HostMemory(64 * 1024**2, settings.host_reserve_kb + 5 * 1024**2, 0, 0)
         memory = {0: DeviceMemory("GPU-test-0", 3000, 3000)}
         with patch.object(scheduler.stages, "peak", side_effect=peak):
             plan = scheduler._launch_plan(memory, host)
@@ -1217,7 +1251,7 @@ class TestGpuScheduling:
         # The initial 1 GiB reservation still receives the usual cap margin.
         card_kb = Memory([0]).sample()[0].total * 1024
         expected = min(
-            cap_kb(devices.GPU_PEAK_KB_DEFAULT),
+            cap_kb(settings.gpu_peak_kb_default),
             card_kb,
         )
         assert len(ceilings) == 2
@@ -1307,7 +1341,7 @@ class TestGpuScheduling:
             return original(monitor)
 
         with (
-            patch.object(devices, "HOST_RESERVE_KB", 2 * 1024**2),
+            patch.object(settings, "host_reserve_kb", 2 * 1024**2),
             patch.object(Host, "sample", pressure),
         ):
             results = batch.run()
@@ -1479,10 +1513,12 @@ class TestDevice:
         assert batch.devices == (0, 1)
 
     def test_fits_reserve_uses_available_bytes(self):
-        nearly_full = HostMemory(HOST_RESERVE_KB, HOST_RESERVE_KB - 1, 0, 0)
+        nearly_full = HostMemory(
+            settings.host_reserve_kb, settings.host_reserve_kb - 1, 0, 0
+        )
         assert nearly_full.available_ratio > 0.9
         assert not fits_reserve(nearly_full, 0)
-        available = HOST_RESERVE_KB + 2 * 1024**2
+        available = settings.host_reserve_kb + 2 * 1024**2
         roomy = HostMemory(64 * 1024**2, available, 0, 0)
         assert fits_reserve(roomy, 2 * 1024**2)
         assert not fits_reserve(roomy, 2 * 1024**2 + 1)
@@ -1497,7 +1533,7 @@ class TestDevice:
         assert fits_reserve(half_swapped, 0)
         # Swap fully occupied, memory perfectly available: still a launch.
         assert fits_reserve(HostMemory(large, large // 2, 4096, 0), 0)
-        short = HostMemory(large, HOST_RESERVE_KB - 1, 4096, 0)
+        short = HostMemory(large, settings.host_reserve_kb - 1, 4096, 0)
         assert not fits_reserve(short, 0)
 
     def test_query_timeout_is_an_observation_error_with_the_default_timeout(self):
@@ -1583,7 +1619,7 @@ class TestDevice:
         monitor = MeminfoMonitor(meminfo)
         observation = monitor.sample()
         assert observation.swap_free_kb == 2097152.0
-        assert observation.headroom_kb == 8388608.0 - HOST_RESERVE_KB
+        assert observation.headroom_kb == 8388608.0 - settings.host_reserve_kb
         assert not observation.tight
         # Half the swap stays occupied, and it changes nothing: the occupied
         # pages are not memory anything can be asked to give back.

@@ -4,11 +4,12 @@ The reader loads the manifest and configurations from the trusted batch
 directory. An unreadable run configuration is reported in the skipped list.
 An unreadable manifest or a failed metrics query raises AnalysisError.
 
-Comparisons use successful runs containing both the metric and configuration
-field, with at least three paired observations. Numeric fields with three
-or more distinct values use Spearman rank correlation. Other varying fields
-are grouped by value and compared using the fraction of metric variation
-between groups.
+Each comparison requires min_numeric_points successful runs containing both
+the metric and the configuration field. Numeric fields with three or more
+distinct values use Spearman rank correlation. Other varying fields are
+grouped by value if they yield at least min_groups groups. The fraction of
+metric variation between groups is reported when some group has replicates
+and the metric varies.
 """
 
 import json
@@ -22,13 +23,12 @@ from time import time
 from typing import Any
 
 from expman.observation.status import RecordedBatch
+from expman.settings import settings
 from expman.storage.base import StorageError
 from expman.storage.batch import BatchStore
 
 ANALYSIS_SCHEMA = 1
 SUMMARY_STEP = -1  # MetricStore's sentinel for run-level summary values
-MIN_NUMERIC_POINTS = 3  # Minimum paired observations for any field/metric comparison.
-MIN_GROUPS = 2
 DURATION_METRIC = "run_duration_seconds"
 
 
@@ -57,7 +57,7 @@ class Collected:
 
 def fingerprint(directory: Path) -> tuple:
     """A cheap change marker for the inputs one analysis depends on."""
-    parts: list[Any] = []
+    parts: list[Any] = [settings.min_numeric_points, settings.min_groups]
     for name in ("batch.pkl", "metrics.sqlite3"):
         path = directory / name
         try:
@@ -337,7 +337,7 @@ def _pair_for(
         key = _group_key(value)
         groups.setdefault(key, []).append(y)
         raw[key] = value
-    if len(groups) < MIN_GROUPS:
+    if len(groups) < settings.min_groups:
         return None
     return _categorical_pair(field_name, groups, raw)
 
@@ -409,7 +409,7 @@ def analysis_payload(directory: Path, batch_id: int | None = None) -> dict:
                 for run_id, leaves in flat.items()
                 if run_id in samples and path in leaves
             ]
-            if len(picked) < MIN_NUMERIC_POINTS:
+            if len(picked) < settings.min_numeric_points:
                 insufficient += 1
                 continue
             pair = _pair_for(

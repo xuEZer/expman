@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-MAX_COLUMNS = 48
+from expman.settings import settings
 
 
 def _flatten(value, path=()):
@@ -49,7 +49,7 @@ class FeatureVariable:
 class Encoding:
     """Encoded rows plus the declared variables that produced them.
 
-    ``variables`` is ``None`` once the column count passes ``MAX_COLUMNS`` and
+    ``variables`` is ``None`` once the column count passes ``max_columns`` and
     groups are hashed together: membership is then no longer recoverable, and
     distances fall back to comparing columns directly.
     """
@@ -96,7 +96,7 @@ def encode(configs) -> Encoding:
             variables.append(
                 FeatureVariable("categorical", tuple(range(first, len(columns) + 1)))
             )
-    width = min(len(columns), MAX_COLUMNS)
+    width = min(len(columns), settings.max_columns)
     rows = [[1.0] + [0.0] * width for _ in configs]
     for index, (name, values) in enumerate(columns):
         sign = 1

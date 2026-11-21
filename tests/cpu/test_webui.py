@@ -28,6 +28,7 @@ from expman.process_control import STOP_FIFO, stop_on_sigterm
 from expman.resources.devices import DeviceMemory, HostMemory
 from expman.scheduling.parallel_estimation import estimate_parallel
 from expman.scheduling.scheduler import GpuScheduler, Worker
+from expman.settings import settings
 from expman.storage.base import PickleSerializer, run_lock, write_record
 from expman.storage.batch import BatchStore
 from expman.webui.server import Stream, Workspace, serve
@@ -75,7 +76,7 @@ class Broken:
 def fake_devices(monkeypatch):
     monkeypatch.setattr(devices, "NvidiaMemory", Memory)
     monkeypatch.setattr(devices, "MeminfoMonitor", Host)
-    monkeypatch.setattr(devices, "POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(settings, "poll_interval", 0.01)
 
 
 def make_batch(root, *, count=2, delay=0.0):
@@ -574,9 +575,13 @@ def test_a_snapshot_degrades_instead_of_raising(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_publishing_is_on_by_default_and_can_be_switched_off(monkeypatch):
+def test_live_settings_and_environment_control_publishing(tmp_path, monkeypatch):
     monkeypatch.delenv("EXPMAN_LIVE", raising=False)
     assert live_enabled() is True
+    monkeypatch.setattr(settings, "live_enabled", False)
+    assert live_enabled() is False
+    monkeypatch.setattr(settings, "live_interval", 2.5)
+    assert LivePublisher(Broken(tmp_path)).interval == 2.5
     monkeypatch.setenv("EXPMAN_LIVE", "off")
     assert live_enabled() is False
     monkeypatch.setenv("EXPMAN_LIVE", "1")
@@ -831,6 +836,25 @@ class TestDashboard:
             assert payload["schema"] == SCHEMA
             assert [entry["name"] for entry in payload["batches"]] == ["run_a", "run_b"]
             assert payload["batches"][1]["status"] == "failed"
+        finally:
+            dashboard.close()
+
+    def test_serve_reads_the_configured_root_and_web_defaults_at_startup(
+        self, runs, monkeypatch
+    ):
+        monkeypatch.setattr(settings, "batches_dir", runs)
+        monkeypatch.setattr(settings, "web_port", 0)
+        monkeypatch.setattr(settings, "web_interval", 12.5)
+        dashboard = serve()
+        try:
+            assert dashboard._server.stream.interval == 12.5
+            monkeypatch.setattr(settings, "batches_dir", runs / "different")
+            dashboard.refresh()
+            _, body, _ = self.get(dashboard.url + "api/batches")
+            assert [entry["name"] for entry in json.loads(body)["batches"]] == [
+                "run_a",
+                "run_b",
+            ]
         finally:
             dashboard.close()
 

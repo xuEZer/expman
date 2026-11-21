@@ -19,6 +19,7 @@ from expman.observation.archive import read_batch, summarize
 from expman.observation.registry import ensure_ids
 from expman.observation.snapshot import SCHEMA
 from expman.process_control import request_stop
+from expman.settings import settings
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 STATIC_FILES = {
@@ -27,18 +28,13 @@ STATIC_FILES = {
     "index.html": "text/html; charset=utf-8",
     "style.css": "text/css; charset=utf-8",
 }
-HEARTBEAT_SECONDS = 15.0
-# A taken port is not an experiment failure: try the next few numbers.
-PORT_ATTEMPTS = 10
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8765
 
 
 class Workspace:
     """Every batch under the selected batches directory, read from disk on demand."""
 
     def __init__(self, root: Path | None = None) -> None:
-        self.root = root
+        self.root = (settings.batches_dir if root is None else root).resolve()
 
     def collect(self) -> tuple[list[dict], dict[int, dict]]:
         """Summaries for the list page and full snapshots keyed by batch ID.
@@ -332,7 +328,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             generation = -1
             while not stream.stopped.is_set():
-                generation, payload = stream.wait(generation, key, HEARTBEAT_SECONDS)
+                generation, payload = stream.wait(
+                    generation, key, settings.web_heartbeat
+                )
                 self.wfile.write(f"data: {payload}\n\n".encode())
                 self.wfile.flush()
         finally:
@@ -437,20 +435,22 @@ def _check(host, port, interval):
 def serve(
     root: Path | None = None,
     *,
-    host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
-    interval: float = 1.0,
+    host: str | None = None,
+    port: int | None = None,
+    interval: float | None = None,
 ) -> WebUI:
-    """Start a dashboard over ``root`` (``./batches/`` by default) and return it.
+    """Start a dashboard over ``root``, using the batches_dir setting when omitted.
 
     The dashboard runs in daemon threads, so it also disappears with the
-    process that started it.  Binding the loopback address is the default;
-    exposing it to a network requires passing a host explicitly.
+    process that started it. Omitted arguments use the current settings.
     """
+    host = settings.web_host if host is None else host
+    port = settings.web_port if port is None else port
+    interval = settings.web_interval if interval is None else interval
     _check(host, port, interval)
     workspace = Workspace(root)
     last = None
-    last_port = min(port + PORT_ATTEMPTS - 1, 65535) if port else 0
+    last_port = min(port + settings.web_port_attempts - 1, 65535) if port else 0
     for candidate in range(port, last_port + 1):
         try:
             server = DashboardServer(

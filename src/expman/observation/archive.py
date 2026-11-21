@@ -18,9 +18,8 @@ from expman.observation.snapshot import (
 )
 from expman.observation.status import RecordedBatch
 from expman.process_control import is_running
+from expman.settings import settings
 from expman.storage.base import StorageError
-
-STALE_SECONDS = 3.0
 
 
 def _latest_snapshot(directory: Path, running: bool, now: float) -> dict | None:
@@ -32,7 +31,11 @@ def _latest_snapshot(directory: Path, running: bool, now: float) -> dict | None:
         if not isinstance(data, dict) or not isinstance(data.get("batch"), dict):
             return None
         stamp = number(data.get("generated_at"))
-        if running and stamp is not None and abs(now - stamp) <= STALE_SECONDS:
+        if (
+            running
+            and stamp is not None
+            and abs(now - stamp) <= settings.live_stale_seconds
+        ):
             data["source"] = "live"
         else:
             data["source"] = "last"

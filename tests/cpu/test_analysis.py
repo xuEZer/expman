@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from expman.observation.analysis import AnalysisError, analysis_payload
+from expman.observation.analysis import AnalysisError, analysis_payload, fingerprint
+from expman.settings import settings
 from expman.storage.base import PickleSerializer, write_record
 from expman.storage.batch import BatchStore
 from expman.storage.metrics import MetricStore
@@ -375,7 +376,7 @@ def test_literal_metric_paths_and_duration_keep_their_own_values(root):
     }
 
 
-def test_pairs_with_too_few_points_are_counted_not_shown(root):
+def test_pairs_with_too_few_points_are_counted_not_shown(root, monkeypatch):
     directory = make_batch(
         root,
         [
@@ -398,6 +399,13 @@ def test_pairs_with_too_few_points_are_counted_not_shown(root):
     assert score["pairs"] == []
     assert score["skipped_fields"] == 2
     assert score["influence_max"] is None
+
+    before = fingerprint(directory)
+    monkeypatch.setattr(settings, "min_numeric_points", 2)
+    assert fingerprint(directory) != before
+    assert pair(analysis_payload(directory), "score", "kind")["n"] == 2
+    monkeypatch.setattr(settings, "min_groups", 3)
+    assert metric(analysis_payload(directory), "score")["pairs"] == []
 
 
 @pytest.mark.parametrize("scale", [1e-200, 1e200])

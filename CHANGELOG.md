@@ -6,7 +6,7 @@
 
 - 移除 Python 的 `Batch(pipeline, cfg)` 和 `Batch.resume(...)` 接口。批次统一通过 `expman run train config.yaml` 创建并运行，通过 `expman resume ID` 恢复。缺少流程位置的批次无法通过 CLI 恢复。
 - 批次默认父目录由 `./runs/` 改为 `./batches/`。CLI 各子命令统一使用 `--batches-dir` 指定父目录，移除 `run` 的 `-o` / `--output-dir` 和 `web` 的 `--root`。CLI 新建批次时使用 `<pipeline-attr>_<config-stem>_<YYYYMMDDHHMMSS>` 命名子目录，并打印批次 ID 和目录。时间戳采用本地时间，精确到秒，目录重名时命令报错退出。
-- `status`、`resume` 和 `stop` 的位置参数改为所选父目录中的整数批次 ID。`status` 省略 ID 时显示总览，指定 ID 时显示单批次详情。两种视图每两秒刷新一次，按 Ctrl+C 退出查看。批次清单读取失败时，命令报错并退出。`resume` 和 `stop` 要求提供 ID。
+- `status`、`resume` 和 `stop` 的位置参数改为所选父目录中的整数批次 ID。`status` 省略 ID 时显示总览，指定 ID 时显示单批次详情。两种视图默认每两秒刷新一次，按 Ctrl+C 退出查看。批次清单读取失败时，命令报错并退出。`resume` 和 `stop` 要求提供 ID。
 - 移除 `run` 和 `resume` 的 `--progress` 选项。运行期间可在另一终端用 `expman status` 或 Web 看板查看状态。
 - 移除 `expman web --read-only` 和 Python 看板服务的 `allow_stop` 参数。所有看板均允许访问者请求停止运行中的批次，`GET /api/health` 的响应也移除了 `stop` 字段。
 - 批次清单 `batch.pkl` 使用 v2 格式。旧批次如需续跑，请使用创建它的代码环境。用当前代码从头运行时，`expman run` 会创建按时间戳命名的新批次目录。
@@ -15,10 +15,11 @@
 
 ### Added
 
+- 运行参数集中在 `src/expman/settings.py`。各条 CLI 命令可以共用项目 `pyproject.toml` 的 `[tool.expman]` 配置，Python 调用者可以用 `expman.set(...)` 和 `expman.get(key)` 覆盖或读取当前进程的设置。支持设置批次目录、看板端口、刷新间隔、资源预算和 worker 环境。
 - 新增 `expman delete ID`，可删除指定批次的目录及登记记录并释放 ID。命令支持 `--batches-dir`，也可清除已手动移走目录的批次记录。运行中的批次须先停止。
 - `expman run` 支持省略流程模块名。例如 `expman run train experiments.yaml` 会从默认模块 `pipeline` 导入 `train`。
 - 默认 pytest 和提交检查均要求真实 CUDA/MPS 测试通过。测试从可见、显存足够且未被其他测试预留的物理 GPU 中选择利用率最低的一张，已有计算任务的卡也可入选。
-- 运行看板新增「结果分析」页签：对单个批次做简单的自变量—因变量分析。数据取自 `batch.pkl`（Run 清单/状态/累计耗时）、每个 Run 的 `config.pkl` 与 `metrics.sqlite3`（`step=-1` 汇总值优先，多 Stage 同名指标自动消歧），耗时以 `run_duration_seconds` 伪指标参与。批次不必跑完：配置不可读的 Run 跳过并标注原因，失败/未完成 Run 排除但计入覆盖度，每个指标各自计 `n`、缺值 Run 按 pairwise 跳过。数值配置项（≥3 个不同取值）报 Spearman 秩相关、绝对值即影响力；其余按取值分组报每组均值与最佳取值，影响力取组间平方和占比（η²）；常量项与样本不足项跳过并显式标注。指标与配置项均按影响力排序，`GET /api/analysis/<id>` 按批次清单、指标库及各 run 配置文件的指纹缓存。分析只描述观测到的关系，不做显著性检验与因果断言。
+- 运行看板新增「结果分析」页签：对单个批次做简单的自变量—因变量分析。数据取自 `batch.pkl`（Run 清单/状态/累计耗时）、每个 Run 的 `config.pkl` 与 `metrics.sqlite3`（`step=-1` 汇总值优先，多 Stage 同名指标自动消歧），耗时以 `run_duration_seconds` 伪指标参与。批次不必跑完：配置不可读的 Run 跳过并标注原因，失败/未完成 Run 排除但计入覆盖度，每个指标各自计 `n`、缺值 Run 按 pairwise 跳过。数值配置项（≥3 个不同取值）报 Spearman 秩相关、绝对值即影响力；其余按取值分组报每组均值与最佳取值，影响力取组间平方和占比（η²）；常量项与样本不足项跳过并显式标注。指标与配置项均按影响力排序，`GET /api/analysis/<id>` 按批次清单、指标库、各 run 配置文件的指纹及两项分析阈值缓存。分析只描述观测到的关系，不做显著性检验与因果断言。
 - 运行看板由独立进程 `expman web` 提供。实验进程定期把只读快照写入 `live.json`，看板通过 HTTP 和 SSE 展示运行状态、调度与资源观测。支持指定地址、端口和批次根目录，并为发现的批次登记稳定编号。
 - worker 默认将受支持的线程池环境变量设为 4，未设置 `HF_ENDPOINT` 时使用 `https://hf-mirror.com`。shell 已导出任一受支持的线程池变量时，整组线程设置由 shell 决定。可用 `EXPMAN_THREADS`（`off` 或正整数）和 `EXPMAN_HF_MIRROR`（`off`、`cn` 或端点）调整默认值。框架写入的值记录在每次尝试的 `bootstrap.pkl` 中。无效的 `EXPMAN_THREADS` 会在创建批次目录前报错。
 - GPU Batch 改为按顶层 Stage 派发：已完成前缀从快照恢复，Stage 通过 IPC 上报完成状态、耗时、cgroup 内存峰值、NVIDIA 客户端显存采样峰值、Recorder 事件和声明的配置依赖。按滚动依赖特征分别估计每个 Stage 的耗时、主机内存和显存峰值，并优先尝试与既有样本距离更远的可行参数组合。
@@ -94,6 +95,6 @@
 - 尝试摘要只保存状态、耗时、错误和输出来源。有阶段的成功 run 通过最终阶段快照按需加载输出，恢复批次后也能读取。
 - 调度准入同时观察逐卡显存与主机内存：每个 tick 重新查询两者，查询超时（默认 3 秒）或失败按主机内存紧张处理并暂停派发；已发出的预留若无法兑现——主机余量连零字节都放不下，或某卡上未兑现的预留超过空闲显存——则撤销最近启动的一个尝试（带冷却；只有一个 worker 时只暂停派发、不撤销）。准入由主机余量与逐卡未兑现预留联合决定，压力消失后自然恢复；swap 只观测；并发 ETA 在压力期间只保留已占用的槽位。
 - 调度主循环按同阶段配置的差异选择候选并计算装箱计划。批次计时线程更新并保存 ETA。
-- Batch 累计运行时间及最近有效剩余时间区间持久化，resume 后连续显示，恢复实时调度观测后更新预测。
+- Batch 持久化累计运行时间及当前剩余时间区间，区间未知时记录为空。resume 沿用累计时间，调度恢复后更新预测。
 - 命名默认配置按字段路径从项目根目录的 configs 读取。
 - checkpoint 原子保存并按声明的配置依赖恢复，避免下游无关参数变化导致前缀重算。

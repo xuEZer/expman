@@ -12,13 +12,13 @@ from expman.core.experiment import AttemptResult, ExperimentResult, StageResult
 from expman.core.pipeline import Pipeline
 from expman.core.randomness import seed_everything
 from expman.core.recorders import InMemoryRecorder, Recorder
-from expman.core.settings import get, set
 from expman.core.stage import Stage
 from expman.estimation.estimate import TimeEstimate
 from expman.observation import cleanup
 from expman.resources import limits
 from expman.resources.devices import DeviceMemory, MeminfoMonitor, NvidiaMemory
 from expman.scheduling import environment
+from expman.settings import get, set
 from expman.storage.base import (
     PickleSerializer,
     RecoveryWarning,

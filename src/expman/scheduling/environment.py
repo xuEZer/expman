@@ -1,20 +1,18 @@
 """Thread-pool and Hugging Face environment defaults for each worker.
 
-EXPMAN_THREADS sets a positive thread limit, defaults to four and accepts
-``off`` to leave library defaults in place. If any supported thread-pool
-variable is already present, the whole group is inherited from the parent.
+EXPMAN_THREADS overrides the worker_threads setting with a positive integer
+or ``off``. If any supported thread-pool variable is already present, the
+whole group is inherited from the parent.
 
-EXPMAN_HF_MIRROR accepts ``cn``, ``off`` or an endpoint. An existing
-HF_ENDPOINT takes precedence.
+An unset EXPMAN_HF_MIRROR or the value ``cn`` selects the hf_mirror setting.
+Use ``off`` to skip adding an endpoint, or supply another endpoint directly.
+An existing HF_ENDPOINT takes precedence.
 """
 
 import os
 
-# Threads one worker may use. Deliberately a fixed number rather than a share of
-# the machine: the ceiling exists to bound what many concurrent attempts do to
-# the CPU together, so every attempt of a configuration is measured under the
-# same budget instead of one whose value depends on how busy the Batch is.
-WORKER_THREADS = 4
+from expman.settings import settings
+
 # One environment variable per thread pool. They all have to agree, otherwise a
 # worker picks up whichever library sizes its pool last and spawns more threads
 # than the budget allows.
@@ -30,7 +28,6 @@ THREAD_VARIABLES = (
 )
 THREADS_OVERRIDE = "EXPMAN_THREADS"
 MIRROR_OVERRIDE = "EXPMAN_HF_MIRROR"
-HF_MIRROR = "https://hf-mirror.com"
 
 
 def _override(name: str) -> str | None:
@@ -45,7 +42,7 @@ def thread_budget() -> int | None:
     """Threads one worker may use; None when the ceiling is switched off."""
     override = _override(THREADS_OVERRIDE)
     if override is None:
-        return WORKER_THREADS
+        return settings.worker_threads
     if override.lower() == "off":
         return None
     try:
@@ -65,7 +62,7 @@ def hf_endpoint() -> str | None:
     """The Hugging Face endpoint to hand workers; None to leave it alone."""
     override = _override(MIRROR_OVERRIDE)
     if override is None or override.lower() == "cn":
-        return HF_MIRROR
+        return settings.hf_mirror
     if override.lower() == "off":
         return None
     return override if "://" in override else f"https://{override}"

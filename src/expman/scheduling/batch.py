@@ -8,7 +8,6 @@ from typing import Any
 from uuid import uuid4
 
 from expman.config import configured_devices
-from expman.core import settings
 from expman.core.context import _nonnegative_integer
 from expman.core.events import Status
 from expman.core.experiment import AttemptResult, Experiment, ExperimentResult
@@ -19,10 +18,9 @@ from expman.estimation.estimate import TimeEstimate, valid_seconds, validate_cov
 from expman.process_control import stop_on_sigterm
 from expman.scheduling.environment import validate as validate_environment
 from expman.scheduling.state import BatchState, LiveObservations
+from expman.settings import settings
 from expman.storage.base import RecoveryWarning, StorageError, run_lock
 from expman.storage.batch import BatchStore
-
-TIMING_SAVE_INTERVAL = 5.0
 
 
 def _attempt_record(result: AttemptResult) -> dict:
@@ -77,8 +75,8 @@ class _Batch:
         batch = cls(
             pipeline,
             BatchStore(output_dir.parent.resolve() / output_dir.name),
-            settings.get("retries"),
-            settings.get("coverage"),
+            settings.retries,
+            settings.coverage,
             pipeline_spec,
         )
         batch.devices = configured_devices(configs)
@@ -267,7 +265,7 @@ class _Batch:
             )
 
     def _timing_loop(self, stopped):
-        while not stopped.wait(TIMING_SAVE_INTERVAL):
+        while not stopped.wait(settings.timing_save_interval):
             self._update_timing()
 
     def run(self) -> tuple[ExperimentResult, ...]:

@@ -5,9 +5,9 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+from expman.settings import settings
 from expman.storage.base import StorageError, run_lock
 
-BATCHES_DIR = Path("./batches/")
 REGISTRY_NAME = ".batches.sqlite3"
 _DELETING = ".expman-deleting"
 
@@ -33,7 +33,7 @@ def _registered(connection: sqlite3.Connection) -> dict[str, int]:
 
 def ensure_ids(root: Path | None = None) -> dict[int, Path]:
     """Look up visible batches, registering new names in one write transaction."""
-    base = (BATCHES_DIR if root is None else Path(root)).resolve()
+    base = (settings.batches_dir if root is None else Path(root)).resolve()
     candidates = _scan_batches(base)
     if not candidates:
         return {}

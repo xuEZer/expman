@@ -2,7 +2,6 @@
 
 from itertools import zip_longest
 
-import expman.resources.devices as devices
 from expman.core.dependencies import observation, stage_dependencies
 from expman.core.events import Status
 from expman.estimation.duration_model import DurationModel
@@ -11,8 +10,7 @@ from expman.estimation.memory_model import LocalQuantileEstimator
 from expman.estimation.time_model import encode
 from expman.resources import limits
 from expman.scheduling._planning import Candidate
-
-CANDIDATES_PER_STAGE = 32
+from expman.settings import settings
 
 
 class StageWork:
@@ -259,14 +257,14 @@ class StageWork:
         # spread samples across that Stage's dependency-feature space.
         ordered = retries + sorted(fresh, key=novelty, reverse=True)
         candidates = []
-        selected = ordered[:CANDIDATES_PER_STAGE]
+        selected = ordered[: settings.candidates_per_stage]
         denominator = max(1, len(selected) - 1)
         for rank, run_id in enumerate(selected):
             host_estimate = self.peak(
-                run_id, stage_index, "peak_kb", devices.HOST_PEAK_KB_DEFAULT
+                run_id, stage_index, "peak_kb", settings.host_peak_kb_default
             )
             gpu_estimate = self.peak(
-                run_id, stage_index, "gpu_process_peak_kb", devices.GPU_PEAK_KB_DEFAULT
+                run_id, stage_index, "gpu_process_peak_kb", settings.gpu_peak_kb_default
             )
             candidates.append(
                 Candidate(

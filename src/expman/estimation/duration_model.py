@@ -8,7 +8,7 @@ is the natural center.
 Choosing a fixed number of nearest configurations makes the estimate jump
 whenever a sample crosses the neighborhood boundary, so every completed sample
 contributes instead through a Gaussian kernel. Its bandwidth is the distance of
-the ``max(2, ceil(n / NEIGHBORHOOD))``-th positive distance, capped at the
+the ``max(2, ceil(n / neighborhood))``-th positive distance, capped at the
 number of distinct-from-query samples. Exact matches retain full weight.
 
 The interval is multiplicative: the residual distribution of the center estimate
@@ -26,9 +26,7 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 from expman.estimation.time_model import Encoding, variable_distance
-
-# Bandwidth rank scales with the sample count.
-NEIGHBORHOOD = 8
+from expman.settings import settings
 
 
 @dataclass(frozen=True)
@@ -98,7 +96,7 @@ class DurationModel:
         positive = sorted(distance for distance in distances if distance > 0.0)
         if not positive:
             return [1.0] * len(distances)
-        rank = max(2, math.ceil(len(samples) / NEIGHBORHOOD))
+        rank = max(2, math.ceil(len(samples) / settings.neighborhood))
         bandwidth = positive[min(rank, len(positive)) - 1]
         return [math.exp(-0.5 * (distance / bandwidth) ** 2) for distance in distances]
 

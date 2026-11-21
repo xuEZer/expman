@@ -5,9 +5,10 @@ import os
 import subprocess
 
 from expman.resources import devices
+from expman.settings import settings
 
 
-def sample(uuid: str) -> float | None:
+def sample(uuid: str, *, timeout: float | None = None) -> float | None:
     """Current KiB for our PID on our GPU. Missing driver counters stay unknown."""
     try:
         result = subprocess.run(
@@ -20,7 +21,7 @@ def sample(uuid: str) -> float | None:
             check=True,
             capture_output=True,
             text=True,
-            timeout=devices.QUERY_TIMEOUT,
+            timeout=settings.query_timeout if timeout is None else timeout,
         )
         pid = str(os.getpid())
         for line in result.stdout.splitlines():

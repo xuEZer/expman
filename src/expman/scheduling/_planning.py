@@ -3,8 +3,7 @@
 from dataclasses import dataclass
 
 from expman.estimation.duration_model import StageDuration
-
-PLAN_BEAM_WIDTH = 128
+from expman.settings import settings
 
 
 @dataclass(frozen=True)
@@ -71,5 +70,5 @@ def pack_candidates(candidates, host_capacity, devices, gpu_capacities, gpu_tota
             expanded,
             key=lambda plan: _plan_score(plan, host_capacity, gpu_totals),
             reverse=True,
-        )[:PLAN_BEAM_WIDTH]
+        )[: settings.plan_beam_width]
     return plans[0].placements

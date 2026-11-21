@@ -6,6 +6,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from expman.settings import settings
+
 # Device memory carries no ratio threshold: CUDA OOM is treated as evidence that
 # the Stage needs a larger next contract. Signatures come from PyTorch's own
 # error type and message.
@@ -15,31 +17,6 @@ CUDA_OOM_MARKERS = (
     "CUDA error: out of memory",
     "cuDNN error: CUDNN_STATUS_ALLOC_FAILED",
 )
-# Keep 1 GiB of MemAvailable outside the scheduler's host reservations.
-HOST_RESERVE_KB = 1024 * 1024
-# Initial per-Stage reservations in KiB until usable peak samples exist.
-HOST_PEAK_KB_DEFAULT = 1024 * 1024
-GPU_PEAK_KB_DEFAULT = 1024 * 1024
-# Requested cgroup and MPS limits include headroom above the reservation.
-# MPS requests are further bounded by GPU capacity and rounded down to MiB.
-CAPACITY_FACTOR = 1.10
-CAPACITY_FLOOR_KB = 512 * 1024
-# A peak this close to a verified host limit counts as a capped observation.
-CAPACITY_NEAR = 0.9
-# Sleep between scheduling ticks. Each tick collects exits, takes fresh memory
-# readings and can start multiple workers on each card.
-POLL_INTERVAL = 1.0
-# How long shedding one attempt suspends shedding the next. The memory an ended
-# attempt held is not visible to the reading that follows it, and a shortage
-# that outlives one tick would otherwise spend one attempt per tick: an attempt
-# cancelled for pressure is retried, so an unbounded sweep turns into a loop
-# that burns cold starts instead of making room.
-RELIEF_COOLDOWN = 10.0
-# Measured on RTX 3070 laptop / WSL2, one GPU, at the scheduler's own cadence:
-# median 53 ms, p99 300 ms, worst 620 ms with the GPU in desktop use; median
-# 143 ms, worst 915 ms with the host CPU saturated. The timeout leaves room
-# for jitter before dispatch pauses and load shedding can start.
-QUERY_TIMEOUT = 3.0
 MEMINFO_PATH = Path("/proc/meminfo")
 # WSL2 installs the Linux nvidia-smi here without adding it to PATH.
 NVIDIA_SMI_FALLBACKS = (Path("/usr/lib/wsl/lib/nvidia-smi"),)
@@ -92,7 +69,7 @@ class NvidiaMemory:
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=QUERY_TIMEOUT,
+                timeout=settings.query_timeout,
             )
             values = {}
             for line in result.stdout.splitlines():
@@ -143,7 +120,7 @@ class HostMemory:
     @property
     def headroom_kb(self) -> float:
         """MemAvailable above the reserve; a non-positive value admits nothing."""
-        return self.available_kb - HOST_RESERVE_KB
+        return self.available_kb - settings.host_reserve_kb
 
     @property
     def tight(self) -> bool:

@@ -26,7 +26,7 @@ flowchart LR
     V --> UI
 ```
 
-1. **创建批次。** `expman run` 按 `module:attr` 导入 Pipeline，省略模块名时从 `pipeline` 模块读取属性。命令把 YAML 展开为一组配置，批次调度代码校验设备和种子，为每份配置创建一个 run 目录，把流程位置和初始队列写入批次清单。[CLI](src/expman/cli.py) · [批次调度](src/expman/scheduling/batch.py)
+1. **创建批次。** `expman run` 按 `module:attr` 导入 Pipeline，省略模块名时从 `pipeline_module` 指定的模块读取属性，默认为 `pipeline`。命令把 YAML 展开为一组配置，批次调度代码校验设备和种子，为每份配置创建一个 run 目录，把解析后的 `module:attr` 和初始队列写入批次清单。[CLI](src/expman/cli.py) · [批次调度](src/expman/scheduling/batch.py)
 2. **选择任务。** 主进程取每个 run 当前就绪的顶层阶段。可以共享前缀的成员按组处理。命中缓存时，主进程只读元数据，把指标和快照引用写到目标 run，推进它的阶段位置。需要计算时，主进程根据内存余量选择候选和设备，在启动 worker 前持久化该成员的活动状态。[调度循环](src/expman/scheduling/scheduler.py) · [阶段分组](src/expman/scheduling/_stages.py)
 3. **计算一个阶段。** worker 在独立解释器内核验 MPS 客户端，加载用户模块和本次尝试的输入，重建 Experiment。执行第 `i` 个阶段前，`run_stage(i)` 检查前置阶段都已有完成记录。Pipeline 从头走到 `i`，依次恢复已有阶段的输出和随机状态，再构造需要执行的 Stage 调用其 `process(data, ctx)`。相邻阶段可以运行在不同进程，跨进程传值依赖磁盘快照。[worker 入口](src/expman/scheduling/_worker.py) · [Experiment](src/expman/core/experiment.py) · [托管阶段执行](src/expman/core/execution.py)
 4. **收集结果。** worker 通过本地 socket 把完成摘要传给主进程。主进程记录历史，释放占用，安排下一阶段或重试。成功结果保存最终快照的位置。调度结束后，CLI 按配置展开顺序打印每个 run 的 ID 和最终状态。[进程间通信](src/expman/scheduling/ipc.py) · [结果对象](src/expman/core/experiment.py)
@@ -45,7 +45,9 @@ flowchart LR
 | 用于后续分析的指标 | `ctx.log_metrics(mapping, step=...)` 将整批有限实数指标写入 SQLite。持久化失败会使当前阶段失败。 |
 | 嵌套子流程 | `Pipeline([Child]).run(data, ctx)` 为子阶段分配独立存储位置。直接调用 `Child().run(data, ctx)` 只建立观测作用域。在该子调用中使用 `ctx.checkpoint()` 会抛出 `RuntimeError`，外层的 checkpoint 仍属于外层阶段。 |
 
-## 配置怎样决定工作量
+## 框架设置与实验配置
+
+CLI 从当前工作目录向上查找最近的 `pyproject.toml`，在解析命令行参数前应用 `[tool.expman]`。CLI、调度器、资源采样和看板共用一处设置定义，显式命令行参数可以覆盖对应选项。流程模块在导入时可调用 `expman.set(...)` 覆盖当前进程的值。主进程启动独立 worker 时传入生效的设置。恢复时，重试次数和耗时区间覆盖率取自原批次清单，资源与调度参数采用本次会话的设置。[全局设置](src/expman/settings.py) · [命令入口](src/expman/cli.py) · [worker 入口](src/expman/scheduling/_worker.py)
 
 `load_configs` 处理 YAML 语法及默认文件，`expand` 负责生成组合，`configured_devices` 校验整个批次共享的设备列表。[配置加载](src/expman/config/loader.py) · [变体展开](src/expman/config/variants.py) · [批次约束](src/expman/config/schema.py)
 
@@ -59,7 +61,7 @@ flowchart LR
 
 | 位置 | 内容和使用者 |
 |---|---|
-| `batch.pkl`、`timing.pkl` | 批次清单保存流程的导入位置和签名、重试及估时设置、队列、活动成员、阶段游标、尝试摘要和阶段历史。`timing.pkl` 单独记录批次累计墙钟时间和当前 ETA，估计区间未知时存为空值。 |
+| `batch.pkl`、`timing.pkl` | 批次清单保存流程的导入位置和签名、重试次数和耗时区间覆盖率、队列、活动成员、阶段游标、尝试摘要和阶段历史。`timing.pkl` 单独记录批次累计墙钟时间和当前 ETA，估计区间未知时存为空值。 |
 | `experiments/<run_id>/config.pkl`、`rng_initial.pkl` | 具体配置与 run 的初始随机状态。 |
 | `experiments/<run_id>/stages/<位置>/` | `status.pkl` 是阶段状态，`checkpoint.pkl` 是最近一次成功保存的中间进度，`completed.pkl` 是完成快照或共享节点引用。每次 Pipeline 调用所在路径还有用于校验定义的 `pipeline.pkl`。 |
 | `cache/<key>/<父节点>/<节点>/` | `snapshot.pkl` 保存大输出及状态，`metadata.pkl` 保存依赖、指标和耗时。调度器据元数据推进等价 run，下游 worker 再读取输出。 |
@@ -79,7 +81,7 @@ flowchart LR
 
 **随机状态与计时。** 每个 run 根据 seed 初始化 Python、NumPy 和 PyTorch 全局随机生成器。CUDA 设备可用时也捕获各可见设备的状态。托管执行恢复已完成前缀的结束状态，并在有 checkpoint 时于调用 `process` 前重置到保存点。恢复会校验随机状态记录的格式、seed、CPU 状态与非空 CUDA 状态的设备数，应用失败时回滚。缺失或无效的随机状态会报错。用户自建的生成器和 DataLoader 子进程状态由用户保存。[随机状态实现](src/expman/core/randomness.py)
 
-批次墙钟时间剔除停机间隔，约每五秒保存一次。阶段 checkpoint 和完成快照都要求保存有限、非负的累计执行秒数。断点计时缺失或无效时会告警并从阶段开头重跑。已提交快照计时无效时读取报错。若在两个保存点之间失败，被丢弃的工作要重新执行。每次 worker 尝试的实测时长另计入调度历史和 run 的尝试摘要，因此排查重试开销应看尝试历史。[批次计时](src/expman/scheduling/batch.py) · [尝试收尾](src/expman/scheduling/scheduler.py)
+批次墙钟时间剔除停机间隔，按 `timing_save_interval` 定期保存。阶段 checkpoint 和完成快照都要求保存有限、非负的累计执行秒数。断点计时缺失或无效时会告警并从阶段开头重跑。已提交快照计时无效时读取报错。若在两个保存点之间失败，被丢弃的工作要重新执行。每次 worker 尝试的实测时长另计入调度历史和 run 的尝试摘要，因此排查重试开销应看尝试历史。[批次计时](src/expman/scheduling/batch.py) · [尝试收尾](src/expman/scheduling/scheduler.py)
 
 ## 调度器如何使用 GPU 和主机内存
 
@@ -88,7 +90,7 @@ flowchart LR
 | 调度时的问题 | 对应源码 |
 |---|---|
 | 有哪些等价的工作可以复用？哪个阶段是候选？ | `StageWork` 按截至当前阶段的配置依赖和 seed 分组，根据历史为候选估计耗时、主机内存和显存。[阶段工作量](src/expman/scheduling/_stages.py) |
-| 现在还能放多少作业？ | 主进程读取 `/proc/meminfo` 和 NVIDIA 设备读数，扣除主机保留量及活跃 worker 尚未使用的预算。冷启动时主机和 GPU 的峰值估计均为 1 GiB。资源不足时暂缓派发，压力持续时按规则减载。[设备采样](src/expman/resources/devices.py) · [容量计算](src/expman/scheduling/_resource.py) |
+| 现在还能放多少作业？ | 主进程读取 `/proc/meminfo` 和 NVIDIA 设备读数，扣除主机保留量及活跃 worker 尚未使用的预算。冷启动时采用配置中的主机和 GPU 初始峰值预算，默认均为 1 GiB。资源不足时暂缓派发，压力持续时按规则减载。[设备采样](src/expman/resources/devices.py) · [容量计算](src/expman/scheduling/_resource.py) |
 | 哪些作业放在哪张卡？ | `pack_candidates` 在每轮保留一组可行排布，根据剩余主机内存和各卡相对容量打分。准入消耗估计峰值。单个 worker 的主机或 GPU 硬上限另留余量。主机 cgroup 不能核验时可回退到进程用量采样，展示中会区分预算和已核验上限。[装箱逻辑](src/expman/scheduling/_planning.py) |
 | worker 报了什么？下一步如何处理？ | Worker 封装进程、IPC 消息和资源读数。普通失败按该 Stage 的重试预算处理。CUDA OOM 或主机限额终止用作需求下界，下一次重新估价。调度退出时回收 worker 进程组。[Worker](src/expman/scheduling/_process.py) · [调度循环](src/expman/scheduling/scheduler.py) |
 
@@ -98,7 +100,7 @@ ETA 同样按剩余的**阶段组**估算。耗时模型根据配置距离给成
 
 CLI 和 Web 看板共用所选批次父目录下的 `.batches.sqlite3`，默认位置是 `./batches/.batches.sqlite3`。每个父目录独立分配批次 ID，每次选择登记表中最小的空闲非负整数。手动移除批次目录后，登记表仍保留该 ID。`expman delete ID` 在清除批次文件后释放登记记录，运行中的批次受执行锁保护。[批次登记](src/expman/observation/registry.py)
 
-`expman status` 每两秒枚举一次当前父目录中的批次。`expman status ID` 通过登记表定位该批次，每两秒重读其运行记录并刷新详情。两种视图都由 Ctrl+C 退出。`resume` 和 `stop` 使用同一登记表定位批次。[命令入口](src/expman/cli.py)
+`expman status` 定期枚举当前父目录中的批次。`expman status ID` 通过登记表定位该批次，重读其运行记录并刷新详情。两种视图按 `status_interval` 刷新，默认为两秒。按 Ctrl+C 退出查看。`resume` 和 `stop` 使用同一登记表定位批次。[命令入口](src/expman/cli.py)
 
 `expman status` 与归档页面从批次文件重建状态。实验主进程另有旁路线程，把在锁内读到的调度状态和阶段完成组数整理为实时快照并原子写入 `live.json`，写入失败不会中断实验。`expman web` 在独立进程内通过 HTTP 和 SSE 提供这些数据。读取端在批次停止管道可连接且快照足够新鲜时标为实时。历史快照早于最新批次清单或快照不可用时，从持久化记录重建。页面查询不会触发训练或资源调度。[归档读取](src/expman/observation/status.py) · [快照构建](src/expman/observation/snapshot.py) · [来源判定](src/expman/observation/archive.py) · [Web 服务](src/expman/webui/server.py)
 

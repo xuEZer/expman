@@ -15,16 +15,7 @@ from dataclasses import dataclass, field
 from math import ceil, isfinite
 
 from expman.estimation.time_model import Encoding, variable_distance
-
-# Empirical percentile of nearby Stage samples used for admission. It is high
-# because the reserve has to bound the next attempt, not describe the average one.
-PEAK_QUANTILE = 0.9
-# A run stopped by its host or GPU cap receives a retry floor above the peak
-# it was seen to reach; the cap is recomputed from the raised estimate.
-PEAK_BUMP_MARGIN = 1.5
-
-LOCAL_MIN_SAMPLES = 4
-LOCAL_NEIGHBORS = 8
+from expman.settings import settings
 
 
 @dataclass
@@ -41,8 +32,8 @@ class LocalQuantileEstimator:
     encoding: Encoding
     indices: dict
     default: float
-    quantile: float = PEAK_QUANTILE
-    margin: float = PEAK_BUMP_MARGIN
+    quantile: float = field(default_factory=lambda: settings.peak_quantile)
+    margin: float = field(default_factory=lambda: settings.peak_bump_margin)
     include_zero: bool = False
     observations: list[tuple[int, float]] = field(default_factory=list)
     floors: dict = field(default_factory=dict)
@@ -66,12 +57,12 @@ class LocalQuantileEstimator:
         return variable_distance(self.encoding, rows[left], rows[right])
 
     def _nearby(self, row):
-        if len(self.observations) < LOCAL_MIN_SAMPLES:
+        if len(self.observations) < settings.local_min_samples:
             return [value for _, value in self.observations]
         closest = sorted(
             self.observations,
             key=lambda item: self._distance(row, item[0]),
-        )[:LOCAL_NEIGHBORS]
+        )[: settings.local_neighbors]
         return [value for _, value in closest]
 
     def estimate(self, run_id):
@@ -105,6 +96,8 @@ class PeakCeiling:
         if not isinstance(peak, (int, float)) or not isfinite(peak) or peak <= 0:
             return
         adjusted = (
-            float(peak) * PEAK_BUMP_MARGIN if entry.get("capped") else float(peak)
+            float(peak) * settings.peak_bump_margin
+            if entry.get("capped")
+            else float(peak)
         )
         self.ceiling_kb = max(self.ceiling_kb, adjusted)

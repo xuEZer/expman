@@ -23,6 +23,8 @@ from expman.resources.limits import (
     usage,
 )
 from expman.scheduling.ipc import worker_channel
+from expman.settings import set as configure
+from expman.settings import settings
 from expman.storage.base import PickleSerializer, read_record, run_lock
 
 PROC_STATUS = Path("/proc/self/status")
@@ -56,7 +58,7 @@ def _own_usage():
     return values["VmRSS"], values["VmHWM"]
 
 
-def _resource_snapshot(directory):
+def _resource_snapshot(directory, query_timeout=None):
     unit = os.environ.get("EXPMAN_CGROUP_UNIT")
     directory = attempt_cgroup(directory, unit)
     host = None if directory is None else usage(directory)
@@ -83,7 +85,9 @@ def _resource_snapshot(directory):
         diagnostic = "kernel memory limit is missing, unlimited, or exceeds the request"
     return {
         "timestamp": monotonic(),
-        "gpu_used_kb": gpu_memory.sample(os.environ["CUDA_VISIBLE_DEVICES"])
+        "gpu_used_kb": gpu_memory.sample(
+            os.environ["CUDA_VISIBLE_DEVICES"], timeout=query_timeout
+        )
         if "CUDA_MPS_PINNED_DEVICE_MEM_LIMIT" in os.environ
         else None,
         "host_current_kb": None if host is None else host[0],
@@ -109,14 +113,14 @@ def _resource_cgroup():
     return actual
 
 
-def _report_resources(channel, stop, interval):
+def _report_resources(channel, stop, interval, query_timeout):
     last_diagnostic = None
 
     def report():
         nonlocal last_diagnostic
         # systemd placement may not be ready at process creation; retry discovery
         # on every tick instead of freezing a missing/shared group forever.
-        snapshot = _resource_snapshot(_resource_cgroup())
+        snapshot = _resource_snapshot(_resource_cgroup(), query_timeout)
         diagnostic = snapshot["host_usage_error"]
         if diagnostic and diagnostic != last_diagnostic:
             print(
@@ -150,6 +154,8 @@ def main():
     threading.Thread(target=_watch_parent, daemon=True).start()
     root = Path(sys.argv[1])
     channel = worker_channel(os.environ["EXPMAN_IPC_FD"])
+    metadata = read_record(root / "bootstrap.pkl", PickleSerializer())
+    configure(**metadata["settings"])
     try:
         server_pid = mps.verify_client()
     except Exception as error:
@@ -166,11 +172,15 @@ def main():
     resource_stopped = threading.Event()
     resource_thread = threading.Thread(
         target=_report_resources,
-        args=(channel, resource_stopped, float(os.environ["EXPMAN_POLL_INTERVAL"])),
+        args=(
+            channel,
+            resource_stopped,
+            settings.poll_interval,
+            settings.query_timeout,
+        ),
         daemon=True,
     )
     resource_thread.start()
-    metadata = read_record(root / "bootstrap.pkl", PickleSerializer())
     sys.path[:] = metadata["sys_path"]
     script = metadata["main_script"]
     if script is not None:
@@ -184,6 +194,8 @@ def main():
                     value.__module__ = "__main__"
         sys.modules["__main__"] = module
     payload = read_record(root / "input.pkl", PickleSerializer())
+    # Unpickling imports the user's pipeline module and can re-run its defaults.
+    configure(**metadata["settings"])
     experiment = Experiment(
         payload["pipeline"],
         payload["cfg"],

@@ -4,6 +4,7 @@ import pytest
 from batch_helpers import make_batch
 
 from expman import Pipeline, Stage, environment
+from expman.settings import settings
 
 
 @pytest.fixture(autouse=True)
@@ -23,9 +24,9 @@ def test_overlay_sets_the_thread_ceiling_and_the_mirror():
 
     assert set(values) == {*environment.THREAD_VARIABLES, "HF_ENDPOINT"}
     assert {values[name] for name in environment.THREAD_VARIABLES} == {
-        str(environment.WORKER_THREADS)
+        str(settings.worker_threads)
     }
-    assert values["HF_ENDPOINT"] == environment.HF_MIRROR
+    assert values["HF_ENDPOINT"] == settings.hf_mirror
 
 
 def test_an_exported_value_wins(monkeypatch):
@@ -51,7 +52,7 @@ def test_overrides_replace_the_defaults(monkeypatch):
     assert "HF_ENDPOINT" not in environment.overlay()
 
     monkeypatch.setenv(environment.MIRROR_OVERRIDE, "cn")
-    assert environment.overlay()["HF_ENDPOINT"] == environment.HF_MIRROR
+    assert environment.overlay()["HF_ENDPOINT"] == settings.hf_mirror
 
     monkeypatch.setenv(environment.MIRROR_OVERRIDE, "hf-mirror.com")
     assert environment.overlay()["HF_ENDPOINT"] == "https://hf-mirror.com"
@@ -72,8 +73,8 @@ def test_blank_overrides_are_not_overrides(monkeypatch, value):
     monkeypatch.setenv(environment.THREADS_OVERRIDE, value)
     monkeypatch.setenv(environment.MIRROR_OVERRIDE, value)
 
-    assert environment.thread_budget() == environment.WORKER_THREADS
-    assert environment.hf_endpoint() == environment.HF_MIRROR
+    assert environment.thread_budget() == settings.worker_threads
+    assert environment.hf_endpoint() == settings.hf_mirror
 
 
 def test_a_bad_override_fails_before_the_batch_directory_exists(tmp_path, monkeypatch):

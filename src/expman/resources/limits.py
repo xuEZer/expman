@@ -13,7 +13,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-import expman.resources.devices as devices
+from expman.settings import settings
 
 PROC_ROOT = Path("/proc")
 SYSTEMD_RUN = "systemd-run"
@@ -39,8 +39,8 @@ class MemoryLimit:
 
 
 def cap_kb(estimate_kb) -> float:
-    """Cgroup limit for one worker: estimate plus room, never below the floor."""
-    return max(devices.CAPACITY_FLOOR_KB, estimate_kb * devices.CAPACITY_FACTOR)
+    """Apply the configured headroom factor and floor to a host or GPU estimate."""
+    return max(settings.capacity_floor_kb, estimate_kb * settings.capacity_factor)
 
 
 def _unescape(value: str) -> str:
@@ -290,4 +290,4 @@ def refused(counts: dict[str, float]) -> bool:
 
 def near_cap(peak_kb: float, limit_kb: float) -> bool:
     """Whether an observed peak came close enough to its limit to have hit it."""
-    return limit_kb > 0 and peak_kb >= limit_kb * devices.CAPACITY_NEAR
+    return limit_kb > 0 and peak_kb >= limit_kb * settings.capacity_near

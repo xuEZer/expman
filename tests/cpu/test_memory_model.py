@@ -1,9 +1,9 @@
 from expman.estimation.memory_model import (
-    LOCAL_NEIGHBORS,
     LocalQuantileEstimator,
     PeakCeiling,
 )
 from expman.estimation.time_model import Encoding, encode, variable_distance
+from expman.settings import settings
 
 
 def rows(values):
@@ -66,7 +66,7 @@ def test_the_peak_model_draws_neighbours_in_the_shared_configuration_distance():
             key=lambda item: variable_distance(
                 encoding, encoding.rows[query], encoding.rows[indices[item[0]]]
             ),
-        )[:LOCAL_NEIGHBORS]
+        )[: settings.local_neighbors]
     )
 
     assert sorted(estimator._nearby(query)) == nearest

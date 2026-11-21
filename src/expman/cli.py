@@ -1,15 +1,16 @@
 """Command-line interface: run, resume, inspect, stop and delete experiment Batches.
 
-The pipeline is located as ``module:attr`` or by an attribute of the default
-``pipeline`` module. The Batch manifest records that location for
+The CLI resolves a bare pipeline name in the configured ``pipeline_module``
+(built-in default ``pipeline``) or accepts an explicit ``module:attr``.
+The batch manifest records the resolved ``module:attr`` for
 ``expman resume``. Each batches directory (default ``./batches/``) has its own
 integer IDs recorded in ``.batches.sqlite3``. ``expman status`` refreshes the
 directory overview or the selected batch's details until Ctrl+C. An ID also
 selects a batch for ``stop``, ``resume`` or ``delete``. ``expman web`` serves a
 dashboard over the same IDs from its own process, independent of any batch
-it watches. Retry counts and interval coverage are process-wide settings
-configured in code with ``expman.set(...)`` next to the Pipeline, not
-command-line flags.
+it watches. The CLI reads project defaults from ``[tool.expman]`` in the nearest
+``pyproject.toml`` at or above the working directory. The pipeline module can
+override settings when it is imported.
 """
 
 import argparse
@@ -24,22 +25,20 @@ from expman.config import load_configs
 from expman.core.events import Status
 from expman.core.pipeline import Pipeline
 from expman.estimation.estimate import _clock as _fmt_elapsed
-from expman.observation.registry import BATCHES_DIR, delete_batch, ensure_ids
+from expman.observation.registry import delete_batch, ensure_ids
 from expman.observation.status import RecordedBatch
 from expman.process_control import request_stop
 from expman.scheduling.batch import _Batch
+from expman.settings import Defaults, project_settings, settings
 from expman.storage.batch import BatchStore
-from expman.webui.server import DEFAULT_HOST, DEFAULT_PORT, serve
-
-_STATUS_INTERVAL = 2.0
-DEFAULT_PIPELINE_MODULE = "pipeline"
+from expman.webui.server import serve
 
 
-def _resolve_pipeline(spec: str) -> Pipeline:
-    """Import a pipeline by attribute name or by an explicit module:attr."""
+def _resolve_pipeline(spec: str, default_module: str) -> tuple[str, Pipeline]:
+    """Import the pipeline and return its fully qualified location."""
     module_name, separator, attr_name = spec.rpartition(":")
     if not separator:
-        module_name = DEFAULT_PIPELINE_MODULE
+        module_name = default_module
     if not module_name or not attr_name or Path(attr_name).name != attr_name:
         raise SystemExit(
             f"pipeline must look like 'attr' or 'module:attr', got {spec!r}"
@@ -60,13 +59,17 @@ def _resolve_pipeline(spec: str) -> Pipeline:
         ) from None
     if not isinstance(attribute, Pipeline):
         raise SystemExit(f"{spec!r} must be a Pipeline; got {type(attribute).__name__}")
-    return attribute
+    return f"{module_name}:{attr_name}", attribute
 
 
-def _command_hint(command: str, batches_dir: Path, *arguments: str) -> str:
+def _command_hint(
+    command: str, batches_dir: Path, *arguments: str, default_dir: Path | None = None
+) -> str:
     words = ["expman", command, *arguments]
-    if batches_dir.resolve() != BATCHES_DIR.resolve():
-        words.extend(["--batches-dir", str(batches_dir.resolve())])
+    directory = batches_dir.resolve()
+    default = settings.batches_dir if default_dir is None else default_dir
+    if directory != Defaults().batches_dir.resolve() or directory != default.resolve():
+        words.extend(["--batches-dir", str(directory)])
     return shlex.join(words)
 
 
@@ -84,14 +87,16 @@ def _timing(report: RecordedBatch) -> tuple[str, str]:
     return elapsed, remaining
 
 
-def _execute(batch: _Batch, *, batch_id: int) -> int:
+def _execute(batch: _Batch, *, batch_id: int, default_dir: Path) -> int:
     """Run the batch; a stop signal maps to a resume hint and exit 143."""
     print(f"Batch ID: {batch_id}\nBatch directory: {batch.output_dir}", flush=True)
 
     try:
         results = batch.run()
     except KeyboardInterrupt:
-        resume_command = _command_hint("resume", batch.output_dir.parent, str(batch_id))
+        resume_command = _command_hint(
+            "resume", batch.output_dir.parent, str(batch_id), default_dir=default_dir
+        )
         print(f"Stopped; resume with: {resume_command}", file=sys.stderr)
         return 143
     for result in results:
@@ -101,29 +106,35 @@ def _execute(batch: _Batch, *, batch_id: int) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    pipeline = _resolve_pipeline(args.pipeline)
-    attr = args.pipeline.rpartition(":")[2]
+    default_dir = settings.batches_dir.resolve()
+    spec, pipeline = _resolve_pipeline(args.pipeline, settings.pipeline_module)
+    attr = spec.rpartition(":")[2]
     stem = Path(args.config).stem
     timestamp = strftime("%Y%m%d%H%M%S")
-    directory = args.batches_dir / f"{attr}_{stem}_{timestamp}"
+    parent = args.batches_dir if args.batches_dir is not None else settings.batches_dir
+    directory = parent / f"{attr}_{stem}_{timestamp}"
     batch = _Batch.create(
         pipeline,
         load_configs(args.config),
         output_dir=directory,
-        pipeline_spec=args.pipeline,
+        pipeline_spec=spec,
     )
     ids = ensure_ids(batch.output_dir.parent)
     batch_id = next(i for i, path in ids.items() if path == batch.output_dir)
-    return _execute(batch, batch_id=batch_id)
+    return _execute(batch, batch_id=batch_id, default_dir=default_dir)
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
+    default_dir = settings.batches_dir.resolve()
     directory = _batch_directory(args.batches_dir, args.ID)
     store = BatchStore(directory)
     manifest = store.read_resumable_manifest()
-    pipeline = _resolve_pipeline(manifest["pipeline_spec"])
+    # A short name in an existing manifest was recorded against the built-in module.
+    _, pipeline = _resolve_pipeline(
+        manifest["pipeline_spec"], Defaults().pipeline_module
+    )
     batch = _Batch.resume(pipeline, store, manifest)
-    return _execute(batch, batch_id=args.ID)
+    return _execute(batch, batch_id=args.ID, default_dir=default_dir)
 
 
 def _print_detail(directory: Path, batch_id: int) -> None:
@@ -179,6 +190,7 @@ def _print_overview(batches_dir: Path) -> None:
 
 def _cmd_status(args: argparse.Namespace) -> int:
     """Refresh the overview or a single batch's records until Ctrl+C."""
+    interval = settings.status_interval
     try:
         if args.ID is None:
             print_frame = partial(_print_overview, args.batches_dir)
@@ -188,10 +200,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
         while True:
             print("\033[2J\033[H", end="")
             print_frame()
-            print(
-                f"Refreshing every {_STATUS_INTERVAL:g}s; Ctrl+C to exit.", flush=True
-            )
-            sleep(_STATUS_INTERVAL)
+            print(f"Refreshing every {interval:g}s; Ctrl+C to exit.", flush=True)
+            sleep(interval)
     except KeyboardInterrupt:
         pass
     return 0
@@ -235,7 +245,7 @@ def _parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="create and run a new Batch")
     run.add_argument(
         "pipeline",
-        help=f"pipeline attribute or 'module:attr' (default module: {DEFAULT_PIPELINE_MODULE})",
+        help=f"pipeline attribute or 'module:attr' (default module: {settings.pipeline_module})",
     )
     run.add_argument("config", help="experiment YAML path")
     resume = commands.add_parser("resume", help="continue a stopped Batch")
@@ -250,12 +260,12 @@ def _parser() -> argparse.ArgumentParser:
     web.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_PORT,
-        help="dashboard port (default: 8765; 0 picks a free one)",
+        default=settings.web_port,
+        help="dashboard port (default: %(default)s; 0 picks a free one)",
     )
     web.add_argument(
         "--host",
-        default=DEFAULT_HOST,
+        default=settings.web_host,
         help="dashboard bind address (default: %(default)s)",
     )
     web.set_defaults(handler=_cmd_web)
@@ -286,14 +296,16 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--batches-dir",
             type=Path,
-            default=BATCHES_DIR,
+            # A run imports the pipeline before choosing its default directory.
+            default=None if command is run else settings.batches_dir,
             metavar="DIR",
-            help="parent directory holding the batches (default: %(default)s)",
+            help=f"parent directory holding the batches (default: {settings.batches_dir})",
         )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     """Console entry point; the return value is the process exit status."""
-    args = _parser().parse_args(argv)
-    return args.handler(args)
+    with project_settings():
+        args = _parser().parse_args(argv)
+        return args.handler(args)

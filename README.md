@@ -275,16 +275,12 @@ summary = Pipeline([ModelSummary])
 
 ## 命令行
 
-在当前目录的 `pipeline.py` 中定义 `train` 后，命令行中的 `train` 等同于 `pipeline:train`。流程定义在其他模块时，写成 `module:attr`，例如 `mypkg.pipelines:train`。
+使用内置默认值时，`expman run train experiments.yaml` 从当前目录的 `pipeline.py` 导入 `train`。流程定义在其他模块时，写成 `module:attr`，例如 `mypkg.pipelines:train`。
 
 ```python
 # pipeline.py
-import expman
 from expman import Pipeline
 from mypkg.stages import LoadData, Train, Eval
-
-# 进程级默认值在这里配置，命令行没有对应旗标
-expman.set(retries=3, coverage=0.9)
 
 train = Pipeline([LoadData, Train, Eval])
 ```
@@ -311,20 +307,46 @@ expman resume 0
 
 - 所有子命令都用 `--batches-dir` 选择批次父目录，默认为 `./batches/`。`run` 的子目录名为 `<pipeline-attr>_<config-stem>_<YYYYMMDDHHMMSS>`，依次使用流程属性名、去掉最后一个扩展名的配置文件名和精确到秒的本地时间。同一父目录中若已存在该名称，命令会报错退出。
 - CLI 和看板共用批次父目录中的 `.batches.sqlite3` 登记表。同时发现多个新批次时，按目录修改时间先后登记，时间相同则按目录名排序。每次取该表中最小的空闲非负整数 ID。例如，删除 `[0, 1, 2]` 中的批次 `1` 后，原批次 `2` 保留编号，下一个新批次得到 `1`。
-- `expman status --batches-dir results` 显示 `results/` 下所有批次的总览。`expman status 0 --batches-dir results` 显示批次 0 中每个 run 的状态、阶段和尝试记录。两种视图每两秒刷新一次，批次结束后也会继续刷新。在运行 `status` 的终端按 Ctrl+C 只会退出查看。若批次清单无法读取，命令报错并结束刷新。
+- `expman status --batches-dir results` 显示 `results/` 下所有批次的总览。`expman status 0 --batches-dir results` 显示批次 0 中每个 run 的状态、阶段和尝试记录。两种视图默认每两秒刷新一次，批次结束后也会继续刷新。在运行 `status` 的终端按 Ctrl+C 只会退出查看。若批次清单无法读取，命令报错并结束刷新。
 - `stop` 和 `resume` 都要求提供批次 ID。在自定义目录中操作时使用同一父目录，例如 `expman stop 0 --batches-dir results`、`expman resume 0 --batches-dir results`。
 - `expman delete 1` 删除批次 `1` 的整个目录（含运行结果和检查点）及其 ID 登记记录。自定义父目录时可用 `expman delete 1 --batches-dir results`。运行中的批次须先用 `stop` 请求停止，等运行进程退出后再删除。手动移走批次目录后，登记表仍保留该 ID，直到用 `delete` 清除记录。
-- 在流程模块里调用 `expman.set(retries=..., coverage=...)` 可设置新批次的默认值。`retries` 是每个 run 的每个顶层阶段普通失败后可额外重试的次数，默认为 1。`coverage` 是单阶段耗时区间的名义覆盖率，默认为 0.8。恢复时沿用批次清单里保存的设置。
 - `run` 和 `resume` 持有批次执行锁时会打开 `stop.fifo`。同一系统用户运行的 CLI 或看板可通过它探测批次是否仍在运行。向管道写入停止请求后，Linux 内核向持有读端的批次进程发送 SIGTERM。
 - `run` 和 `resume` 启动时打印批次 ID 和目录，执行结束后打印每个 run 的最终状态。批次全部成功时退出码为 0，有 run 最终失败时为 1，收到停止请求并中断时为 143。
-- `expman web` 启动独立看板。可用 `--host` 指定绑定地址（默认仅回环），用 `--port` 指定端口（默认 `8765`，`0` 由系统分配，指定端口被占时最多尝试连续 10 个端口）。详见[运行看板](#运行看板)。
+- `expman web` 启动独立看板。可用 `--host` 指定绑定地址（默认仅回环），用 `--port` 指定端口（默认 `8765`，`0` 由系统分配，端口被占时默认最多尝试连续 10 个端口）。详见[运行看板](#运行看板)。
+
+## 全局设置
+
+要让 `run`、`status` 和 `web` 等独立命令各自在启动时读到同一份设置，可以在项目的 `pyproject.toml` 中写入需要覆盖的键。
+
+```toml
+[tool.expman]
+batches_dir = "results"
+web_port = 8899
+status_interval = 1.0
+worker_threads = 8
+```
+
+CLI 启动时会从当前工作目录向上查找，读取遇到的第一个 `pyproject.toml`。文件中未填写的键保留程序默认值。上例中，从同一目录执行 `expman run train experiments.yaml` 和 `expman status` 都会使用 `results/`，`expman web` 会从端口 8899 开始监听。显式参数优先，例如 `expman web --port 9000` 会从 9000 开始尝试。和 `--batches-dir` 一样，配置中的相对路径以命令的工作目录为基准。
+
+CLI 使用 `pipeline_module` 查找流程时，流程模块尚未导入。要修改 `expman run train …` 的默认模块，在 `[tool.expman]` 中设置 `pipeline_module`。流程模块导入后，可以用 `expman.set()` 覆盖本次运行的设置，再用 `expman.get()` 查询进程内的值。
+
+```python
+import expman
+
+expman.set(retries=2, coverage=0.9)
+assert expman.get("retries") == 2
+```
+
+`retries` 是每个 run 的每个顶层阶段普通失败后允许的额外重试次数。`coverage` 是单阶段耗时区间的名义覆盖率。`run` 把两者写入批次清单，`resume` 沿用保存值。调度轮询、资源预留和 worker 环境等设置在本次运行或恢复时生效，新启动的 worker 会收到父进程的设置。独立的 `web`、`status` 进程各自读取项目配置。它们需要共用的键适合放在 TOML 中。
+
+所有受支持的键及内置默认值集中在同一文件。资源键名中的 `kb` 表示 KiB，刷新间隔和超时使用秒。[全局设置定义](src/expman/settings.py)
 
 ## 运行看板
 
 看板在**独立进程**中扫描所选父目录（默认 `./batches/`），显示运行中和已结束的批次。实验和看板可以分别启动或停止。
 
 ```bash
-# 在项目根目录启动看板，默认 127.0.0.1:8765（从指定端口起最多尝试 10 个端口）
+# 在项目根目录启动看板，内置默认地址为 127.0.0.1:8765
 expman web
 
 # 指定端口与绑定地址（0 由系统分配；默认仅回环）
@@ -338,7 +360,7 @@ expman web --batches-dir results
 
 | 情形 | 判定 | 显示 |
 | --- | --- | --- |
-| 实时 | 批次停止管道可连接，快照时间与当前时间相差不超过 3 秒 | 实时指标：调度、进度、逐卡「分配 vs 实际」、事件流 |
+| 实时 | 批次停止管道可连接，快照时间与当前时间相差不超过 `live_stale_seconds`（默认 3 秒） | 实时指标：调度、进度、逐卡「分配 vs 实际」、事件流 |
 | 最后读数 | 快照可读但未达到实时条件，且没有更新的可读批次清单 | 展示最近一次成功发布的读数，并标记数据来源 |
 | 归档 | 没有可用快照，或最后读数之后有更新的可读批次清单 | 从 `batch.pkl` 重建历史状态，耗时和 ETA 取自可用的 `timing.pkl` |
 | 记录不可读 | 既无可用快照，也无法读取批次清单 | 显示批次名称，实时面板为空 |
@@ -361,19 +383,19 @@ expman web --batches-dir results
 - **数据来源**：`batch.pkl`（Run 清单、状态、累计耗时）＋ 每个 Run 的 `config.pkl`（自变量）＋ `metrics.sqlite3`（`ctx.log_metrics` 记录的标量指标）。读不到配置的 Run 记为「跳过」并给出原因，不中断整体分析。
 - **局部结果**：失败与未跑完的 Run 不参与统计但计入覆盖度（页面显示「Run N / M」）；每个指标各自计 `n`，缺该指标的 Run 按 pairwise 跳过并计入「缺失」。
 - **逐对分析**：数值型配置项（≥3 个不同取值）报告 Spearman 秩相关 ρ，其绝对值即影响力度量；其余配置项按取值分组，报告每组均值/样本数、均值最高的取值，以及组间变异占指标总变异的比例（η²）。
-- **跳过规则**：所有 Run 取值相同的常量项在页首列出一次、不参与比较；有效样本不足（<3）的配置项只计数不展示；每个取值只有一个样本时只列各组均值、不算影响力。
+- **跳过规则**：所有 Run 取值相同的常量项在页首列出一次、不参与比较；每个“配置项与指标”组合至少需要 `min_numeric_points` 个配对样本（默认 3 个），按取值分组时还需达到 `min_groups` 组（默认 2 组）。不足的组合只计数。每组都只有一个样本时只列各组均值。
 - **结果排序**：指标卡片按最大影响力排序，卡片内配置项也按影响力排序，直接回答「哪个配置项最影响这个指标」。
 
-耗时以 `run_duration_seconds` 参与分析，汇总多次尝试。与它重名的业务指标，以及多个阶段记录的同名指标，用阶段路径区分。含点的字面键用引号区分，例如 `"train.loss"` 与嵌套的 `train.loss`。分析由 `GET /api/analysis/<id>` 提供，服务按批次目录和输入文件的指纹复用分析结果。点「重新分析」会重新请求，指纹变化时服务重新计算。这些都是对观测数据的描述（相关与分组差异），不是因果结论。
+耗时以 `run_duration_seconds` 参与分析，汇总多次尝试。与它重名的业务指标，以及多个阶段记录的同名指标，用阶段路径区分。含点的字面键用引号区分，例如 `"train.loss"` 与嵌套的 `train.loss`。分析由 `GET /api/analysis/<id>` 提供，服务按批次目录、输入文件指纹和两项分析阈值复用结果。点「重新分析」会重新请求，输入或阈值变化时服务重新计算。这些都是对观测数据的描述（相关与分组差异），不是因果结论。
 
 ## 工作进程环境
 
 调度器为每个新 worker 准备环境变量，再启动独立解释器。
 
-- **线程池**。默认将 OpenMP、MKL、OpenBLAS 等受支持线程池的环境变量设为 4。实际线程数由各库决定。
-- **HF 镜像**：`HF_ENDPOINT` 未设置时指向 `https://hf-mirror.com`，模型下载不依赖到 huggingface.co 的直连。
+- **线程池**。用 `worker_threads` 设置 OpenMP、MKL、OpenBLAS 等受支持线程池的环境变量，默认为 4。实际线程数由各库决定。
+- **HF 镜像**。默认端点由 `hf_mirror` 设置，初始值为 `https://hf-mirror.com`。
 
-shell 已导出的设置优先。设置任一受支持的线程池变量（如 `OMP_NUM_THREADS` 或 `VECLIB_MAXIMUM_THREADS`），框架便保留整组线程设置。已有 `HF_ENDPOINT` 也会保留。以下变量可以调整默认行为。
+shell 已导出的设置优先。设置任一受支持的线程池变量（如 `OMP_NUM_THREADS` 或 `VECLIB_MAXIMUM_THREADS`），框架便保留整组线程设置。已有 `HF_ENDPOINT` 也会保留。还可以用以下环境变量针对单次启动覆盖 expman 的对应设置。
 
 ```bash
 EXPMAN_THREADS=8 expman run mypkg.pipelines:train experiments.yaml   # 改上限
@@ -456,14 +478,14 @@ with sqlite3.connect("file:metrics.sqlite3?mode=ro", uri=True) as db:
 
 ## 耗时与剩余时间
 
-运行期间可在另一终端用 `expman status ID` 查看该批次的耗时与剩余时间。时间采用 `DD:HH:MM`，例如 `00:00:35` 表示 35 分钟。批次累计运行时间跨 resume 延续，两次运行之间的停机时间排除在外。批次约每 5 秒保存累计时间与当前可用的 ETA，正常收尾时也会保存。进程意外退出时，以最近一次成功写入的记录为准。
+运行期间可在另一终端用 `expman status ID` 查看该批次的耗时与剩余时间。时间采用 `DD:HH:MM`，例如 `00:00:35` 表示 35 分钟。批次累计运行时间跨 resume 延续，两次运行之间的停机时间排除在外。批次按 `timing_save_interval`（默认 5 秒）保存累计时间与当前可用的 ETA，正常收尾时也会保存。进程意外退出时，以最近一次成功写入的记录为准。
 
 例如，在流程模块中调用 `expman.set(coverage=0.95)`，新建批次就按 95% 的名义覆盖率校准单阶段耗时区间。覆盖率须大于 0 且小于 1。模型用配置距离加权的历史对数耗时估计中心，用留一残差估计区间。取消的样本提供耗时下界。并行估计考虑阶段依赖和可用槽位，分别用各阶段的耗时下界、上界进行贪心排程。整批区间取两次排程完工时间中的较小值与较大值。缺少必要的耗时数据时显示问号，全部结束时显示零。[调度与估时的源码导读](DESIGN.md)
 
 ## GPU 派发与资源限制
 
 - `device` 是整批共用的物理 GPU 编号列表。调度器通过设备 UUID 为每个 worker 设置一张可见卡，业务代码可以使用 `cuda:0`。worker 在运行用户代码之前建立 CUDA 主上下文并核验 MPS 注册。只做 CPU 计算的 Stage 也会建立该上下文。
-- 调度器每轮采集主机可用内存与设备空闲显存，扣除主机预留量和已有 worker 尚未占用的预算，再选择可同时运行的任务。主机预留 1 GiB。没有相应峰值样本时，主机和显存的初始预算分别为 1 GiB。[资源默认值](src/expman/resources/devices.py)
+- 调度器每轮采集主机可用内存与设备空闲显存，扣除主机预留量和已有 worker 尚未占用的预算，再选择可同时运行的任务。主机默认预留 1 GiB。没有相应峰值样本时，主机和显存的初始预算分别由 `host_peak_kb_default` 和 `gpu_peak_kb_default` 决定，均默认为 1 GiB。[资源默认值](src/expman/settings.py)
 - worker 的资源上限在估计峰值上留有余量。显存上限通过 MPS 请求，主机内存上限取决于可用的 cgroup 机制。缺少独立 cgroup 读数时，worker 尝试读取自身的 RSS 和历史峰值。看板区分预算、实际采样和已核验的上限。
 - 调度器根据采样结果决定是否暂停派发或减载。被确认为资源限额导致的失败会重新估价并入队。每次尝试的标准输出和错误输出位于 `experiments/<run_id>/attempts/stage-<index>/<attempt>/output.log`。
 - worker 通过 pickle 接收 Pipeline。请在可导入的模块顶层定义 Stage 类，并把 Pipeline 实例赋给 `expman run` 指定的模块属性。worker 的标准输入用于检测父进程退出。

@@ -12,6 +12,7 @@ from pathlib import Path
 from uuid import UUID
 
 from expman.resources import devices, limits, mps
+from expman.settings import settings
 
 
 @dataclass(frozen=True)
@@ -24,12 +25,12 @@ class Card:
 
 def _output(command):
     return subprocess.check_output(
-        command, text=True, timeout=devices.QUERY_TIMEOUT
+        command, text=True, timeout=settings.query_timeout
     ).splitlines()
 
 
 def _rank_cards(rows, visible):
-    minimum_mib = limits.cap_kb(devices.GPU_PEAK_KB_DEFAULT) / 1024
+    minimum_mib = limits.cap_kb(settings.gpu_peak_kb_default) / 1024
     cards = []
     for row in rows:
         index, uuid, free, utilization = (field.strip() for field in row.split(","))
@@ -52,7 +53,7 @@ def reserve_card():
     if torch.version.cuda is None:
         raise RuntimeError("CUDA/MPS tests require PyTorch built with NVIDIA CUDA")
     if not devices.fits_reserve(
-        devices.MeminfoMonitor().sample(), devices.HOST_PEAK_KB_DEFAULT
+        devices.MeminfoMonitor().sample(), settings.host_peak_kb_default
     ):
         raise RuntimeError("not enough free host RAM for a test worker")
 

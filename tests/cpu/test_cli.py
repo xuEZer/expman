@@ -11,7 +11,7 @@ import pytest
 
 import expman
 from expman import cli
-from expman.cli import _resolve_pipeline, main
+from expman.cli import main
 from expman.observation.registry import ensure_ids
 from expman.process_control import STOP_FIFO, is_running, request_stop, stop_on_sigterm
 from expman.scheduling.batch import _Batch
@@ -60,7 +60,7 @@ SETTINGS_MODULE_NAME = "cli_pipeline_settings"
 SETTINGS_MODULE_SOURCE = """\
 import expman
 
-expman.set(retries=3, coverage=0.9)
+expman.set(retries=3, coverage=0.9, batches_dir="pipeline-batches")
 
 from expman import Pipeline, Stage
 
@@ -84,15 +84,6 @@ def pipeline_module(tmp_path, monkeypatch):
         yield MODULE_NAME
     finally:
         sys.modules.pop(MODULE_NAME, None)
-
-
-@pytest.fixture()
-def settings_restored():
-    """Keep the process-wide expman settings from leaking between tests."""
-    try:
-        yield
-    finally:
-        expman.set(retries=1, coverage=0.8)
 
 
 @pytest.fixture
@@ -164,8 +155,12 @@ def test_run_creates_a_named_batch_under_the_output_parent(
     assert ensure_ids(tmp_path / parent) == {0: directory}
 
 
+@pytest.mark.parametrize(
+    ("options", "parent"),
+    [([], "pipeline-batches"), (["--batches-dir", "explicit"], "explicit")],
+)
 def test_run_reads_settings_set_by_the_pipeline_module(
-    tmp_path, monkeypatch, settings_restored, prepare_batch_only
+    tmp_path, monkeypatch, prepare_batch_only, options, parent
 ):
     (tmp_path / f"{SETTINGS_MODULE_NAME}.py").write_text(SETTINGS_MODULE_SOURCE)
     monkeypatch.chdir(tmp_path)
@@ -177,20 +172,19 @@ def test_run_reads_settings_set_by_the_pipeline_module(
                     "run",
                     f"{SETTINGS_MODULE_NAME}:train",
                     str(write_config(tmp_path)),
-                    "--batches-dir",
-                    str(tmp_path),
+                    *options,
                 ]
             )
             == 0
         )
     finally:
         sys.modules.pop(SETTINGS_MODULE_NAME, None)
-    manifest = BatchStore(ensure_ids(tmp_path)[0]).read_manifest()
+    manifest = BatchStore(ensure_ids(tmp_path / parent)[0]).read_manifest()
     assert manifest["max_retries"] == 3
     assert manifest["estimate_coverage"] == 0.9
 
 
-def test_run_and_resume_from_default_pipeline_module(tmp_path):
+def test_resume_of_a_short_pipeline_location_uses_its_original_module(tmp_path):
     (tmp_path / "pipeline.py").write_text(
         "from expman import Pipeline\ntrain = Pipeline([])\n"
     )
@@ -198,9 +192,49 @@ def test_run_and_resume_from_default_pipeline_module(tmp_path):
     subprocess.run(
         [*cli, "run", "train", str(write_config(tmp_path))], cwd=tmp_path, check=True
     )
-    manifest = BatchStore(ensure_ids(tmp_path / "batches")[0]).read_manifest()
-    assert manifest["pipeline_spec"] == "train"
+    store = BatchStore(ensure_ids(tmp_path / "batches")[0])
+    manifest = store.read_manifest()
+    assert manifest["pipeline_spec"] == "pipeline:train"
+    manifest["pipeline_spec"] = "train"
+    store.save_manifest(manifest)
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.expman]\npipeline_module = "different"\n'
+    )
     subprocess.run([*cli, "resume", "0"], cwd=tmp_path, check=True)
+
+
+def test_project_defaults_apply_across_cli_processes_and_explicit_arguments_win(
+    tmp_path,
+):
+    config = write_config(tmp_path)
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[tool.expman]\npipeline_module = "workflows"\nbatches_dir = "project-batches"\n'
+        "web_port = 9301\n"
+    )
+    (tmp_path / "workflows.py").write_text(
+        "from expman import Pipeline\ntrain = Pipeline([])\n"
+    )
+    cli = [sys.executable, "-m", "expman"]
+    for options, parent in [
+        ([], "project-batches"),
+        (["--batches-dir", "custom"], "custom"),
+    ]:
+        subprocess.run(
+            [*cli, "run", "train", str(config), *options], cwd=tmp_path, check=True
+        )
+        store = BatchStore(ensure_ids(tmp_path / parent)[0])
+        assert store.read_manifest()["pipeline_spec"] == "workflows:train"
+    help_text = subprocess.check_output(
+        [*cli, "web", "--help"], cwd=tmp_path, text=True
+    )
+    assert "9301" in help_text
+
+    project.write_text(project.read_text().replace('"workflows"', '"different"'))
+    subprocess.run([*cli, "resume", "0"], cwd=tmp_path, check=True)
+    subprocess.run([*cli, "delete", "0"], cwd=tmp_path, check=True)
+    assert ensure_ids(tmp_path / "project-batches") == {}
+    assert 0 in ensure_ids(tmp_path / "custom")
 
 
 @pytest.mark.simulated_gpu
@@ -501,13 +535,13 @@ def test_an_old_stop_writer_cannot_interrupt_the_next_execution(tmp_path):
 def test_resolution_rejects_malformed_and_mistyped_specs(pipeline_module):
     for malformed in (":train", f"{pipeline_module}:"):
         with pytest.raises(SystemExit, match="module:attr"):
-            _resolve_pipeline(malformed)
+            main(["run", malformed, "unused.yaml"])
     with pytest.raises(SystemExit, match="could not import"):
-        _resolve_pipeline("no_such_pipeline_module_xyz:train")
+        main(["run", "no_such_pipeline_module_xyz:train", "unused.yaml"])
     with pytest.raises(SystemExit, match="defines no attribute"):
-        _resolve_pipeline(f"{pipeline_module}:missing_attr")
+        main(["run", f"{pipeline_module}:missing_attr", "unused.yaml"])
     with pytest.raises(SystemExit, match="must be a Pipeline"):
-        _resolve_pipeline(f"{pipeline_module}:not_a_pipeline")
+        main(["run", f"{pipeline_module}:not_a_pipeline", "unused.yaml"])
 
 
 def test_settings_validate_values():

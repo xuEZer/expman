@@ -7,7 +7,7 @@ import subprocess
 import sys
 import warnings
 from collections import deque
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from time import perf_counter, sleep, time
 
@@ -33,6 +33,7 @@ from expman.scheduling._resource import (
 )
 from expman.scheduling._stages import StageWork
 from expman.scheduling.ipc import Channel
+from expman.settings import settings
 from expman.storage.base import PickleSerializer, RecoveryWarning, write_record
 
 
@@ -124,7 +125,9 @@ class GpuScheduler:
         # ETA opens idle slots when this conservative host estimate fits.
         # Actual launches use each candidate's own per-Stage estimate.
         admits_next = _admits(
-            self.workers, host, max(self.peaks.ceiling_kb, devices.HOST_PEAK_KB_DEFAULT)
+            self.workers,
+            host,
+            max(self.peaks.ceiling_kb, settings.host_peak_kb_default),
         )
         with self.batch._state_lock:
             self.batch.live.host_memory = {
@@ -187,7 +190,7 @@ class GpuScheduler:
         # The attempt launched last is the one whose reservation this machine
         # has had least time to honour, and the cheapest to give back.
         self._shed(self._newest(device), kind, device)
-        self._relief_until = perf_counter() + devices.RELIEF_COOLDOWN
+        self._relief_until = perf_counter() + settings.relief_cooldown
 
     def _newest(self, device=None):
         """The attempt launched last, globally or on one card."""
@@ -433,6 +436,13 @@ class GpuScheduler:
                 {
                     "main_script": str(Path(script).resolve()) if script else None,
                     "sys_path": [str(Path(path).resolve()) for path in sys.path],
+                    "settings": asdict(
+                        replace(
+                            settings,
+                            retries=batch.max_retries,
+                            coverage=batch.estimate_coverage,
+                        )
+                    ),
                     # What the framework configured for this attempt, for
                     # diagnosis; the shell keeps the last word.
                     "environment": dict(self._environment),
@@ -484,7 +494,6 @@ class GpuScheduler:
             parent_socket, child_socket = socket.socketpair()
             parent_socket.setblocking(False)
             env["EXPMAN_IPC_FD"] = str(child_socket.fileno())
-            env["EXPMAN_POLL_INTERVAL"] = str(devices.POLL_INTERVAL)
             # The driver accepts whole MiB. Record the limit sent to MPS.
             cap_mib = max(1, int(candidate.gpu_cap_kb // 1024))
             applied_gpu_kb = cap_mib * 1024
@@ -639,7 +648,9 @@ class GpuScheduler:
                 "host_retry_floor_kb": host_retry_floor,
                 # Highest NVIDIA process-memory sample for this worker PID.
                 "gpu_process_peak_kb": worker.gpu_process_peak_kb,
-                "gpu_retry_floor_kb": (worker.gpu_cap_kb or devices.GPU_PEAK_KB_DEFAULT)
+                "gpu_retry_floor_kb": (
+                    worker.gpu_cap_kb or settings.gpu_peak_kb_default
+                )
                 if gpu_capped
                 else None,
                 "gpu_limit_kb": worker.gpu_cap_kb,
@@ -704,7 +715,7 @@ class GpuScheduler:
                         item.uuid for item in memory.values()
                     ):
                         self._launch_available(memory, host)
-                sleep(devices.POLL_INTERVAL)
+                sleep(settings.poll_interval)
             return self.batch.results
         except BaseException:
             # Kill every worker before doing any potentially slow IO or recovery work.
