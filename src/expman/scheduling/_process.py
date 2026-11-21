@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TypeGuard
 
-from expman.core.events import ProgressEvent, Status
+from expman.core.events import ExecutionEvent, ProgressEvent, Status
 from expman.core.experiment import Experiment, StageResult
 from expman.core.recorders import Recorder, record_event
 from expman.estimation.duration_model import StageDuration
@@ -60,6 +60,10 @@ class Worker:
     memory_events: dict = field(default_factory=dict)
     finished: StageResult | None = None
     progress: ProgressEvent | None = None
+    _stage_execution_id: str | None = None
+    _stage_progress: ProgressEvent | None = None
+    # Time of the last usable top-level report and seconds left at that report.
+    progress_forecast: tuple[float, float] | None = None
     dependencies: list | None = None
     reused: bool = False
     cap_hit: bool = False
@@ -78,14 +82,8 @@ class Worker:
             kind = message.get("type")
             if kind == "event":
                 event = message["event"]
-                if (
-                    isinstance(event, ProgressEvent)
-                    and event.run_id == self.experiment.run_id
-                    and event.attempt == self.stage_attempt
-                ):
-                    # The IPC channel identifies this attempt even when a nested
-                    # Pipeline uses a child-local stage_id. Preserve the event.
-                    self.progress = event
+                if isinstance(event, (ExecutionEvent, ProgressEvent)):
+                    self._observe_progress(event)
                 record_event(recorder, event)
             elif kind == "mps_ready":
                 self.mps_client = (message["server"], message["pid"])
@@ -108,6 +106,54 @@ class Worker:
                     dependencies if isinstance(dependencies, list) else None
                 )
                 self.reused = message.get("reused") is True
+
+    def _observe_progress(self, event: ExecutionEvent | ProgressEvent) -> None:
+        if (
+            event.run_id != self.experiment.run_id
+            or event.attempt != self.stage_attempt
+        ):
+            return
+        if isinstance(event, ExecutionEvent):
+            # This worker restores the prefix and executes one top-level Stage.
+            # Its start precedes any nested Stage that shares its numeric index.
+            if (
+                self._stage_execution_id is None
+                and event.kind == "stage"
+                and event.status == Status.RUNNING
+                and event.stage_id == self.stage_index
+                and not event.reused
+            ):
+                self._stage_execution_id = event.execution_id
+            return
+        self.progress = event
+        if (
+            self._stage_execution_id is None
+            or event.execution_id != self._stage_execution_id
+        ):
+            return
+        previous = self._stage_progress
+        forecast = None
+        if (
+            previous is not None
+            and event.total == previous.total
+            and event.unit == previous.unit
+        ):
+            seconds = (event.timestamp - previous.timestamp).total_seconds()
+            if seconds < 0 or event.completed == previous.completed:
+                return  # A heartbeat contributes neither new work nor a new baseline.
+            if (
+                seconds > 0
+                and event.total is not None
+                and previous.completed < event.completed < event.total
+            ):
+                with suppress(OverflowError):
+                    units_left = event.total - event.completed
+                    units_done = event.completed - previous.completed
+                    seconds_left = seconds * (units_left / units_done)
+                    if math.isfinite(seconds_left) and seconds_left > 0:
+                        forecast = (event.timestamp.timestamp(), seconds_left)
+        self._stage_progress = event
+        self.progress_forecast = forecast
 
     def update_resources(self, message) -> None:
         if "gpu_used_kb" in message:

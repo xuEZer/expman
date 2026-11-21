@@ -170,7 +170,8 @@ class StageWork:
                 for entry in self.batch.state.stage_history:
                     if entry.get("stage") != stage_index or entry.get("reused"):
                         continue
-                    duration = entry.get("stage_duration_seconds")
+                    # Use the same worker-start clock as the running attempt.
+                    duration = entry.get("duration")
                     if not valid_seconds(duration) or duration == 0:
                         continue
                     status = entry.get("status")

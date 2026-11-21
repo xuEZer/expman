@@ -222,7 +222,7 @@ def stage_samples(history):
         if entry.get("reused"):
             bucket["reused"] += 1
         else:
-            duration = entry.get("stage_duration_seconds")
+            duration = entry.get("duration")
             if valid_seconds(duration) and duration > 0:
                 if entry.get("status") == Status.SUCCEEDED.value:
                     bucket["measured"] += 1

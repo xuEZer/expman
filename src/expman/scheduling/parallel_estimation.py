@@ -3,6 +3,7 @@
 from statistics import median
 from time import time
 
+from expman.estimation.duration_model import RUNNING_FIT_COVERAGE, StageDuration
 from expman.estimation.estimate import TimeEstimate, valid_seconds
 
 _LOWER = 0
@@ -65,6 +66,25 @@ def _stage_view(groups, active_groups, tasks):
     return stages
 
 
+def _work_span(predicted, running, coverage, now):
+    if running is None:
+        return (predicted.lower, predicted.upper) if predicted else None
+    if predicted is not None:
+        elapsed = running.get("duration")
+        return (
+            predicted.remaining(elapsed, coverage) if valid_seconds(elapsed) else None
+        )
+    # Without history, estimate this attempt from the pace of its own work.
+    forecast = running.get("progress_forecast")
+    if forecast is None:
+        return None
+    reported_at, seconds_left = forecast
+    age = max(0.0, now - reported_at)
+    return StageDuration(seconds_left, seconds_left, seconds_left).remaining(
+        age, coverage
+    )
+
+
 def estimate_parallel(scheduler, coverage):
     """Estimate remaining Stage work rather than whole Experiment attempts.
 
@@ -81,17 +101,24 @@ def estimate_parallel(scheduler, coverage):
     with batch._state_lock:
         queue = list(batch.state.queue)
         active = dict(batch.state.active_gpu)
-        running = dict(batch.live.running_info)
+        # A slot is already claimed during worker startup, before the first poll.
+        running = {
+            run_id: batch.live.running_info.get(
+                run_id,
+                {"stage_index": batch.state.stage_progress[run_id], "duration": 0.0},
+            )
+            for run_id in active
+        }
         host = dict(batch.live.host_memory)
         groups = scheduler.stages.remaining_groups(queue, running)
         samples = sum(
             entry.get("status") == "succeeded"
             and not entry.get("reused")
-            and valid_seconds(entry.get("stage_duration_seconds"))
-            and entry["stage_duration_seconds"] > 0
+            and valid_seconds(entry.get("duration"))
+            and entry["duration"] > 0
             for entry in batch.state.stage_history
         )
-    if groups is None or set(active) != set(running):
+    if groups is None:
         _publish(
             batch,
             coverage,
@@ -125,56 +152,31 @@ def estimate_parallel(scheduler, coverage):
 
     unknown = TimeEstimate(None, None, coverage, samples, len(groups))
     tasks = []
-    incomplete = False
-    overdue = False
+    now = time()
     for group, (run_id, stage_index) in groups.items():
-        active_run = group in active_groups
-        if active_run and coverage == batch.estimate_coverage:
-            # Keep the dispatch-time prediction for the usual live countdown.
-            span = [
-                running[run_id].get(key)
-                for key in ("expected_lower_seconds", "expected_upper_seconds")
-            ]
-        else:
-            predicted = scheduler.stages.duration(
-                run_id, stage_index, coverage=coverage
-            )
-            span = [] if predicted is None else [predicted.lower, predicted.upper]
-        if not span or not all(valid_seconds(value) for value in span):
-            incomplete = True
-            continue
-        if active_run:
-            elapsed = running[run_id].get("duration")
-            if not valid_seconds(elapsed):
-                incomplete = True
-                continue
-            if elapsed >= span[_UPPER]:
-                incomplete = True
-                overdue = True
-                continue
-            span = [max(0.0, value - elapsed) for value in span]
-        tasks.append((span, group))
+        details = running[run_id] if group in active_groups else None
+        fit_coverage = coverage if details is None else RUNNING_FIT_COVERAGE
+        predicted = scheduler.stages.duration(
+            run_id, stage_index, coverage=fit_coverage
+        )
+        span = _work_span(predicted, details, coverage, now)
+        if span is not None and all(valid_seconds(value) for value in span):
+            tasks.append((span, group))
 
-    stages = _stage_view(groups, active_groups, tasks)
-    if incomplete:
+    view = {
+        "pending_runs": len(queue),
+        "running_runs": len(active),
+        "groups": len(groups),
+        "running_groups": len(active_groups),
+        "samples": samples,
+        "stages": _stage_view(groups, active_groups, tasks),
+    }
+    if len(tasks) != len(groups):
         _publish(
             batch,
             coverage,
-            degraded=(
-                "运行中阶段已达到或超出耗时预测上界，无法给出剩余时间区间"
-                if overdue
-                else (
-                    "待执行阶段缺少可用耗时区间，无法估计完工时间"
-                    if not tasks
-                    else "部分阶段缺少耗时区间，无法给出整批完工区间"
-                )
-            ),
-            pending_runs=len(queue),
-            running_runs=len(active),
-            groups=len(groups),
-            running_groups=len(active_groups),
-            samples=samples,
-            stages=stages,
+            degraded="待执行阶段缺少耗时估计，无法给出整批完工区间",
+            **view,
         )
         return unknown
 
@@ -191,12 +193,7 @@ def estimate_parallel(scheduler, coverage):
             batch,
             coverage,
             degraded="主机内存紧张，没有可用的并行位",
-            pending_runs=len(queue),
-            running_runs=len(active),
-            groups=len(groups),
-            running_groups=len(active_groups),
-            samples=samples,
-            stages=stages,
+            **view,
         )
         return unknown
 
@@ -262,13 +259,8 @@ def estimate_parallel(scheduler, coverage):
     _publish(
         batch,
         coverage,
-        pending_runs=len(queue),
-        running_runs=len(active),
-        groups=len(groups),
-        running_groups=len(active_groups),
-        samples=samples,
         device_slots=dict(counts),
         makespan={"lower_seconds": lower, "upper_seconds": upper},
-        stages=stages,
+        **view,
     )
     return TimeEstimate(lower, upper, coverage, samples, len(groups))

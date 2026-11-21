@@ -23,10 +23,14 @@ attempt contributes a lower bound to the residual pool for the lower endpoint.
 
 import math
 from dataclasses import dataclass
+from sys import float_info
 from typing import NamedTuple
 
 from expman.estimation.time_model import Encoding, variable_distance
 from expman.settings import settings
+
+# Fit the running-time curve at the 10th and 90th percentiles for every query.
+RUNNING_FIT_COVERAGE = 0.8
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,55 @@ class StageDuration:
     center: float
     lower: float
     upper: float
+
+    def remaining(self, elapsed: float, coverage: float) -> tuple[float, float]:
+        """Quantiles of remaining time, conditional on still running at elapsed.
+
+        The input interval supplies the 10th and 90th percentiles around the
+        predicted median. Fit a log-logistic curve on each side. The requested
+        coverage selects quantiles on that same curve. A side without measured
+        spread uses a factor of two at its reference percentile. Cap each
+        log-scale at 1/2 to keep the fitted distribution's mean finite.
+        """
+        tail = (1 - coverage) / 2
+        log_odds = math.log1p(RUNNING_FIT_COVERAGE) - math.log1p(-RUNNING_FIT_COVERAGE)
+        log_center = math.log(self.center)
+
+        def scale(log_width: float) -> float:
+            if log_width <= 0:
+                log_width = math.log(2)
+            return min(0.5, log_width / log_odds)
+
+        left = scale(log_center - math.log(self.lower)) if self.lower > 0 else 0.5
+        right = scale(math.log(self.upper) - log_center)
+
+        def quantile(probability: float, log_survival: float) -> float:
+            # If the odds of finishing before elapsed are O, the p-quantile
+            # given survival has target odds (O + p) / (1 - p). The equivalent
+            # forms below avoid overflowing O or subtracting nearly equal times.
+            if elapsed >= self.center:
+                inverse_odds = (self.center / elapsed) ** (1 / right)
+                increment = math.log1p(probability * inverse_odds) - log_survival
+                remaining = elapsed * math.expm1(right * increment)
+            else:
+                fraction = elapsed / self.center
+                odds = fraction ** (1 / left)
+                target_log_odds = math.log(odds + probability) - log_survival
+                if target_log_odds >= 0:
+                    # The quantile crosses the median. Add the gaps on either side.
+                    remaining = self.center * (
+                        (1 - fraction) + math.expm1(right * target_log_odds)
+                    )
+                elif odds > probability:
+                    increment = math.log1p(probability / odds) - log_survival
+                    remaining = elapsed * math.expm1(left * increment)
+                else:
+                    remaining = self.center * (
+                        math.exp(left * target_log_odds) - fraction
+                    )
+            return min(remaining, float_info.max)
+
+        return quantile(tail, math.log1p(-tail)), quantile(1 - tail, math.log(tail))
 
 
 class _Sample(NamedTuple):

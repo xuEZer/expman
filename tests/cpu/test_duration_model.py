@@ -1,3 +1,6 @@
+import math
+from sys import float_info
+
 import pytest
 
 from expman.core.frozen import freeze
@@ -22,6 +25,40 @@ def test_a_stage_measured_once_reports_exactly_what_it_measured():
     model, _indices = build([{"steps": 1}], [12.5])
 
     assert model.predict("run-0") == StageDuration(12.5, 12.5, 12.5)
+
+
+def test_running_single_sample_has_a_continuous_interval_through_an_overrun():
+    stage = StageDuration(20.0, 20.0, 20.0)
+    assert stage.remaining(0, 0.8) == pytest.approx((10, 40))
+    at_reference = stage.remaining(20, 0.8)
+    assert 0 < at_reference[0] < at_reference[1]
+    assert stage.remaining(20 - 1e-8, 0.8) == pytest.approx(at_reference)
+    assert stage.remaining(20 + 1e-8, 0.8) == pytest.approx(at_reference)
+    low, high = stage.remaining(2000, 0.8)
+    assert 0 < low < high < 4000
+
+
+@pytest.mark.parametrize("elapsed", [0, 3, 9, 10, 25])
+def test_running_quantiles_condition_on_surviving_elapsed_time(elapsed):
+    stage = StageDuration(10, 5, 25)
+    left_shape = math.log(9) / math.log(2)
+    right_shape = math.log(9) / math.log(2.5)
+
+    def survival(total):
+        shape = left_shape if total < stage.center else right_shape
+        return 1 / (1 + (total / stage.center) ** shape)
+
+    lower, upper = stage.remaining(elapsed, 0.8)
+    assert survival(elapsed + lower) / survival(elapsed) == pytest.approx(0.9)
+    assert survival(elapsed + upper) / survival(elapsed) == pytest.approx(0.1)
+
+
+def test_running_intervals_remain_finite_with_extreme_measurements_and_coverage():
+    stage = StageDuration(1.0, 1e-200, 1e200)
+    low, high = stage.remaining(1e150, 0.8)
+    assert 0 < low < high < 3e150
+    low, high = stage.remaining(float_info.max, math.nextafter(1, 0))
+    assert 0 < low < high == float_info.max
 
 
 def test_a_stage_without_a_completed_sample_has_no_estimate():

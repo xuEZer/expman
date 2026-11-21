@@ -89,15 +89,7 @@ class GpuScheduler:
                     "uuid": worker.uuid,
                     "concurrency": worker.area / max(now - worker.started, 1e-9),
                     "duration": max(0.0, now - worker.started),
-                    "expected_seconds": None
-                    if worker.expected is None
-                    else worker.expected.center,
-                    "expected_lower_seconds": None
-                    if worker.expected is None
-                    else worker.expected.lower,
-                    "expected_upper_seconds": None
-                    if worker.expected is None
-                    else worker.expected.upper,
+                    "progress_forecast": worker.progress_forecast,
                     "stage_index": worker.stage_index,
                     "resident_kb": worker.resident_kb,
                     "peak_kb": worker.peak_kb,

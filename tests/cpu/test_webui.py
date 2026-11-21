@@ -100,7 +100,7 @@ def seed_finished_first(batch, *, duration=2.0):
                 "stage": stage_index,
                 "attempt": 1,
                 "status": Status.SUCCEEDED.value,
-                "stage_duration_seconds": duration,
+                "duration": duration,
                 "peak_kb": 4096.0,
                 "gpu_peak_kb": 1024.0,
                 "capped": False,
@@ -383,7 +383,7 @@ def test_a_finished_batch_reports_stage_and_resource_facts(tmp_path):
 @POSIX
 def test_stage_samples_match_the_observations_used_by_duration_estimates():
     history = [
-        {"stage": 0, "status": status, "stage_duration_seconds": duration}
+        {"stage": 0, "status": status, "duration": duration}
         for status, duration in [
             ("succeeded", 2),
             ("succeeded", None),
