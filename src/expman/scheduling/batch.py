@@ -15,6 +15,7 @@ from expman.core.pipeline import Pipeline
 from expman.core.randomness import validate_seed
 from expman.core.recorders import InMemoryRecorder
 from expman.estimation.estimate import TimeEstimate, valid_seconds, validate_coverage
+from expman.observation.cleanup import clean_locked
 from expman.process_control import stop_on_sigterm
 from expman.scheduling.environment import validate as validate_environment
 from expman.scheduling.state import BatchState, LiveObservations
@@ -297,7 +298,10 @@ class _Batch:
                             )
                         self._save()
                     return self.results
-                return GpuScheduler(self).run()
+                results = GpuScheduler(self).run()
+                if all(run.status is Status.SUCCEEDED for run in results):
+                    clean_locked(self.output_dir, self.store.serializer)
+                return results
             finally:
                 stopped.set()
                 timer.join()

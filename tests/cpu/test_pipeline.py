@@ -1,3 +1,4 @@
+from functools import wraps
 from unittest.mock import patch
 
 import pytest
@@ -36,7 +37,6 @@ class Report(Stage):
     def process(self, data, ctx):
         ctx.report_metric("loss", 0.5, step=2)
         ctx.report_progress(2, total=4, unit="batch")
-        return data
 
 
 class BrokenRecorder:
@@ -55,16 +55,19 @@ def ctx(recorder):
 
 
 def test_order_and_execution_hierarchy(recorder, ctx):
+    outputs = []
+
     class AddThree(Add):
         def __init__(self):
             super().__init__(3)
 
     class Double(Stage):
         def process(self, data, ctx):
-            return data * 2
+            outputs.append(data * 2)
 
     result = Pipeline([AddThree, Double]).run(2, ctx)
-    assert result == 10
+    assert result is None
+    assert outputs == [10]
     events = recorder.events
     assert [event.status for event in events] == [
         Status.RUNNING,
@@ -92,7 +95,7 @@ def test_empty_pipeline_preserves_input_identity(recorder):
 
 @pytest.mark.parametrize("stop_after", [0, 1, 2])
 def test_stop_after_runs_only_the_requested_prefix(stop_after):
-    pipeline = Pipeline([Add, Add, Add])
+    pipeline = Pipeline([Add, Add, Add, Report])
     assert pipeline.run(0, stop_after=stop_after) == stop_after + 1
 
 
@@ -105,7 +108,9 @@ def test_arbitrary_outputs_including_none_are_forwarded():
         def process(self, data, ctx):
             return {"value": data}
 
-    assert Pipeline([Clear, Wrap]).run(object()) == {"value": None}
+    assert Pipeline([Clear, Wrap, Report]).run(object(), stop_after=1) == {
+        "value": None
+    }
 
 
 def test_failure_stops_downstream_and_preserves_exception(recorder, ctx):
@@ -165,9 +170,9 @@ def test_repeated_class_has_fresh_instances_and_unique_executions(recorder, ctx)
             instances.append(self)
             return super().process(data, ctx)
 
-    pipeline = Pipeline([Capture, Capture])
-    assert pipeline.run(0, ctx) == 2
-    assert pipeline.run(0, ctx) == 2
+    pipeline = Pipeline([Capture, Capture, Report])
+    assert pipeline.run(0, ctx, stop_after=1) == 2
+    assert pipeline.run(0, ctx, stop_after=1) == 2
     assert len({id(stage) for stage in instances}) == 4
     assert all(stage.calls == 1 for stage in instances)
     starts = [event for event in recorder.events if event.status is Status.RUNNING]
@@ -175,12 +180,11 @@ def test_repeated_class_has_fresh_instances_and_unique_executions(recorder, ctx)
 
 
 def test_pipeline_snapshots_stage_sequence():
-    stages = [Add]
+    stages = [Add, Report]
     pipeline = Pipeline(stages)
-    stages.append(Add)
-    assert isinstance(pipeline.stages, tuple)
-    assert pipeline.run(0) == 1
-    assert Pipeline(stage for stage in stages).run(0) == 2
+    stages.insert(0, Add)
+    assert pipeline.stages == (Add, Report)
+    assert Pipeline(stage for stage in stages).stages == (Add, Add, Report)
 
 
 def test_stage_can_run_independently_with_monotonic_timing(recorder, ctx):
@@ -205,13 +209,19 @@ def test_metrics_and_progress_belong_to_stage(recorder, ctx):
 
 
 def test_nested_pipeline_preserves_parent_scopes(recorder, ctx):
+    outputs = []
+
+    class Collect(Stage):
+        def process(self, data, ctx):
+            outputs.append(data)
+
     class Nested(Stage):
         def process(self, data, ctx):
-            result = Pipeline([Add], name="inner").run(data, ctx)
-            ctx.report_metric("result", result)
-            return result
+            Pipeline([Add, Collect], name="inner").run(data, ctx)
+            ctx.report_metric("result", outputs[-1])
 
-    assert Pipeline([Nested]).run(1, ctx) == 2
+    assert Pipeline([Nested]).run(1, ctx) is None
+    assert outputs == [2]
     outer, stage, inner, inner_stage = recorder.events[:4]
     assert stage.parent_id == outer.execution_id
     assert inner.parent_id == stage.execution_id
@@ -222,8 +232,8 @@ def test_nested_pipeline_preserves_parent_scopes(recorder, ctx):
 
 def test_recorder_failure_does_not_change_success(caplog):
     with caplog.at_level("WARNING", logger="expman.core.context"):
-        result = Pipeline([Report, Add]).run(2, RunContext(recorder=BrokenRecorder()))
-    assert result == 3
+        result = Pipeline([Add, Report]).run(2, RunContext(recorder=BrokenRecorder()))
+    assert result is None
     assert caplog.records
 
 
@@ -244,7 +254,6 @@ def test_default_run_contexts_are_independent():
     class Capture(Stage):
         def process(self, data, ctx):
             contexts.append(ctx)
-            return data
 
     pipeline = Pipeline([Capture])
     pipeline.run()
@@ -260,6 +269,66 @@ def test_construction_validation():
         Pipeline([lambda data: data])
     with pytest.raises(TypeError):
         Pipeline([Add()])
+
+
+def test_last_stage_cannot_return_a_value_at_construction():
+    class ReturnsZero(Stage):
+        def process(self, data, ctx) -> None:
+            if data:
+                return 0
+
+    with pytest.raises(ValueError, match="must return None"):
+        Pipeline([Add, ReturnsZero])
+
+
+def test_pipeline_leaf_may_use_helpers_that_return_values():
+    class Sink(Stage):
+        def process(self, data, ctx):
+            def get_metric():
+                return 3
+
+            if data is None:
+                return
+            ctx.log_metrics({"value": get_metric()})
+            return None
+
+    Pipeline([Sink])
+
+
+def test_pipeline_leaf_rejects_deferred_execution_and_forwarded_returns():
+    class AsyncLeaf(Stage):
+        async def process(self, data, ctx):
+            pass
+
+    class GeneratorLeaf(Stage):
+        def process(self, data, ctx):
+            yield None
+
+    class ForwardedReturn(Stage):
+        def process(self, data, ctx):
+            return ctx.log_metrics({"value": 3})
+
+    for leaf in (AsyncLeaf, GeneratorLeaf, ForwardedReturn):
+        with pytest.raises(ValueError, match=leaf.__name__):
+            Pipeline([leaf])
+
+
+def test_pipeline_leaf_checks_the_decorated_method_that_will_run():
+    def with_result(method):
+        @wraps(method)
+        def wrapper(self, data, ctx):
+            method(self, data, ctx)
+            return 1
+
+        return wrapper
+
+    class Sink(Stage):
+        @with_result
+        def process(self, data, ctx) -> None:
+            pass
+
+    with pytest.raises(ValueError, match="must return None"):
+        Pipeline([Sink])
 
 
 @pytest.mark.parametrize("name", ["", " ", 42])
@@ -318,22 +387,14 @@ def test_stage_source_hash_is_the_module_file():
     from hashlib import sha256
     from pathlib import Path
 
-    class Entry(Stage):
-        def process(self, data, ctx):
-            return data
-
-    signature = Pipeline([Entry], name="entry").signature()
+    signature = Pipeline([Report], name="entry").signature()
     expected = sha256(Path(__file__).resolve().read_bytes()).hexdigest()
     assert signature[0]["source"] == expected
-    assert signature[0]["class"].endswith(".Entry")
+    assert signature[0]["class"].endswith(".Report")
 
 
 def test_signature_is_stable_across_calls():
     """Repeated calls agree, so a cached key never disagrees with a fresh one."""
 
-    class Entry(Stage):
-        def process(self, data, ctx):
-            return data
-
-    pipeline = Pipeline([Entry], name="entry")
+    pipeline = Pipeline([Report], name="entry")
     assert pipeline.signature() == pipeline.signature()

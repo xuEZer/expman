@@ -20,6 +20,7 @@ from expman.core.experiment import StageResult
 from expman.estimation.memory_model import PeakCeiling
 from expman.resources.mps import MpsService
 from expman.scheduling._planning import pack_candidates
+from expman.scheduling._prefixes import PrefixReclaimer
 from expman.scheduling._process import (
     Worker,
     _close_stdin,
@@ -51,6 +52,7 @@ class GpuScheduler:
         self.last_tick = perf_counter()
         # The ETA slot forecast uses host peaks from measured final Stages.
         self.stages = StageWork(batch)
+        self.prefixes = PrefixReclaimer(self.stages)
         last_stage = len(batch.pipeline.stages) - 1
         self.peaks = PeakCeiling.from_history(
             row
@@ -304,7 +306,7 @@ class GpuScheduler:
             self.last_plan = {**self.last_plan, "launched": launched}
 
     def _complete_stage(self, run_id, stage_index, observation=None):
-        """Advance a successful run or publish its final output."""
+        """Advance a successful run or record its completion."""
         if stage_index < len(self.batch.pipeline.stages) - 1:
             self.batch.state.advance(run_id)
             return
@@ -326,13 +328,16 @@ class GpuScheduler:
             if parent_ref is None:
                 return False
             parent = parent_ref[2]
-        # Metadata only: a reusable Stage's output can be large, and
-        # reading it here would cost that much memory in the scheduler
-        # for every member that reuses it.  The worker that consumes the
-        # output loads it once, when it needs it.
+        # Reuse needs only metadata. A downstream worker loads its input
+        # from the intermediate snapshot when it runs.
         stage = experiment.pipeline.stages[stage_index]
         dependencies = stage_dependencies(stage, experiment._frozen)
-        candidate = shared.find_metadata(parent, (stage_index,), dependencies)
+        candidate = shared.find_metadata(
+            parent,
+            (stage_index,),
+            dependencies,
+            leaf=stage_index == len(experiment.pipeline.stages) - 1,
+        )
         if candidate is None:
             return False
         reference, completed = candidate
@@ -374,16 +379,19 @@ class GpuScheduler:
         return True
 
     def _materialize_reuses(self):
-        changed = False
+        reused = []
         while True:
             for run_id in list(self.batch.state.queue):
+                stage_index = self.batch.state.stage_progress[run_id]
                 if self._reuse_stage(run_id):
-                    changed = True
+                    reused.append((run_id, stage_index))
                     break
             else:
                 break
-        if changed:
+        if reused:
             self.batch._save()
+            for run_id, stage_index in reused:
+                self.prefixes.reclaim_after(run_id, stage_index)
 
     def _launch(self, device, memory, host, candidate):
         batch = self.batch
@@ -460,6 +468,7 @@ class GpuScheduler:
             # killed after the child starts, resume must advance the Stage attempt
             # so checkpoints and user retry logic see a genuine retry.
             batch._save()  # Durable active membership precedes process creation.
+            self.prefixes.attempt_started(run_id)
             env = dict(os.environ)
             env["CUDA_VISIBLE_DEVICES"] = memory.uuid
             env["PYTHONPATH"] = os.pathsep.join(
@@ -687,8 +696,13 @@ class GpuScheduler:
             )
             self.batch._save()
 
+        self.prefixes.reclaim_after(
+            run_id, worker.stage_index, succeeded=result.status is Status.SUCCEEDED
+        )
+
     def run(self):
         try:
+            self.prefixes.reclaim_saved()
             while self.batch.state.queue or self.workers:
                 for run_id, worker in list(self.workers.items()):
                     worker.read_messages(self.batch.recorder)

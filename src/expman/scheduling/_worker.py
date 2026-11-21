@@ -240,7 +240,7 @@ def main():
                         else completed.get("config_dependencies"),
                         "reused": bool(
                             completed is not None
-                            and completed.get("_shared_reused", False)
+                            and completed.get("shared_reused", False)
                         ),
                     }
                 )

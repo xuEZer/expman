@@ -114,8 +114,7 @@ class Worker:
         ):
             return
         if isinstance(event, ExecutionEvent):
-            # This worker restores the prefix and executes one top-level Stage.
-            # Its start precedes any nested Stage that shares its numeric index.
+            # The scheduled Stage starts before any nested Stage with the same index.
             if (
                 self._stage_execution_id is None
                 and event.kind == "stage"

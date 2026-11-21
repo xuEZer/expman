@@ -80,8 +80,8 @@ def test_blank_overrides_are_not_overrides(monkeypatch, value):
 def test_a_bad_override_fails_before_the_batch_directory_exists(tmp_path, monkeypatch):
 
     class Trivial(Stage):
-        def process(self, data, ctx):
-            return data
+        def process(self, data, ctx) -> None:
+            pass
 
     config = tmp_path / "experiments.yaml"
     config.write_text("device: [0]\nseed: 0\n")

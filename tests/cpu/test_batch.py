@@ -12,7 +12,7 @@ def test_empty_pipeline_finishes_and_a_stale_session_cannot_overwrite_it(tmp_pat
 
     (result,) = original.run()
     assert result.status is Status.SUCCEEDED
-    assert result.output is None and len(result.attempts) == 1
+    assert len(result.attempts) == 1
     with pytest.raises(StorageError, match="batch records changed"):
         stale.run()
 

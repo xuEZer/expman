@@ -4,7 +4,7 @@ expman 把一条 Python 实验流程应用到多份配置上，在一台 Linux �
 
 ## 从一次实验读起
 
-假设实验包含“准备数据 → 训练”两个阶段，配置文件列出两种学习率。这个例子里有一个 **Batch**（整批实验）、两个 **run**（各自对应一个 `Experiment`、一份具体配置和一个稳定的 `run_id`）。每个 run 都要得到两个阶段的输出。**调度单元是某个 run 的一个顶层 Stage**，worker 只负责该阶段的一次尝试。若准备数据声明只依赖数据配置，两份配置在同一种子下可以共享前一阶段的结果。
+假设实验包含“准备数据 → 训练”两个阶段，配置文件列出两种学习率。这个例子里有一个 **Batch**（整批实验）、两个 **run**（各自对应一个 `Experiment`、一份具体配置和一个稳定的 `run_id`）。两个 run 都要完成训练。**调度单元是某个 run 的一个顶层 Stage**，worker 只负责该阶段的一次尝试。若准备数据声明只依赖数据配置，两份配置在同一种子下可以共享准备好的数据。
 
 ```mermaid
 flowchart LR
@@ -27,13 +27,13 @@ flowchart LR
 ```
 
 1. **创建批次。** `expman run` 按 `module:attr` 导入 Pipeline，省略模块名时从 `pipeline_module` 指定的模块读取属性，默认为 `pipeline`。命令把 YAML 展开为一组配置，批次调度代码校验设备和种子，为每份配置创建一个 run 目录，把解析后的 `module:attr` 和初始队列写入批次清单。[CLI](src/expman/cli.py) · [批次调度](src/expman/scheduling/batch.py)
-2. **选择任务。** 主进程取每个 run 当前就绪的顶层阶段。可以共享前缀的成员按组处理。命中缓存时，主进程只读元数据，把指标和快照引用写到目标 run，推进它的阶段位置。需要计算时，主进程从各阶段的就绪队列选取候选，再按主机内存和各卡显存余量决定派发哪些任务及其设备。启动 worker 前先持久化该成员的活动状态。[调度循环](src/expman/scheduling/scheduler.py) · [阶段分组](src/expman/scheduling/_stages.py)
-3. **计算一个阶段。** worker 在独立解释器内核验 MPS 客户端，加载用户模块和本次尝试的输入，重建 Experiment。执行第 `i` 个阶段前，`run_stage(i)` 检查前置阶段都已有完成记录。Pipeline 从头走到 `i`，依次恢复已有阶段的输出和随机状态，再构造需要执行的 Stage 调用其 `process(data, ctx)`。相邻阶段可以运行在不同进程，跨进程传值依赖磁盘快照。[worker 入口](src/expman/scheduling/_worker.py) · [Experiment](src/expman/core/experiment.py) · [托管阶段执行](src/expman/core/execution.py)
-4. **收集结果。** worker 通过本地 socket 把完成摘要传给主进程。主进程记录历史，释放占用，安排下一阶段或重试。成功结果保存最终快照的位置。调度结束后，CLI 按配置展开顺序打印每个 run 的 ID 和最终状态。[进程间通信](src/expman/scheduling/ipc.py) · [结果对象](src/expman/core/experiment.py)
+2. **选择任务。** 主进程取每个 run 当前就绪的顶层阶段。可以共享前缀的成员按组处理。命中缓存时，主进程只读元数据，把指标和共享节点引用写到目标 run，推进它的阶段位置。需要计算时，主进程从各阶段的就绪队列选取候选，再按主机内存和各卡显存余量决定派发哪些任务及其设备。启动 worker 前先持久化该成员的活动状态。[调度循环](src/expman/scheduling/scheduler.py) · [阶段分组](src/expman/scheduling/_stages.py)
+3. **计算一个阶段。** worker 在独立解释器内核验 MPS 客户端，加载用户模块并重建 Experiment。执行第 `i` 个顶层阶段时，第一阶段从初始随机状态和输入 `None` 开始，其余阶段只需从第 `i - 1` 个阶段的快照取得输入和随机状态。目标阶段已有有效 checkpoint 时，从该保存点继续。[worker 入口](src/expman/scheduling/_worker.py) · [Experiment](src/expman/core/experiment.py) · [托管阶段执行](src/expman/core/execution.py)
+4. **收集结果。** worker 通过本地 socket 把完成摘要传给主进程。主进程记录历史，释放占用，安排下一阶段或重试。成功的叶子留下完成记录，业务指标保存在 SQLite。调度结束后，CLI 按配置展开顺序打印每个 run 的 ID 和最终状态。[进程间通信](src/expman/scheduling/ipc.py) · [结果对象](src/expman/core/experiment.py)
 
 ## 定义一条流程
 
-`Stage` 是用户扩展点。Pipeline 接收 **Stage 类**的序列，每个实际执行的位置都无参构造一个新实例，上一步的输出作为下一步的输入。批次内的第一步收到 `None`，阶段返回值须能通过 pickle 保存在快照中。Stage 的泛型描述单个阶段的输入输出，相邻阶段的类型兼容由流程作者负责。[Stage](src/expman/core/stage.py) · [Pipeline](src/expman/core/pipeline.py)
+`Stage` 是用户扩展点。Pipeline 接收 **Stage 类**的序列，每个实际执行的位置都无参构造一个新实例，上一步的输出作为下一步的输入。构造非空 `Pipeline` 时，基类检查最后一个 Stage 的 `process()` 定义。该方法须为同步普通方法，只允许自然结束、`return` 和 `return None`。独立和嵌套的流程都遵循这一规则。在批次内，第一步收到 `None`，中间阶段的返回值须能通过 pickle 保存在快照中。Stage 的泛型描述单个阶段的输入输出，相邻阶段的类型兼容由流程作者负责。[Stage](src/expman/core/stage.py) · [Pipeline](src/expman/core/pipeline.py)
 
 有两种常用的执行方式。调试单个转换时可调用 `stage.run(data)` 或 `pipeline.run(data)`，在调用者进程内同步执行。交给 Batch 托管时，同一个 `process` 会收到带存储服务的 `RunContext`。用户因此可以在循环内写 checkpoint、记录持久化指标。两种路径共用阶段的开始、结束、异常和父子事件语义。[运行上下文](src/expman/core/context.py) · [执行作用域](src/expman/core/execution.py)
 
@@ -62,26 +62,28 @@ CLI 从当前工作目录向上查找最近的 `pyproject.toml`，在解析命�
 | 位置 | 内容和使用者 |
 |---|---|
 | `batch.pkl`、`timing.pkl` | 批次清单保存流程的导入位置和签名、重试次数和耗时区间覆盖率、队列、活动成员、阶段游标、尝试摘要和阶段历史。`timing.pkl` 单独记录批次累计墙钟时间和当前 ETA，估计区间未知时存为空值。 |
-| `experiments/<run_id>/config.pkl`、`rng_initial.pkl` | 具体配置与 run 的初始随机状态。 |
-| `experiments/<run_id>/stages/<位置>/` | `status.pkl` 是阶段状态，`checkpoint.pkl` 是最近一次成功保存的中间进度，`completed.pkl` 是完成快照或共享节点引用。每次 Pipeline 调用所在路径还有用于校验定义的 `pipeline.pkl`。 |
-| `cache/<key>/<父节点>/<节点>/` | `snapshot.pkl` 保存大输出及状态，`metadata.pkl` 保存依赖、指标和耗时。调度器据元数据推进等价 run，下游 worker 再读取输出。 |
+| `experiments/<run_id>/config.pkl`、`rng_initial.pkl` | 具体配置。worker 需要执行该 run 的阶段 0 时才创建或读取初始随机状态文件。 |
+| `experiments/<run_id>/stages/<位置>/` | `status.pkl` 记录阶段状态，`checkpoint.pkl` 保存最近的中间进度，`completed.pkl` 记录阶段完成。共享中间结果通过引用定位，嵌套阶段的完成快照保存在本 run。每次 Pipeline 调用所在路径还有用于校验定义的 `pipeline.pkl`。 |
+| `cache/<key>/<父节点>/<节点>/` | 中间节点的 `snapshot.pkl` 保存输出、业务状态和随机状态，`metadata.pkl` 保存供复用的依赖、指标和耗时。叶子只发布 `metadata.pkl`。 |
 | `metrics.sqlite3` | 同批次各 run 的持久化标量。主键是 run ID、阶段路径、step、指标路径。重试重新写同一点时更新值，省略 step 的汇总值使用 `-1`。 |
 | `experiments/<run_id>/attempts/stage-<i>/<尝试号>/` | worker 启动描述、输入和 `output.log`，可用来定位某次尝试的导入、启动或业务异常。 |
 | `live.json` | 当前或最后一次发布的观测快照，供独立进程展示。运行队列的恢复依据是 `batch.pkl`。 |
 
 [批次文件](src/expman/storage/batch.py) · [原子写和互斥锁](src/expman/storage/base.py) · [阶段文件](src/expman/storage/run.py) · [共享前缀](src/expman/storage/prefix_cache.py) · [指标库](src/expman/storage/metrics.py)
 
-**恢复从三个粒度看。** `BatchState` 记录待调度的 run、已派发的 run 及每个 run 的下一阶段。恢复时先检查清单和 Pipeline 签名，将上次仍标为活动的 run 放回队首，并把中断的尝试记为取消。在 run 内，worker 读取已完成阶段的快照。中途失败的阶段从最后一个有效 checkpoint 继续。进程结束时仅保存在内存中的对象需要由用户的 `process` 重建。[批次状态](src/expman/scheduling/state.py) · [托管执行](src/expman/core/execution.py)
+**恢复从三个粒度看。** `BatchState` 记录待调度的 run、已派发的 run 及每个 run 的下一阶段。恢复时先检查清单和 Pipeline 签名，将上次仍标为活动的 run 放回队首，并把中断的尝试记为取消。worker 从直接前驱的快照取得目标阶段的输入，中途失败的阶段从最后一个有效 checkpoint 继续。进程结束时仅保存在内存中的对象需要由用户的 `process` 重建。[批次状态](src/expman/scheduling/state.py) · [托管执行](src/expman/core/execution.py)
 
-**阶段位置决定恢复哪条记录。** 一个顶层 Stage 的位置是它在 Pipeline 中的索引。嵌套 Pipeline 在父位置后加上调用序号和子阶段索引。checkpoint 同步保存调用计数、位置、业务状态、累计阶段耗时、配置依赖和随机状态。一个训练循环多次调用同一个验证 Pipeline 时，各轮因此能找到各自的输出。临时文件写入、刷新并同步成功后才原子替换目标。完成快照提交后清理该阶段的 checkpoint。损坏或依赖不匹配的 checkpoint 会告警并退回阶段入口。无法读取本 run 已完成的输出则报告存储错误。
+**阶段位置决定恢复哪条记录。** 一个顶层 Stage 的位置是它在 Pipeline 中的索引。嵌套 Pipeline 在父位置后加上调用序号和子阶段索引。checkpoint 同步保存调用计数、位置、业务状态、累计阶段耗时、配置依赖和随机状态。训练循环多次调用同一个验证 Pipeline 时，每轮都能找到对应的阶段快照。临时文件写入、刷新并同步成功后才原子替换目标。完成记录提交后清理该阶段的 checkpoint。损坏或依赖不匹配的 checkpoint 会告警并退回阶段入口。无法读取本 run 恢复所需的输出则报告存储错误。
 
-**何时可以共享。** 在同一批次内，缓存以 Pipeline 签名和 seed 分区。签名由各 Stage 类的模块名、限定名和可读取的模块文件摘要组成。查找时还要匹配上一步的共享节点、当前阶段位置、完整的依赖路径集合及各路径的值摘要。这样，即使两个训练阶段配置相同，也只有上游数据来自同一前缀时才会共享。run 自己已经开始的阶段优先恢复自己的工作。共享节点先写快照，再发布元数据。命中时目标 run 记录引用并恢复相应指标。外部数据文件的内容变化需要由业务配置体现。
+**何时可以共享。** 在同一批次内，缓存以 Pipeline 签名和 seed 分区。签名由各 Stage 类的模块名、限定名和可读取的模块文件摘要组成。查找时还要匹配上一步的共享节点、当前阶段位置、完整的依赖路径集合及各路径的值摘要。这样，即使两个训练阶段配置相同，也只有上游数据来自同一前缀时才会共享。run 自己已经开始的阶段优先恢复自己的工作。中间节点先写快照，再发布元数据。命中时目标 run 保存完成记录并恢复相应指标。外部数据文件的内容变化需要由业务配置体现。
 
-清理缓存前需要确认哪些节点仍被 run 引用，即使批次已经成功，用户也可能再次读取最终输出。清理函数取得批次锁，扫描完成记录后只删除无引用节点。读取完成记录或校验共享引用失败时，清理会在删除前中止。[缓存清理](src/expman/observation/cleanup.py)
+**何时回收。** 所有可能读取同一份输出的 run 都已成功完成直接后继阶段并保存进度时，调度器删除这个节点的快照和元数据。后继阶段还在排队、运行、重试或失败时，它需要的输入会保留。即使两份配置等价，重试也可能生成两份快照。run 一旦选定另一条实际缓存分支，就能从当前分支的使用者中排除。叶子只保存用于复用指标的元数据，最后一个可能复用它的 run 完成后即可删除。批次恢复时从已提交的进度继续回收。[缓存使用者与回收判定](src/expman/scheduling/_prefixes.py) · [节点存储](src/expman/storage/prefix_cache.py)
 
-**随机状态与计时。** 每个 run 根据 seed 初始化 Python、NumPy 和 PyTorch 全局随机生成器。CUDA 设备可用时也捕获各可见设备的状态。托管执行恢复已完成前缀的结束状态，并在有 checkpoint 时于调用 `process` 前重置到保存点。恢复会校验随机状态记录的格式、seed、CPU 状态与非空 CUDA 状态的设备数，应用失败时回滚。缺失或无效的随机状态会报错。用户自建的生成器和 DataLoader 子进程状态由用户保存。[随机状态实现](src/expman/core/randomness.py)
+所有 run 成功且 worker 已退出后，批次还会清除写入过程中被中断、没有 run 引用的快照和空缓存子目录。各 run 的完成记录、耗时和 SQLite 指标独立保留。[批次收尾](src/expman/scheduling/batch.py) · [缓存清理](src/expman/observation/cleanup.py)
 
-批次墙钟时间剔除停机间隔，按 `timing_save_interval` 定期保存。阶段 checkpoint 和完成快照都要求保存有限、非负的累计执行秒数。断点计时缺失或无效时会告警并从阶段开头重跑。已提交快照计时无效时读取报错。若在两个保存点之间失败，被丢弃的工作要重新执行。每次 worker 尝试的实测时长另计入调度历史和 run 的尝试摘要，因此排查重试开销应看尝试历史。[批次计时](src/expman/scheduling/batch.py) · [尝试收尾](src/expman/scheduling/scheduler.py)
+**随机状态与计时。** worker 执行阶段 0 时按 seed 初始化 Python、NumPy 和 PyTorch 全局随机生成器，或加载已保存的初始状态。CUDA 可用时也捕获各可见设备的状态。后续阶段从直接前驱的快照恢复随机状态。有 checkpoint 时，在调用 `process` 前重置到保存点。恢复会校验随机状态记录的格式、seed、CPU 状态与非空 CUDA 状态的设备数，应用失败时回滚。缺失或无效的随机状态会报错。用户自建的生成器和 DataLoader 子进程状态由用户保存。[随机状态实现](src/expman/core/randomness.py)
+
+批次墙钟时间剔除停机间隔，按 `timing_save_interval` 定期保存。checkpoint 和阶段完成时保存的累计执行秒数都必须是有限的非负数。断点计时缺失或无效时会告警并从阶段开头重跑。已提交的阶段计时无效时读取报错。若在两个保存点之间失败，被丢弃的工作要重新执行。每次 worker 尝试的实测时长另计入调度历史和 run 的尝试摘要，因此排查重试开销应看尝试历史。[批次计时](src/expman/scheduling/batch.py) · [尝试收尾](src/expman/scheduling/scheduler.py)
 
 ## 调度器如何使用 GPU 和主机内存
 

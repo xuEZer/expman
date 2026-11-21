@@ -47,7 +47,7 @@ class Accumulate(Stage):
             ctx.checkpoint(index + 1, total)
             if ctx.cfg["interrupt_once"] and ctx.attempt == 1 and index == 1:
                 raise KeyboardInterrupt()
-        return total
+        ctx.log_metrics({"total": total})
 
 
 train = Pipeline([LoadValues, Accumulate])
@@ -66,8 +66,8 @@ from expman import Pipeline, Stage
 
 
 class Trivial(Stage):
-    def process(self, data, ctx):
-        return data
+    def process(self, data, ctx) -> None:
+        pass
 
 
 train = Pipeline([Trivial])

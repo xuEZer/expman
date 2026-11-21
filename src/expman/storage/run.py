@@ -86,7 +86,7 @@ class RunStore:
         """Attach a shared Stage snapshot and its metrics to this run."""
         assert self.metrics is not None and self.run_id is not None
         self.metrics.restore(self.run_id, attempt, completed["metrics"])
-        self.reference(position, reference, reused=True)
+        self.reference(position, reference, completed, reused=True)
 
     def stage_dir(self, position: tuple[int, ...]) -> Path:
         return self.root.joinpath("stages", *(str(index) for index in position))
@@ -124,21 +124,26 @@ class RunStore:
         )
 
     def has_completed(self, position) -> bool:
-        """Whether this position has a completed record, without reading it.
-
-        The record holds the Stage output, which can be large; callers that only
-        need to know that the prefix exists must not pay for it.
-        """
+        """Check the run's durable completion marker without loading any output."""
         return (self.stage_dir(position) / "completed.pkl").exists()
 
     def completed(self, position, *, metadata_only=False) -> dict | None:
-        """Read a completed Stage. Shared metadata can be read without the output."""
+        """Read a Stage's leaf completion record or its retained snapshot."""
         path = self.stage_dir(position) / "completed.pkl"
         if not path.exists():
             return None
         record = read_record(path, self.serializer)
         if not isinstance(record, dict):
             raise StorageError(f"invalid stage snapshot: {path}")
+        if record.get("leaf"):
+            if (
+                record.get("position") != position
+                or not isinstance(record.get("name"), str)
+                or not isinstance(record.get("config_dependencies"), list)
+            ):
+                raise StorageError(f"invalid leaf completion: {path}")
+            stage_seconds(record)
+            return record
         if "cache_ref" in record:
             if self.shared is None or record.get("position") != position:
                 raise StorageError(f"cannot resolve shared snapshot: {path}")
@@ -146,12 +151,11 @@ class RunStore:
             if metadata_only:
                 metadata = self.shared.metadata(reference, position)
                 return {
-                    "config_dependencies": metadata["dependencies"],
-                    "_shared_reused": record["shared_reused"],
+                    "config_dependencies": metadata["config_dependencies"],
+                    "shared_reused": record["shared_reused"],
                 }
             snapshot = self.shared.load(reference, position)
-            snapshot["_cache_ref"] = reference
-            snapshot["_shared_reused"] = record["shared_reused"]
+            snapshot["cache_ref"] = reference
             return snapshot
         validate_snapshot(record, position)
         return record
@@ -162,25 +166,42 @@ class RunStore:
         )
         return record.get("cache_ref")
 
-    def reference(self, position, reference, *, reused):
+    def reference(self, position, reference, completed, *, reused):
+        record = {"position": position, "cache_ref": reference, "shared_reused": reused}
+        if completed.get("leaf"):
+            # Keep leaf completion readable after its shared metadata is pruned.
+            for key in ("leaf", "name", "config_dependencies", "elapsed_seconds"):
+                record[key] = completed[key]
         write_record(
             self.stage_dir(position) / "completed.pkl",
-            {"position": position, "cache_ref": reference, "shared_reused": reused},
+            record,
             self.serializer,
         )
 
-    def complete(self, checkpoint: "Checkpoint", name: str, output: Any, cache_parent):
+    def complete(
+        self,
+        checkpoint: "Checkpoint",
+        name: str,
+        output: Any,
+        cache_parent,
+        *,
+        leaf=False,
+    ) -> float:
         position = checkpoint.position
         record = {
             "position": position,
             "name": name,
-            "output": output,
-            "state": {} if checkpoint.record is None else checkpoint.state,
             "config_dependencies": checkpoint.dependencies,
-            **self.random_snapshot(),
-            "elapsed_seconds": checkpoint.elapsed(),
         }
-        reference = None
+        if leaf:
+            record["leaf"] = True
+        else:
+            record.update(
+                output=output,
+                state={} if checkpoint.record is None else checkpoint.state,
+                **self.random_snapshot(),
+            )
+        record["elapsed_seconds"] = checkpoint.elapsed()
         if cache_parent is None:
             write_record(
                 self.stage_dir(position) / "completed.pkl", record, self.serializer
@@ -193,9 +214,9 @@ class RunStore:
             )
             record["metrics"] = self.metrics.snapshot(self.run_id, position)
             reference = self.shared.publish(cache_parent, record)
-            self.reference(position, reference, reused=False)
+            self.reference(position, reference, record, reused=False)
         self.checkpoint_path(position).unlink(missing_ok=True)
-        return reference, record["elapsed_seconds"]
+        return record["elapsed_seconds"]
 
     def checkpoint_path(self, position) -> Path:
         return self.stage_dir(position) / "checkpoint.pkl"

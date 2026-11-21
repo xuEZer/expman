@@ -2,6 +2,7 @@
 
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -12,9 +13,6 @@ import pytest
 from expman import Pipeline, Stage
 from expman.observation.registry import ensure_ids
 from expman.observation.status import RecordedBatch
-from expman.storage.batch import BatchStore
-from expman.storage.prefix_cache import PrefixCache
-from expman.storage.run import RunStore
 
 
 class SumSquares(Stage):
@@ -37,27 +35,32 @@ class Scale(Stage):
             product = torch.tensor(data, device="cuda") * ctx.cfg["factor"]
             ctx.checkpoint(step + 1, {"__payload__": product.item()})
             raise RuntimeError("retry from checkpoint")
-        return ctx.checkpoint_state["__payload__"]
+        ctx.log_metrics({"total": ctx.checkpoint_state["__payload__"]})
 
 
 cuda_pipeline = Pipeline([SumSquares, Scale])
+
+
+class Increment(Stage):
+    def process(self, data, ctx):
+        return data + 1
 
 
 class PauseAfterCheckpoint(Stage):
     def process(self, data, ctx):
         import torch
 
-        total = ctx.checkpoint_state or 0
+        total = data if ctx.checkpoint_state is None else ctx.checkpoint_state
         for step in ctx.resume_range(0, 2):
             total += torch.tensor(step + 10, device="cuda").item()
             ctx.checkpoint(step + 1, total)
             if step == 0:
                 Path(ctx.cfg["ready"]).touch()
                 sleep(120)
-        return total
+        ctx.log_metrics({"total": total})
 
 
-pause_pipeline = Pipeline([PauseAfterCheckpoint])
+pause_pipeline = Pipeline([SumSquares, Increment, PauseAfterCheckpoint])
 CLI = [sys.executable, "-m", "expman"]
 
 
@@ -70,21 +73,15 @@ def cli_env():
     return env
 
 
-def read_outputs(directory, batch):
-    """Resolve each run's final stage snapshot, including shared prefixes."""
-    store = BatchStore(directory)
-    signature = batch.manifest["pipeline"]
-    outputs = []
-    for run in batch.runs:
-        seed = store.load_config(run.run_id)["seed"]
-        snapshots = RunStore(directory / "experiments" / run.run_id)
-        snapshots.shared = PrefixCache(
-            directory / "cache", signature, seed, store.serializer
+def recorded_totals(directory, batch):
+    with sqlite3.connect(directory / "metrics.sqlite3") as db:
+        values = dict(
+            db.execute(
+                "SELECT run_id, value FROM metrics WHERE metric_path = ? AND step = -1",
+                ('["total"]',),
+            )
         )
-        final = snapshots.completed((len(signature) - 1,))
-        assert final is not None
-        outputs.append(final["output"])
-    return outputs
+    return [values[run.run_id] for run in batch.runs]
 
 
 def test_cuda_batch_reuses_prefix_and_recovers_checkpoint(
@@ -112,7 +109,8 @@ def test_cuda_batch_reuses_prefix_and_recovers_checkpoint(
     batch = RecordedBatch.read(directory)
     assert [run.state for run in batch.runs] == ["succeeded", "succeeded"]
     expected = [sum(i * i for i in range(256)) * factor for factor in (2, 3)]
-    assert read_outputs(directory, batch) == expected
+    assert recorded_totals(directory, batch) == expected
+    assert not list((directory / "cache").rglob("*.pkl"))
     for run in batch.runs:
         assert [attempt["error_message"] for attempt in run.attempts] == [
             "retry from checkpoint",
@@ -180,14 +178,26 @@ def test_stop_and_resume_from_a_committed_cuda_checkpoint(
     )
     resume = shlex.split(hint.removeprefix("Stopped; resume with: "))
     assert resume == ["expman", "resume", "0", "--batches-dir", str(parent)]
-    subprocess.run([*CLI, *resume[1:]], **where, check=True, timeout=90)
     directory = ensure_ids(parent)[0]
+    cache = directory / "cache"
+    assert not list(cache.glob("*/root/*/*.pkl"))
+    assert len(list(cache.rglob("snapshot.pkl"))) == 1
+
+    subprocess.run([*CLI, *resume[1:]], **where, check=True, timeout=90)
     batch = RecordedBatch.read(directory)
     (run,) = batch.runs
     assert [attempt["status"] for attempt in run.attempts] == ["cancelled", "succeeded"]
-    assert read_outputs(directory, batch) == [21]
+    assert recorded_totals(directory, batch) == [
+        sum(i * i for i in range(256)) + 1 + 21
+    ]
+    assert not list(cache.rglob("*.pkl"))
     history = batch.manifest["stage_history"]
-    assert [row["attempt"] for row in history] == [1, 2]
+    assert [(row["stage"], row["attempt"]) for row in history] == [
+        (0, 1),
+        (1, 1),
+        (2, 1),
+        (2, 2),
+    ]
     assert all(
         row["device"] == gpu_device and row["gpu_limit_verified"] for row in history
     )

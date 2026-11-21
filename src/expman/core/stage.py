@@ -53,6 +53,10 @@ class Stage[InputT, OutputT]:
     def process(self, data: InputT, ctx: RunContext) -> OutputT:
         """Execute the Stage once and return the next pipeline value.
 
+        The last Stage in a Pipeline must be a synchronous Python method with readable source.
+        Let it finish naturally, use a bare return, or write return None.
+        Record scalar results with ctx.log_metrics() or save artifacts in user code.
+
         Use ctx.resume_range(start, stop) to obtain a resumable iterator and
         ctx.checkpoint(position, state) to persist state explicitly. The user
         controls the loop, the saved state shape and the resume positions.

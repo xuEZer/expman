@@ -44,7 +44,7 @@ class Work(Stage):
 
     def process(self, data, ctx):
         sleep(ctx.cfg["delay"])
-        return ctx.cfg["item"]
+        ctx.log_metrics({"item": ctx.cfg["item"]})
 
 
 class Memory:
@@ -1085,7 +1085,6 @@ def test_nested_progress_flows_from_worker_ipc_to_snapshot(tmp_path):
         def process(self, data, ctx):
             ctx.report_progress(1, total=5)
             ctx.report_progress(2, total=5)
-            return data
 
     config = tmp_path / "nested.yaml"
     config.write_text("device: [0]\nseed: 0\nmarkers: test\ndelay: 0\nitem: 0\n")

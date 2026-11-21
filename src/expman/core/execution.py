@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from expman.core.context import RunContext
 from expman.core.dependencies import stage_dependencies
 from expman.core.events import Status
-from expman.storage.base import RecoveryWarning
+from expman.storage.base import RecoveryWarning, StorageError
 from expman.storage.run import Checkpoint, RunStore
 
 if TYPE_CHECKING:
@@ -39,19 +39,13 @@ class ManagedStages:
     def __init__(self, store: RunStore, base: tuple[int, ...], signature: list):
         store.bind_pipeline(base, signature)
         self.store = store
-        self.parent = "root" if store.shared is not None and not base else None
-        self.lookup = self.parent is not None
 
     def _restore(self, ctx, snapshot, started, *, shared_reference=None):
         position = ctx._stage_path
-        self.store.restore_random(snapshot)
-        if shared_reference is None:
-            reference = snapshot.get("_cache_ref")
-            self.parent = reference[2] if reference is not None else None
-            self.lookup = self.lookup and snapshot.get("_shared_reused", False)
-        else:
+        if not snapshot.get("leaf"):
+            self.store.restore_random(snapshot)
+        if shared_reference is not None:
             self.store.reuse(position, ctx.attempt, shared_reference, snapshot)
-            self.parent = shared_reference[2]
         duration = perf_counter() - started
         with ctx.observe(snapshot["name"], kind="stage", reused=True):
             self.store.status(
@@ -62,9 +56,41 @@ class ManagedStages:
                 elapsed_seconds=snapshot["elapsed_seconds"],
                 restore_seconds=duration,
             )
-            return snapshot["output"]
+            return snapshot.get("output")
 
-    def run(self, stage_type: type[Stage[Any, Any]], data: Any, ctx: RunContext) -> Any:
+    def run_scheduled(self, stages, index: int, ctx: RunContext) -> None:
+        """Start the scheduled Stage from its immediate predecessor's output and RNG."""
+        position = (index,)
+        data = None
+        cache_parent = "root" if index == 0 and self.store.shared is not None else None
+        if index and not self.store.has_completed(position):
+            previous = self.store.completed((index - 1,))
+            if previous is None:
+                raise StorageError(
+                    f"scheduled Stage {index} has no completed predecessor"
+                )
+            self.store.restore_random(previous)
+            data = previous["output"]
+            if reference := previous.get("cache_ref"):
+                cache_parent = reference[2]
+        scoped = replace(ctx, stage_id=index, _stage_path=position)
+        self.run(
+            stages[index],
+            data,
+            scoped,
+            cache_parent=cache_parent,
+            leaf=index == len(stages) - 1,
+        )
+
+    def run(
+        self,
+        stage_type: type[Stage[Any, Any]],
+        data: Any,
+        ctx: RunContext,
+        *,
+        cache_parent: str | None = None,
+        leaf=False,
+    ) -> Any:
         store = self.store
         position = ctx._stage_path
         started = perf_counter()
@@ -74,15 +100,16 @@ class ManagedStages:
 
         try:
             dependencies = stage_dependencies(stage_type, ctx.cfg)
-            if self.lookup and store.can_reuse(position):
+            if cache_parent is not None and store.can_reuse(position):
                 assert store.shared is not None
-                candidate = store.shared.find(self.parent, position, dependencies)
+                candidate = store.shared.find(
+                    cache_parent, position, dependencies, leaf=leaf
+                )
                 if candidate is not None:
                     reference, snapshot = candidate
                     return self._restore(
                         ctx, snapshot, started, shared_reference=reference
                     )
-            self.lookup = False
             store.status(position, Status.RUNNING.value, ctx.attempt)
             checkpoint = Checkpoint(
                 store,
@@ -94,10 +121,9 @@ class ManagedStages:
             stage = stage_type()
             with stage_scope(stage.name, ctx, checkpoint) as stage_context:
                 output = stage.process(data, stage_context)
-                reference, elapsed = store.complete(
-                    checkpoint, stage.name, output, self.parent
+                elapsed = store.complete(
+                    checkpoint, stage.name, output, cache_parent, leaf=leaf
                 )
-            self.parent = reference[2] if reference is not None else None
             store.status(
                 position, Status.SUCCEEDED.value, ctx.attempt, elapsed_seconds=elapsed
             )

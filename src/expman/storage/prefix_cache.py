@@ -1,7 +1,9 @@
 """Immutable, Batch-local completed prefix nodes with atomic publication."""
 
 import pickle
+import shutil
 import warnings
+from contextlib import suppress
 from hashlib import sha256
 from uuid import uuid4
 
@@ -45,20 +47,27 @@ class PrefixCache:
         return directory
 
     def load(self, reference, position) -> dict:
-        directory = self._directory(reference)
-        self.metadata(reference, position)
+        return self._snapshot(self.metadata(reference, position))
+
+    def _snapshot(self, metadata) -> dict:
+        if metadata.get("leaf"):
+            return metadata
+        directory = self._directory(metadata["reference"])
         record = read_record(directory / "snapshot.pkl", self.serializer)
-        validate_snapshot(record, position, shared=True)
+        validate_snapshot(record, metadata["position"], shared=True)
         return record
 
-    def _candidates(self, parent, position, dependencies):
+    def _candidates(self, parent, position, dependencies, leaf):
         """Yield the usable ``(reference, metadata)`` nodes for one position."""
         directory = self.root / self.key / parent
         for path in sorted(directory.glob("*/metadata.pkl")):
             reference = (self.key, parent, path.parent.name)
             try:
                 metadata = self.metadata(reference, position)
-                if metadata["dependencies"] == dependencies:
+                if (
+                    metadata.get("leaf", False) == leaf
+                    and metadata["config_dependencies"] == dependencies
+                ):
                     yield reference, metadata
             except (
                 StorageError,
@@ -88,17 +97,21 @@ class PrefixCache:
             or metadata.get("reference") != reference
             or not isinstance(metadata.get("dependencies"), list)
             or not isinstance(metadata.get("metrics"), list)
+            or (metadata.get("leaf") and not isinstance(metadata.get("name"), str))
         ):
             raise StorageError("invalid shared-cache metadata")
         stage_seconds(metadata)
+        metadata["config_dependencies"] = metadata.pop("dependencies")
         return metadata
 
     def find(
-        self, parent, position, dependencies
+        self, parent, position, dependencies, *, leaf=False
     ) -> tuple[tuple[str, str, str], dict] | None:
-        for reference, _metadata in self._candidates(parent, position, dependencies):
+        for reference, metadata in self._candidates(
+            parent, position, dependencies, leaf
+        ):
             try:
-                return reference, self.load(reference, position)
+                return reference, self._snapshot(metadata)
             except (
                 StorageError,
                 ValueError,
@@ -114,17 +127,21 @@ class PrefixCache:
         return None
 
     def find_metadata(
-        self, parent, position, dependencies
+        self, parent, position, dependencies, *, leaf=False
     ) -> tuple[tuple[str, str, str], dict] | None:
         """Like ``find``, but returns the metadata without the snapshot."""
-        for reference, metadata in self._candidates(parent, position, dependencies):
+        for reference, metadata in self._candidates(
+            parent, position, dependencies, leaf
+        ):
             return reference, metadata
         return None
 
     def publish(self, parent, record) -> tuple[str, str, str]:
         reference = (self.key, parent, uuid4().hex)
         directory = self._directory(reference)
-        write_record(directory / "snapshot.pkl", record, self.serializer)
+        leaf = record.get("leaf", False)
+        if not leaf:
+            write_record(directory / "snapshot.pkl", record, self.serializer)
         write_record(
             directory / "metadata.pkl",
             {
@@ -136,7 +153,19 @@ class PrefixCache:
                 # read the snapshot itself.
                 "elapsed_seconds": record["elapsed_seconds"],
                 "metrics": record["metrics"],
+                **({"leaf": True, "name": record["name"]} if leaf else {}),
             },
             self.serializer,
         )
         return reference
+
+    def reclaim(self, reference, *, leaf=False) -> None:
+        """Remove this published node. Its children live in separate directories."""
+        directory = self._directory(reference)
+        if directory.resolve() != self.root.resolve().joinpath(*reference):
+            raise StorageError(f"unexpected link in shared cache: {directory}")
+        if leaf and (directory / "snapshot.pkl").exists():
+            # Older batches stored their final result here as a user artifact.
+            return
+        with suppress(FileNotFoundError):
+            shutil.rmtree(directory)

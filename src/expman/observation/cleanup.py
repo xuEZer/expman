@@ -57,28 +57,43 @@ def _references(root: Path, serializer: Serializer) -> set[tuple]:
 def clean(
     output_dir: str | Path, *, serializer: Serializer | None = None
 ) -> CleanReport:
-    """Delete unreferenced cache nodes, preserving resumability and lazy results.
+    """Delete orphaned publications, preserving nodes referenced by runs.
 
     Use the batch's serializer when it differs from the default. Unreadable
     top-level completion records abort the scan before any nodes are removed.
     """
     root = Path(output_dir)
-    cache = root / "cache"
-    report = CleanReport()
-    if not cache.is_dir():
-        return report
+    if not (root / "cache").is_dir():
+        return CleanReport()
     with run_lock(root):
-        referenced = _references(
+        return clean_locked(
             root, serializer if serializer is not None else PickleSerializer()
         )
-        for node in cache.glob("*/*/*"):
-            parts = node.relative_to(cache).parts
-            if parts in referenced or not node.is_dir():
-                continue
-            if node.resolve() != root.resolve() / "cache" / Path(*parts):
-                raise StorageError(f"unexpected link in shared cache: {node}")
-            sizes = [item.stat().st_size for item in node.iterdir() if item.is_file()]
-            shutil.rmtree(node)
-            report.files += len(sizes)
-            report.bytes += sum(sizes)
+
+
+def clean_locked(root: Path, serializer: Serializer) -> CleanReport:
+    """Sweep abandoned publications while the batch lock is held and workers are idle."""
+    cache = root / "cache"
+    expected_cache = root.resolve() / "cache"
+    report = CleanReport()
+    nodes = list(cache.glob("*/*/*"))
+    referenced = _references(root, serializer) if nodes else set()
+    for node in nodes:
+        parts = node.relative_to(cache).parts
+        if parts in referenced or not node.is_dir():
+            continue
+        if node.resolve() != expected_cache.joinpath(*parts):
+            raise StorageError(f"unexpected link in shared cache: {node}")
+        sizes = [item.stat().st_size for item in node.iterdir() if item.is_file()]
+        shutil.rmtree(node)
+        report.files += len(sizes)
+        report.bytes += sum(sizes)
+    # Workers may publish a sibling at any time during a run. Once idle the
+    # empty parent-ID and pipeline/seed directories can also be removed.
+    for pattern in ("*/*", "*"):
+        for directory in cache.glob(pattern):
+            if directory.is_dir() and not any(directory.iterdir()):
+                if directory.resolve() != expected_cache / directory.relative_to(cache):
+                    raise StorageError(f"unexpected link in shared cache: {directory}")
+                directory.rmdir()
     return report

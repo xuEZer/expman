@@ -20,8 +20,8 @@ class First(Stage):
     def config_dependencies(cls, cfg):
         return {}
 
-    def process(self, data, ctx):
-        return data
+    def process(self, data, ctx) -> None:
+        pass
 
 
 class Second(Stage):
@@ -29,8 +29,8 @@ class Second(Stage):
     def config_dependencies(cls, cfg):
         return {"item": True}
 
-    def process(self, data, ctx):
-        return ctx.cfg["item"]
+    def process(self, data, ctx) -> None:
+        pass
 
 
 def test_eta_counts_only_unmaterialized_stage_parameter_groups(tmp_path):

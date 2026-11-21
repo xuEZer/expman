@@ -15,6 +15,11 @@ from expman.storage.base import RecoveryWarning, StorageError, read_record, writ
 from expman.storage.run import RunStore
 
 
+class Finish(Stage):
+    def process(self, data, ctx):
+        pass
+
+
 def managed_context(tmp_path: Path, cfg=None, seed=42):
     """A RunContext whose store continues one seeded random stream."""
     store = RunStore(tmp_path)
@@ -50,7 +55,7 @@ def test_failed_checkpoint_write_preserves_last_saved_step(tmp_path):
 
     ctx, store = managed_context(tmp_path)
     with pytest.raises(StorageError, match="cannot save"):
-        Pipeline([Train]).run(ctx=ctx)
+        Pipeline([Train, Finish]).run(ctx=ctx, stop_after=0)
     assert Train.seen == [0, 1, 2]
     record = store.latest((0,))
     assert record["step"] == 3
@@ -59,7 +64,7 @@ def test_failed_checkpoint_write_preserves_last_saved_step(tmp_path):
     Train.fail_at = None
     Train.seen = []
     ctx, _ = managed_context(tmp_path)
-    result = Pipeline([Train]).run(ctx=ctx)
+    result = Pipeline([Train, Finish]).run(ctx=ctx, stop_after=0)
     assert result == {"epoch": 4, "seen": [0, 1, 2, 3]}
     assert Train.seen == [3]
     assert store.completed((0,))["state"] == result
@@ -78,9 +83,9 @@ def test_checkpoint_preserves_state_when_resume_has_no_steps_left(tmp_path, save
 
     ctx, _ = managed_context(tmp_path)
     with pytest.raises(RuntimeError, match="interrupt"):
-        Pipeline([Train]).run(ctx=ctx)
+        Pipeline([Train, Finish]).run(ctx=ctx, stop_after=0)
     ctx, store = managed_context(tmp_path)
-    assert Pipeline([Train]).run(ctx=ctx) == saved
+    assert Pipeline([Train, Finish]).run(ctx=ctx, stop_after=0) == saved
     assert store.completed((0,))["state"] == saved
 
 
@@ -105,11 +110,37 @@ def test_explicit_checkpoint_restores_random_state(tmp_path):
 
     ctx, _ = managed_context(tmp_path)
     with pytest.raises(RuntimeError):
-        Pipeline([Sampler]).run(ctx=ctx)
+        Pipeline([Sampler, Finish]).run(ctx=ctx, stop_after=0)
     ctx, _ = managed_context(tmp_path)
-    output = Pipeline([Sampler]).run(ctx=ctx)
+    output = Pipeline([Sampler, Finish]).run(ctx=ctx, stop_after=0)
     expected = random.Random(42)
     assert output == [expected.random() for _ in range(4)]
+
+
+def test_scheduled_stage_needs_only_its_predecessors_random_state(tmp_path):
+    draws = []
+
+    class Draw(Stage):
+        def process(self, data, ctx):
+            return random.random()
+
+    class Collect(Stage):
+        def process(self, data, ctx):
+            draws.append((data, random.random()))
+
+    experiment = Experiment(
+        Pipeline([Draw, Collect]),
+        {"seed": 42},
+        output_dir=tmp_path / "run",
+        _cache_root=tmp_path / "cache",
+    )
+    assert experiment.run_stage(0, attempt=1).status is Status.SUCCEEDED
+    (experiment.output_dir / "rng_initial.pkl").unlink()
+    random.random()
+    assert experiment.run_stage(1, attempt=1).status is Status.SUCCEEDED
+    expected = random.Random(42)
+    assert draws == [(expected.random(), expected.random())]
+    assert not (experiment.output_dir / "rng_initial.pkl").exists()
 
 
 def test_direct_nested_stage_leaves_outer_checkpoint_for_retry(tmp_path):
@@ -128,19 +159,23 @@ def test_direct_nested_stage_leaves_outer_checkpoint_for_retry(tmp_path):
                 raise RuntimeError("outer interrupted")
             return Inner().run(ctx.checkpoint_state, ctx) * 2
 
-    pipeline = Pipeline([Outer])
+    pipeline = Pipeline([Outer, Finish])
     ctx, store = managed_context(tmp_path)
     with pytest.raises(RuntimeError, match="outer interrupted"):
         pipeline.run(ctx=ctx)
     assert not store.has_completed((0,))
     assert store.latest((0,))["state"] == 5
     ctx, _ = managed_context(tmp_path)
-    assert pipeline.run(ctx=ctx) == 12
+    assert pipeline.run(ctx=ctx, stop_after=0) == 12
     assert store.completed((0,))["name"] == "Outer"
 
 
 def test_run_resumes_its_own_checkpoint_before_reusing_shared_work(tmp_path):
     calls = []
+
+    class LogMetric(Stage):
+        def process(self, data, ctx):
+            ctx.log_metrics({"result": 5})
 
     class Train(Stage):
         def process(self, data, ctx):
@@ -148,7 +183,7 @@ def test_run_resumes_its_own_checkpoint_before_reusing_shared_work(tmp_path):
             if len(calls) == 1:
                 ctx.checkpoint(1, 5)
                 raise RuntimeError("interrupted")
-            return 5
+            Pipeline([LogMetric]).run(ctx=ctx)
 
     pipeline = Pipeline([Train])
     first, second, third = (
@@ -167,7 +202,10 @@ def test_run_resumes_its_own_checkpoint_before_reusing_shared_work(tmp_path):
     assert first.run_stage(0, attempt=2).status is Status.SUCCEEDED
     assert third.run_stage(0, attempt=1).status is Status.SUCCEEDED
     assert calls == [("first", None), ("second", None), ("first", 5)]
-    assert third._store.completed((0,))["output"] == 5
+    rows = third._metrics.snapshot("third", (0,))
+    assert [value for _, _, _, value in rows] == [5]
+    assert rows == second._metrics.snapshot("second", (0,))
+    assert not list((tmp_path / "cache").rglob("snapshot.pkl"))
 
 
 def test_both_cache_readers_compare_the_target_stage_declaration(tmp_path):
@@ -179,9 +217,15 @@ def test_both_cache_readers_compare_the_target_stage_declaration(tmp_path):
         def process(self, data, ctx):
             return sum(ctx.cfg[key] for key in self.config_dependencies(ctx.cfg))
 
+    class WriteTotal(Stage):
+        def process(self, data, ctx):
+            ctx.log_metrics({"total": data})
+
     path = tmp_path / "experiments.yaml"
     path.write_text("seed: 42\ndevice: [0]\ninput_x: 2\ncombines: [{}, {input_y: 5}]")
-    batch = make_batch(Pipeline([SumInputs]), path, output_dir=tmp_path / "batch")
+    batch = make_batch(
+        Pipeline([SumInputs, WriteTotal]), path, output_dir=tmp_path / "batch"
+    )
     first, second = batch.experiments
     assert first.run_stage(0, attempt=1).status is Status.SUCCEEDED
     assert first._store.completed((0,))["output"] == 2
@@ -202,14 +246,14 @@ def test_invalid_timing_restarts_checkpoint_but_rejects_completed_stage(tmp_path
             return "done"
 
     store = RunStore(tmp_path)
-    pipeline = Pipeline([Train])
+    pipeline = Pipeline([Train, Finish])
     with pytest.raises(RuntimeError, match="interrupted"):
         pipeline.run(ctx=RunContext(_store=store))
     checkpoint = store.latest((0,))
     del checkpoint["elapsed_seconds"]
     write_record(store.checkpoint_path((0,)), checkpoint, store.serializer)
     with pytest.warns(RecoveryWarning, match="invalid cumulative stage duration"):
-        assert pipeline.run(ctx=RunContext(_store=store)) == "done"
+        assert pipeline.run(ctx=RunContext(_store=store), stop_after=0) == "done"
     assert starts == [None, None]
 
     completed = store.completed((0,))

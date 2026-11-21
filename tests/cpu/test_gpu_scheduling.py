@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import subprocess
@@ -31,6 +32,7 @@ from expman.scheduling._resource import _admits
 from expman.scheduling.scheduler import GpuScheduler
 from expman.settings import settings
 from expman.storage.base import PickleSerializer, read_record
+from expman.storage.prefix_cache import PrefixCache
 
 IMPORT_DEVICE = os.environ.get("CUDA_VISIBLE_DEVICES")
 
@@ -77,14 +79,14 @@ class GpuWork(Stage):
                             raise RuntimeError("test release timed out")
                         sleep(0.01)
                 sleep(ctx.cfg["delay"])
-                (root / f"{ctx.run_id}.finished").touch()
-                return {
+                worker_info = {
                     "device": os.environ.get("CUDA_VISIBLE_DEVICES"),
                     "import_device": IMPORT_DEVICE,
                     "pid": os.getpid(),
                     "saved": state["saved"],
                     "cfg_devices": list(ctx.cfg["device"]),
                 }
+                (root / f"{ctx.run_id}.finished").write_text(json.dumps(worker_info))
             finally:
                 (root / f"{ctx.run_id}.finally").touch()
         return None
@@ -94,7 +96,6 @@ class CudaOomOnce(Stage):
     def process(self, data, ctx):
         if ctx.attempt == 1:
             raise RuntimeError("CUDA out of memory")
-        return 1
 
 
 class SharedWork(Stage):
@@ -127,8 +128,9 @@ class Consume(Stage):
 
     def process(self, data, ctx):
         root = Path(ctx.cfg["markers"])
-        (root / f"{ctx.run_id}.consume").write_text(str(os.getpid()))
-        return data + ctx.cfg["offset"]
+        total = data + ctx.cfg["offset"]
+        ctx.log_metrics({"total": total})
+        (root / f"{ctx.run_id}.consume").write_text(str(total))
 
 
 class ConditionalWork(Stage):
@@ -139,8 +141,8 @@ class ConditionalWork(Stage):
             dependencies["predictor"] = True
         return dependencies
 
-    def process(self, data, ctx):
-        return ctx.cfg["imputer"]
+    def process(self, data, ctx) -> None:
+        pass
 
 
 class Memory:
@@ -387,12 +389,14 @@ class TestGpuScheduling:
         module_name = "worker_settings_stage"
         (tmp_path / f"{module_name}.py").write_text(
             "import os\n"
+            "from pathlib import Path\n"
             "import expman\n"
             'if "EXPMAN_IPC_FD" in os.environ:\n'
             "    expman.set(query_timeout=2.0)\n"
             "class ReadSettings(expman.Stage):\n"
             "    def process(self, data, ctx):\n"
-            '        return expman.get("query_timeout"), expman.get("retries")\n'
+            '        values = expman.get("query_timeout"), expman.get("retries")\n'
+            '        Path(ctx.cfg["marker"]).write_text(str(values))\n'
         )
         monkeypatch.syspath_prepend(tmp_path)
         monkeypatch.setattr(settings, "retries", 4)
@@ -400,7 +404,9 @@ class TestGpuScheduling:
             stage = import_module(module_name).ReadSettings
             pipeline = Pipeline([stage])
             batch = batch_helpers.make_batch(
-                pipeline, {"device": [0], "seed": 0}, output_dir=tmp_path / "batch"
+                pipeline,
+                {"device": [0], "seed": 0, "marker": str(tmp_path / "settings")},
+                output_dir=tmp_path / "batch",
             )
             # A new execution session may override its monitor timeout. The batch
             # keeps the retry count it recorded when it was created.
@@ -409,7 +415,7 @@ class TestGpuScheduling:
             resumed = batch_helpers.restore_batch(pipeline, batch.output_dir)
             (result,) = resumed.run()
             assert result.status is Status.SUCCEEDED
-            assert result.output == (5.0, 4)
+            assert (tmp_path / "settings").read_text() == "(5.0, 4)"
         finally:
             sys.modules.pop(module_name, None)
 
@@ -418,15 +424,14 @@ class TestGpuScheduling:
         batch = warm(make_batch(tmp_path, count=4, delay=0.25))
         results = batch.run()
         assert all(item.status is Status.SUCCEEDED for item in results)
-        assert {item.output["device"] for item in results} == {
-            "GPU-test-0",
-            "GPU-test-1",
-        }
-        assert len({item.output["pid"] for item in results}) == 4
-        assert all(
-            item.output["import_device"] == item.output["device"] for item in results
-        )
-        assert all(item.output["cfg_devices"] == [0, 1] for item in results)
+        workers = [
+            json.loads((tmp_path / f"{item.run_id}.finished").read_text())
+            for item in results
+        ]
+        assert {item["device"] for item in workers} == {"GPU-test-0", "GPU-test-1"}
+        assert len({item["pid"] for item in workers}) == 4
+        assert all(item["import_device"] == item["device"] for item in workers)
+        assert all(item["cfg_devices"] == [0, 1] for item in workers)
         assert any(item.get("concurrency", 0) > 1 for item in batch.state.stage_history)
         measured = [
             item for item in batch.state.stage_history if not item.get("reused")
@@ -440,9 +445,7 @@ class TestGpuScheduling:
             assert db.execute("SELECT count(*) FROM metrics").fetchone()[0] == 40
         assert batch.recorder.events
         resumed = batch_helpers.restore_batch(Pipeline([GpuWork]), batch.output_dir)
-        assert [item.output for item in resumed.run()] == [
-            item.output for item in results
-        ]
+        assert resumed.run() == results
         assert resumed.devices == (0, 1)
 
     @pytest.mark.simulated_gpu
@@ -458,7 +461,7 @@ class TestGpuScheduling:
 
         results = batch.run()
 
-        assert [result.output for result in results] == [11, 12]
+        assert all(result.status is Status.SUCCEEDED for result in results)
         assert sorted(entry["stage"] for entry in batch.state.stage_history) == [
             0,
             0,
@@ -468,9 +471,10 @@ class TestGpuScheduling:
         assert all(
             (tmp_path / f"{result.run_id}.prepare").exists() for result in results
         )
-        assert all(
-            (tmp_path / f"{result.run_id}.consume").exists() for result in results
-        )
+        assert [
+            int((tmp_path / f"{result.run_id}.consume").read_text())
+            for result in results
+        ] == [11, 12]
         dependencies = {
             entry["stage"]: {path for path, _digest in entry["dependencies"]}
             for entry in batch.state.stage_history
@@ -486,6 +490,63 @@ class TestGpuScheduling:
         predicted = scheduler.stages.duration(results[0].run_id, 1)
         assert predicted is not None
         assert 0 < predicted.lower <= predicted.center <= predicted.upper
+
+    @pytest.mark.simulated_gpu
+    def test_shared_parent_survives_a_failed_child_branch(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(settings, "retries", 0)
+        path = tmp_path / "branches.yaml"
+        path.write_text(
+            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\nitem: 2\noffset: 3\n"
+            "grid:\n  offset: [3, invalid]\n"
+        )
+        batch = batch_helpers.make_batch(
+            Pipeline([Prepare, Consume]), path, output_dir=tmp_path / "batch"
+        )
+
+        success, failure = batch.run()
+
+        assert success.status is Status.SUCCEEDED
+        assert (tmp_path / f"{success.run_id}.consume").read_text() == "5"
+        assert failure.status is Status.FAILED
+        first, second = (run._store for run in batch.experiments)
+        assert first.completed_reference((0,)) == second.completed_reference((0,))
+        parent = second.completed((0,))
+        assert parent is not None and parent["output"] == 2
+
+    @pytest.mark.simulated_gpu
+    def test_resume_finishes_cache_cleanup_after_the_last_success(self, tmp_path):
+        pipeline = Pipeline([Prepare, Consume])
+        directory = tmp_path / "batch"
+        batch = batch_helpers.make_batch(
+            pipeline,
+            {
+                "device": [0],
+                "seed": 0,
+                "markers": str(tmp_path),
+                "item": 2,
+                "offset": 3,
+            },
+            output_dir=directory,
+        )
+        with (
+            patch.object(PrefixCache, "reclaim", side_effect=KeyboardInterrupt),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            batch.run()
+
+        cache = directory / "cache"
+        (saved,) = cache.glob("*/root/*/snapshot.pkl")
+        # A worker can die after writing a snapshot but before linking it to a run.
+        orphan = saved.parent.with_name("f" * 32)
+        orphan.mkdir()
+        (orphan / "snapshot.pkl").write_bytes(b"unpublished snapshot")
+        resumed = batch_helpers.restore_batch(pipeline, directory)
+        assert not resumed.state.queue and not resumed.state.active_gpu
+        assert resumed.results[0].status is Status.SUCCEEDED
+        with patch.object(GpuScheduler, "_launch") as launch:
+            resumed.run()
+        launch.assert_not_called()
+        assert not list(cache.iterdir())
 
     def test_zero_sample_cannot_price_an_mps_context(self, tmp_path):
         batch = make_batch(tmp_path, count=2, devices=[0])
@@ -578,11 +639,11 @@ class TestGpuScheduling:
     def test_known_stage_group_has_only_one_runnable_representative(self, tmp_path):
         path = tmp_path / "groups.yaml"
         path.write_text(
-            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\nunused: 1\n"
+            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\noffset: 0\nunused: 1\n"
             "grid:\n  unused: [1, 2, 3]\n"
         )
         batch = batch_helpers.make_batch(
-            Pipeline([SharedWork]), path, output_dir=tmp_path / "groups"
+            Pipeline([SharedWork, Consume]), path, output_dir=tmp_path / "groups"
         )
         scheduler = GpuScheduler(batch)
 
@@ -691,6 +752,9 @@ class TestGpuScheduling:
             @classmethod
             def config_dependencies(cls, cfg):
                 return {"left": True, "right": True}
+
+            def process(self, data, ctx) -> None:
+                pass
 
         path = tmp_path / "cfg.yaml"
         path.write_text(
@@ -927,42 +991,43 @@ class TestGpuScheduling:
 
     @pytest.mark.simulated_gpu
     def test_shared_prefix_is_materialized_without_worker_per_member(self, tmp_path):
-        # SharedWork declares no dependencies, so every batch member shares one
-        # reusable group and receives a local cache reference without a worker.
         output_dir = tmp_path / "shared-two"
         path = tmp_path / "shared.yaml"
-        path.write_text("device: [0]\nseed: 0\nunused: 1\ngrid:\n  unused: [1, 2]\n")
-        batch = batch_helpers.make_batch(
-            Pipeline([SharedWork]), path, output_dir=output_dir
+        path.write_text(
+            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\noffset: 1\n"
+            "combines: [{unused: 1}, {unused: 2}, {offset: 2}]\n"
         )
+        pipeline = Pipeline([SharedWork, Consume])
+        batch = batch_helpers.make_batch(pipeline, path, output_dir=output_dir)
         seeded = Experiment(
-            Pipeline([SharedWork]),
-            {"seed": 0, "unused": 0},
+            pipeline,
+            {"seed": 0},
             output_dir=tmp_path / "seed",
             _cache_root=output_dir / "cache",
         )
-        seeded.run_stage(0, attempt=1)
-        expected = seeded._store.completed((0,))["output"]
-        launches = []
-        original_launch = GpuScheduler._launch
+        assert seeded.run_stage(0, attempt=1).status is Status.SUCCEEDED
+        prefix = seeded._store.completed((0,))
+        assert prefix is not None
+        expected = prefix["output"]
 
-        def counted(scheduler, *args, **kwargs):
-            launches.append(True)
-            return original_launch(scheduler, *args, **kwargs)
-
-        with patch.object(GpuScheduler, "_launch", counted):
-            results = batch.run()
+        results = batch.run()
         assert all(item.status is Status.SUCCEEDED for item in results)
-        assert len(launches) <= 1
-        assert [item.output for item in results] == [expected, expected]
-        references = [
-            experiment._store.completed_reference((0,))
-            for experiment in batch.experiments
-        ]
-        assert references[0] == references[1]
-        assert (
-            batch.experiments[1]._store.completed((0,))["state"]["producer"] == expected
-        )
+        assert [
+            entry["reused"]
+            for entry in batch.state.stage_history
+            if entry["stage"] == 0
+        ] == [True, True, True]
+        assert len(list(tmp_path.glob("*.consume"))) == 2
+        with sqlite3.connect(output_dir / "metrics.sqlite3") as db:
+            for result, offset in zip(results, [1, 1, 2], strict=True):
+                metrics = dict(
+                    db.execute(
+                        "SELECT metric_path, value FROM metrics WHERE run_id = ?",
+                        (result.run_id,),
+                    )
+                )
+                assert metrics == {'["loss"]': 0.25, '["total"]': expected + offset}
+        assert not list((output_dir / "cache").rglob("*.pkl"))
 
     @pytest.mark.simulated_gpu
     @pytest.mark.parametrize("crash", [False, True], ids=["fail-once", "crash"])
@@ -1021,21 +1086,15 @@ class TestGpuScheduling:
         results = resumed.run()
         assert all(item.status is Status.SUCCEEDED for item in results)
         # The state attribute comes from the checkpoint, not a re-executed loop.
-        saved = [item.output["saved"] for item in results]
+        saved = [
+            json.loads((tmp_path / f"{item.run_id}.finished").read_text())["saved"]
+            for item in results
+        ]
         assert len(saved) == 2
         assert all(value == 1 for value in saved)
         assert all(len(item.attempts) in (1, 2) for item in results)
         assert max(len(item.attempts) for item in results) == 2
         assert max(resumed.state.stage_attempts.values()) == 2
-
-    @pytest.mark.simulated_gpu
-    def test_worker_results_are_read_back_instead_of_retained(self, tmp_path):
-        batch = make_batch(tmp_path, count=1, devices=[0], delay=0.05)
-        result = batch.run()[0]
-        attempt = result.attempts[-1]
-        assert attempt.output_source is not None
-        assert attempt.output["device"] == "GPU-test-0"
-        assert result.output["device"] == "GPU-test-0"
 
     def test_host_pressure_does_not_shed_the_only_running_attempt(self, tmp_path):
         # Shedding distributes a shared host between attempts. With one attempt
