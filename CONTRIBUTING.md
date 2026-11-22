@@ -10,16 +10,9 @@ python -m pip install pre-commit ruff
 pre-commit install --install-hooks
 ```
 
-修改 Python 代码后、每次提交前都运行以下检查。仅修改文档的提交也执行同样的检查。若项目环境已单独安装与本机驱动匹配的 PyTorch，手动检查时可设置 `UV_NO_SYNC=1`，让 uv 使用当前环境，与提交 hook 一致。
+执行 `git commit` 时，pre-commit 自动运行 Ruff 检查和格式检查、Pyright、pytest 和锁文件检查。仅修改文档的提交也执行同样的检查。
 
-```bash
-ruff check .
-ruff format --check .
-uv run pyright
-uv run pytest
-```
-
-需要自动修复时运行 `ruff check --fix .` 和 `ruff format .`，检查差异后重新验证。提交 hook 还会运行 `uv lock --check`。GitHub Actions 在推送和拉取请求时运行 Ruff、Pyright，并在 Python 3.12、3.13、3.14 上运行 CPU 测试。
+需要自动修复时运行 `ruff check --fix .` 和 `ruff format .`，检查差异后再次提交。GitHub Actions 在推送和拉取请求时运行 Ruff、Pyright，并在 Python 3.12、3.13、3.14 上运行 CPU 测试。
 
 CI 的真卡测试使用 `expman-gpu` 标签。该标签用于每个作业独立分配、作业结束即销毁的 Linux x64 runner，须提供 NVIDIA GPU、MPS，以及与锁文件中 PyTorch 兼容的驱动。没有匹配的 runner 时，作业会排队等待。
 
@@ -36,11 +29,7 @@ CI 的真卡测试使用 `expman-gpu` 标签。该标签用于每个作业独立
 
 ## 真实 GPU 验证
 
-pytest 和提交 hook 默认运行 `tests/cpu/` 和 `tests/gpu/`。后者需要 Linux、NVIDIA 驱动、MPS，以及与驱动兼容的 CUDA 版 PyTorch。单独运行真卡测试可执行
-
-```bash
-uv run --no-sync pytest tests/gpu/
-```
+提交 hook 自动运行 `tests/cpu/` 和 `tests/gpu/`。后者需要 Linux、NVIDIA 驱动、MPS，以及与驱动兼容的 CUDA 版 PyTorch。
 
 提交 hook 中的 Pyright 和 pytest 均使用 `uv run --no-sync`，保留项目环境中已安装的 PyTorch。
 

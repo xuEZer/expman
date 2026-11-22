@@ -2,7 +2,7 @@
 
 const PAGE = document.body.dataset.page === "batch" ? "batch" : "list";
 const BATCH_ID = (() => {
-  const match = location.pathname.match(/^\/b\/(\d+)\/?$/);
+  const match = location.pathname.match(/^\/b\/(\d+)(?:\/results)?\/?$/);
   return match ? Number(match[1]) : null;
 })();
 
@@ -151,7 +151,8 @@ function topBar(detail) {
     '<a class="pill" href="/">← 全部批次</a>' +
     '<span class="title">' + esc(name) + "</span>" +
     (detail ? pill(detail.status) : "") +
-    '<span class="spacer"></span>' + themeButton() + stopButton + connectionPill() + "</div>";
+    '<span class="spacer"></span>' +
+    themeButton() + stopButton + connectionPill() + "</div>";
 }
 
 function tiles(s) {
@@ -351,27 +352,79 @@ function statusBody(detail) {
   return html;
 }
 
-function renderBatch(s) {
-  const detail = s.batch;
-  let html = notices(s) + topBar(detail);
-  if (!detail) {
-    // A starting frame, an error, or a workspace overview can reach the page
-    // before its first batch detail. Keep waiting for the next SSE frame.
-    const pending = s.starting || s.degraded || !Object.hasOwn(s, "batch");
-    html += '<div class="card empty">' + (pending
-      ? "正在读取批次 " + esc(BATCH_ID) + " 的快照，稍后自动刷新…"
-      : "当前目录中没有批次 " + esc(BATCH_ID)) + "</div>";
-  } else {
-    html += sourceNote(detail) + statusBody(detail);
+function resultsRequested() {
+  return /\/results\/?$/.test(location.pathname);
+}
+
+function renderBatchPanels(s, snapshotUpdated = false) {
+  const detail = s?.batch;
+  const missing = s && Object.hasOwn(s, "batch") && !detail && !s.starting && !s.degraded;
+  const results = !missing && resultsRequested();
+  const statusPanel = document.getElementById("status-panel");
+  const resultsPanel = document.getElementById("results-panel");
+  const enteringResults = results && resultsPanel.hidden;
+  statusPanel.hidden = results;
+  resultsPanel.hidden = !results;
+  const tabs = document.getElementById("batch-tabs");
+  tabs.hidden = Boolean(missing);
+  for (const tab of tabs.children) {
+    const selected = (tab.id === "tab-results") === results;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
   }
-  app.innerHTML = html;
+  if (results) {
+    if (enteringResults || snapshotUpdated) {
+      refreshResultTable(resultsPanel, BATCH_ID, detail?.running ?? true, enteringResults);
+    }
+  } else if (detail) {
+    statusPanel.innerHTML = sourceNote(detail) + statusBody(detail);
+  } else {
+    statusPanel.innerHTML = '<div class="card empty">' + (missing
+      ? "当前目录中没有批次 " + esc(BATCH_ID)
+      : "正在读取批次 " + esc(BATCH_ID) + " 的快照，稍后自动刷新…") + "</div>";
+  }
+}
+
+function wireBatchTabs() {
+  const tabs = document.getElementById("batch-tabs");
+  function select(tab) {
+    if (tab.getAttribute("aria-selected") === "true") return;
+    const path = "/b/" + BATCH_ID + "/" + (tab.id === "tab-results" ? "results/" : "");
+    history.pushState(null, "", path);
+    renderBatchPanels(state.snapshot);
+  }
+  tabs.onclick = (event) => {
+    const tab = event.target.closest('[role="tab"]');
+    if (tab) select(tab);
+  };
+  tabs.onkeydown = (event) => {
+    const [status, results] = tabs.children;
+    let target;
+    switch (event.key) {
+      case "Home": target = status; break;
+      case "End": target = results; break;
+      case "ArrowLeft":
+      case "ArrowRight": target = event.target === status ? results : status; break;
+      default: return;
+    }
+    event.preventDefault();
+    select(target);
+    target.focus();
+  };
+  globalThis.onpopstate = () => renderBatchPanels(state.snapshot);
+}
+
+function renderBatch(s, snapshotUpdated) {
+  document.getElementById("batch-header").innerHTML = (s ? notices(s) : "") + topBar(s?.batch);
+  renderBatchPanels(s, snapshotUpdated);
   wire();
 }
 
-function render() {
+function render(snapshotUpdated = false) {
   const s = state.snapshot;
-  if (!s) { app.innerHTML = '<p class="muted pad">等待第一个快照…</p>'; return; }
-  if (PAGE === "list") renderList(s); else renderBatch(s);
+  if (PAGE === "batch") renderBatch(s, snapshotUpdated);
+  else if (s) renderList(s);
+  else app.innerHTML = '<p class="muted pad">等待第一个快照…</p>';
 }
 
 function wire() {
@@ -393,7 +446,14 @@ function wire() {
 function connect() {
   const url = PAGE === "batch" && BATCH_ID !== null ? "/api/stream?batch=" + BATCH_ID : "/api/stream";
   const source = new EventSource(url);
-  source.onopen = () => { state.connected = true; render(); };
+  source.onopen = () => {
+    state.connected = true;
+    render();
+    const previousBatch = state.snapshot?.batch;
+    if (previousBatch && resultsRequested()) {
+      refreshResultTable(document.getElementById("results-panel"), BATCH_ID, previousBatch.running, true);
+    }
+  };
   source.onerror = () => { state.connected = false; render(); };
   source.onmessage = (message) => {
     state.connected = true;
@@ -403,10 +463,14 @@ function connect() {
       location.reload();
       return;
     }
-    render();
+    render(true);
   };
 }
 
 document.title = PAGE === "batch" ? "expman 看板 · 批次 " + BATCH_ID : "expman 运行看板";
 
+if (PAGE === "batch") {
+  wireBatchTabs();
+  if (resultsRequested()) render();
+}
 connect();

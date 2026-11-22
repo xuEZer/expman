@@ -5,8 +5,11 @@ The server reads snapshots or durable batch records, serves bundled static
 assets, and forwards stop requests to running batches.
 """
 
+import hashlib
 import json
+import sqlite3
 import threading
+from collections import OrderedDict
 from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,15 +19,19 @@ from urllib.parse import parse_qs, urlparse
 
 from expman.observation.archive import read_batch, summarize
 from expman.observation.registry import ensure_ids
+from expman.observation.results import read_results
 from expman.observation.snapshot import SCHEMA
 from expman.process_control import request_stop
 from expman.settings import settings
+from expman.webui.result_layout import layout_results
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 STATIC_FILES = {
     "app.js": "text/javascript; charset=utf-8",
     "batch.html": "text/html; charset=utf-8",
     "index.html": "text/html; charset=utf-8",
+    "results.js": "text/javascript; charset=utf-8",
+    "results.css": "text/css; charset=utf-8",
     "style.css": "text/css; charset=utf-8",
 }
 
@@ -234,7 +241,12 @@ class Handler(BaseHTTPRequestHandler):
         parts = _parts(path)
         if path in ("/", "/index.html"):
             self._static("index.html")
-        elif len(parts) == 2 and parts[0] == "b" and parts[1].isdigit():
+        elif (
+            len(parts) >= 2
+            and parts[0] == "b"
+            and parts[1].isdigit()
+            and parts[2:] in ([], ["results"])
+        ):
             self._static("batch.html")
         elif len(parts) == 2 and parts[0] == "static":
             self._static(parts[1])
@@ -242,6 +254,21 @@ class Handler(BaseHTTPRequestHandler):
             self._raw(self.dashboard.stream.frame(""))
         elif len(parts) == 3 and parts[:2] == ["api", "batch"] and parts[2].isdigit():
             self._detail(int(parts[2]))
+        elif (
+            len(parts) == 4
+            and parts[:2] == ["api", "batch"]
+            and parts[2].isdigit()
+            and parts[3] == "results"
+        ):
+            directory = self._directory(int(parts[2]))
+            if directory is not None:
+                payload, tag = self.dashboard.results(directory)
+                if self.headers.get("If-None-Match") == tag:
+                    self.send_response(304)
+                    self.send_header("ETag", tag)
+                    self.end_headers()
+                else:
+                    self._raw(payload, etag=tag)
         elif path == "/api/stream":
             self._stream(_batch_key(query))
         elif path == "/api/health":
@@ -281,12 +308,14 @@ class Handler(BaseHTTPRequestHandler):
     def _body(self, payload):
         self._raw(json.dumps(payload, default=str))
 
-    def _raw(self, payload):
+    def _raw(self, payload, *, etag=None):
         content = payload.encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
+        if etag is not None:
+            self.send_header("ETag", etag)
         self.end_headers()
         self.wfile.write(content)
 
@@ -335,6 +364,63 @@ def _batch_key(query: dict) -> int | None:
     return int(values[0])
 
 
+class _BatchResults:
+    """Keep the layout and observe metric commits on one read-only connection."""
+
+    def __init__(self):
+        self.db: sqlite3.Connection | None = None
+        self.database_id = None
+        self.stamp = None
+        self.inputs = None
+        self.response = ("", "")
+
+    def close(self):
+        if self.db is not None:
+            self.db.close()
+            self.db = None
+        self.database_id = None
+
+    def read(self, directory: Path) -> tuple[str, str]:
+        database = directory / "metrics.sqlite3"
+        try:
+            stat = database.stat()
+            database_id = (stat.st_dev, stat.st_ino)
+        except FileNotFoundError:
+            database_id = None
+        if database_id != self.database_id:
+            self.close()
+            if database_id is not None:
+                self.db = sqlite3.connect(
+                    f"{database.as_uri()}?mode=ro", uri=True, check_same_thread=False
+                )
+            self.database_id = database_id
+
+        # The run directories are created together and stay fixed as stages run.
+        try:
+            runs = (directory / "experiments").stat()
+            run_set = (runs.st_dev, runs.st_ino, runs.st_mtime_ns)
+        except FileNotFoundError:
+            run_set = None
+        # Compare data_version only on this connection. Sampling it before
+        # reading the metric rows leaves concurrent commits visible on the next poll.
+        version = (
+            self.db.execute("PRAGMA data_version").fetchone()[0] if self.db else None
+        )
+        stamp = (run_set, database_id, version)
+        if stamp != self.stamp:
+            inputs = read_results(directory, self.db)
+            # Repeated writes also update attempt metadata and commit, but only
+            # the configuration and metric values participate in dependency analysis.
+            if inputs != self.inputs:
+                table = layout_results(*inputs)
+                payload = json.dumps({"name": directory.name, **table})
+                tag = '"' + hashlib.sha256(payload.encode()).hexdigest() + '"'
+                self.response = payload, tag
+                self.inputs = inputs
+            self.stamp = stamp
+        return self.response
+
+
 class DashboardServer(ThreadingHTTPServer):
     """The HTTP server plus the snapshot stream it publishes."""
 
@@ -342,10 +428,29 @@ class DashboardServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address, workspace, *, interval):
+        self._results_lock = threading.Lock()
+        self._tables: OrderedDict[Path, _BatchResults] = OrderedDict()
         super().__init__(address, Handler)
         self.workspace = workspace
         self.stream = Stream(workspace, interval)
         self.host, self.port = self.server_address[0], self.server_address[1]
+
+    def results(self, directory: Path) -> tuple[str, str]:
+        with self._results_lock:
+            if directory not in self._tables:
+                # Bound both memory and open SQLite readers as users visit batches.
+                if len(self._tables) >= 16:
+                    self._tables.popitem(last=False)[1].close()
+                self._tables[directory] = _BatchResults()
+            self._tables.move_to_end(directory)
+            return self._tables[directory].read(directory)
+
+    def server_close(self):
+        super().server_close()
+        with self._results_lock:
+            for table in self._tables.values():
+                table.close()
+            self._tables.clear()
 
 
 class WebUI:

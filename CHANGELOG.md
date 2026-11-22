@@ -17,6 +17,7 @@
 
 ### Added
 
+- 批次详情页新增“运行情况”和“实验结果”选项卡。结果表列出全部展开配置，按配置显示每个指标最大 step 对应的数值，在展示值新增或改变时按单变量对照更新列顺序，并合并相邻同值单元格。
 - 运行参数集中在 `src/expman/settings.py`。各条 CLI 命令可以共用项目 `pyproject.toml` 的 `[tool.expman]` 配置，Python 调用者可以用 `expman.set(...)` 和 `expman.get(key)` 覆盖或读取当前进程的设置。支持设置批次目录、看板端口、刷新间隔、资源预算和 worker 环境。
 - 新增 `expman delete ID`，可删除指定批次的目录及登记记录并释放 ID。命令支持 `--batches-dir`，也可清除已手动移走目录的批次记录。运行中的批次须先停止。
 - `expman run` 支持省略流程模块名。例如 `expman run train experiments` 会从默认模块 `pipeline` 导入 `train`。

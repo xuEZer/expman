@@ -1,0 +1,21 @@
+.batch-tabs:not([hidden]) { display: flex; gap: 4px; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
+.batch-tabs button {
+  padding: 5px 12px; border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+  background: transparent; color: var(--muted);
+}
+.batch-tabs button:hover { color: var(--text); }
+.batch-tabs button[aria-selected="true"] { color: var(--actual); border-bottom-color: currentColor; }
+.results-scroll { padding: 0; overflow-x: auto; }
+.results-table { width: 100%; border-spacing: 0; font-variant-numeric: tabular-nums; }
+.results-table th, .results-table td {
+  padding: 8px 14px; text-align: left; border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.results-table tr > :not(:first-child) { border-left: 1px solid var(--border); }
+.results-table thead th { vertical-align: top; background: var(--panel-2); }
+.results-table thead th:first-child { white-space: nowrap; }
+.results-table tbody th { width: 1%; white-space: nowrap; color: var(--muted); font-weight: 400; }
+.results-table tbody td { white-space: pre-wrap; }
+.results-table thead th:not(:first-child) { min-width: 8ch; max-width: 36ch; }
+.results-table .metric-column { color: var(--actual); }
+.result-missing { color: var(--faint); }

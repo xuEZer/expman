@@ -5,9 +5,19 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>expman 运行看板 · 批次详情</title>
 <link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/results.css">
 </head>
 <body data-page="batch">
-<div id="app"><p class="muted pad">连接中…</p></div>
+<main id="app">
+  <div id="batch-header"><p class="muted pad">连接中…</p></div>
+  <div id="batch-tabs" class="batch-tabs" role="tablist" aria-label="批次详情" hidden>
+    <button id="tab-status" type="button" role="tab" aria-controls="status-panel" aria-selected="true">运行情况</button>
+    <button id="tab-results" type="button" role="tab" aria-controls="results-panel" aria-selected="false" tabindex="-1">实验结果</button>
+  </div>
+  <section id="status-panel" role="tabpanel" aria-labelledby="tab-status" tabindex="0"></section>
+  <section id="results-panel" role="tabpanel" aria-labelledby="tab-results" tabindex="0" hidden></section>
+</main>
+<script src="/static/results.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

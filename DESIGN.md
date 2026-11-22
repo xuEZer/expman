@@ -110,6 +110,8 @@ CLI 和 Web 看板共用所选批次父目录下的 `.batches.sqlite3`，默认�
 
 `expman status` 与归档页面从批次文件重建状态。实验主进程另有旁路线程，把在锁内读到的调度状态和阶段完成组数整理为实时快照并原子写入 `live.json`，写入失败不会中断实验。`expman web` 在独立进程内通过 HTTP 和 SSE 提供这些数据。读取端在批次停止管道可连接且快照足够新鲜时标为实时。历史快照早于最新批次清单或快照不可用时，从持久化记录重建。页面查询不会触发训练或资源调度。[归档读取](src/expman/observation/status.py) · [快照构建](src/expman/observation/snapshot.py) · [来源判定](src/expman/observation/archive.py) · [Web 服务](src/expman/webui/server.py)
 
+“实验结果”选项卡按 run ID 将批次保存的配置与 SQLite 指标对应起来。对每个 run、阶段和指标，读取端取最大 step 对应的数值参与依赖判断。服务端缓存最近访问的 16 个批次的结果表。首次访问会读取配置和指标，此后在 `experiments/` 目录条目变化、指标库文件变化或同一只读连接的 `PRAGMA data_version` 显示有新提交时重新读取。展示数据发生变化时重新计算依赖和列顺序。浏览器刷新时带上已有结果的 ETag，表格内容相同时服务端返回 HTTP 304。[结果读取](src/expman/observation/results.py) · [结果表排序](src/expman/webui/result_layout.py) · [Web 服务](src/expman/webui/server.py)
+
 `expman run` 和 `expman resume` 在持有批次执行锁期间监听 `stop.fifo`。`expman stop` 和看板的“停止实验”按钮共用同一条停止管道。请求写入后，内核向持有读端的进程发送 SIGTERM，调度器收尾并保存进度。[进程控制](src/expman/process_control.py)
 
 | 你遇到的现象 | 建议先读的行为测试 |

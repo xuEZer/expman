@@ -30,6 +30,8 @@ from expman.scheduling.scheduler import GpuScheduler, Worker
 from expman.settings import settings
 from expman.storage.base import PickleSerializer, run_lock, write_record
 from expman.storage.batch import BatchStore
+from expman.storage.metrics import MetricStore
+from expman.webui.result_layout import layout_results
 from expman.webui.server import Stream, Workspace, serve
 
 POSIX = pytest.mark.skipif(os.name != "posix", reason="POSIX worker process groups")
@@ -837,6 +839,146 @@ class TestDashboard:
             assert payload["schema"] == SCHEMA
             assert [entry["name"] for entry in payload["batches"]] == ["run_a", "run_b"]
             assert payload["batches"][1]["status"] == "failed"
+        finally:
+            dashboard.close()
+
+    def test_results_page_compares_the_recorded_configurations(self, tmp_path):
+        directory = write_batch_dir(tmp_path, "example", runs=4)
+        metrics = MetricStore(directory / "metrics.sqlite3")
+        configs = [(1, 1), (2, 1), (1, 2), (2, 2)]
+        for index, (x1, x2) in enumerate(configs):
+            run_id = f"{index:032x}"
+            write_record(
+                directory / "experiments" / run_id / "config.pkl",
+                {"x1": x1, "x2": x2, "seed": 42},
+                PickleSerializer(),
+            )
+        dashboard = serve(tmp_path, port=0)
+        try:
+            status, content, _ = self.get(dashboard.url + "b/0/results/")
+            assert status == 200 and b"/static/results.js" in content
+            assert content == self.get(dashboard.url + "b/0/")[1]
+            for asset in ("results.js", "results.css"):
+                assert self.get(dashboard.url + "static/" + asset)[0] == 200
+
+            url = dashboard.url + "api/batch/0/results"
+            status, content, _ = self.get(url)
+            assert status == 200
+            table = json.loads(content)
+            assert table["name"] == "example"
+            x1_column, x2_column = table["columns"]
+            x1_key, x2_key = x1_column["id"], x2_column["id"]
+            assert [x1_column["label"], x2_column["label"]] == ["x1", "x2"]
+            assert sorted((r[x1_key], r[x2_key]) for r in table["rows"]) == sorted(
+                configs
+            )
+
+            for index, (_, x2) in enumerate(configs):
+                metrics.log(f"{index:032x}", (0,), None, 1, [('["y"]', float(x2))])
+                if index == 0:
+                    partial = json.loads(self.get(url)[1])
+                    metric_key = next(
+                        c["id"] for c in partial["columns"] if c["kind"] == "metric"
+                    )
+                    assert sorted(
+                        (r[x1_key], r[x2_key]) for r in partial["rows"]
+                    ) == sorted(configs)
+                    assert [
+                        r[metric_key] for r in partial["rows"] if metric_key in r
+                    ] == [1]
+
+            table = json.loads(self.get(url)[1])
+            assert len(table["rows"]) == len(configs)
+            x2_column, metric, x1_column = table["columns"]
+            assert (x2_column["label"], x1_column["label"]) == ("x2", "x1")
+            assert metric["depends_on"] == [x2_column["id"]]
+            assert metric["undetermined"] == []
+            assert all(
+                row[metric["id"]] == row[x2_column["id"]] for row in table["rows"]
+            )
+            assert self.get(dashboard.url + "api/batch/99/results")[0] == 404
+        finally:
+            dashboard.close()
+
+    def test_result_layout_only_recomputes_for_changed_measurements(
+        self, tmp_path, monkeypatch
+    ):
+        directory = write_batch_dir(tmp_path, "example", runs=2, status="pending")
+        store = BatchStore(directory)
+        manifest = store.read_manifest()
+        first, second = (entry["run_id"] for entry in manifest["experiments"])
+        for x, run_id in enumerate((first, second), start=1):
+            write_record(
+                directory / "experiments" / run_id / "config.pkl",
+                {"x": x},
+                PickleSerializer(),
+            )
+        metrics = MetricStore(directory / "metrics.sqlite3")
+        layout = Mock(wraps=layout_results)
+        monkeypatch.setattr("expman.webui.server.layout_results", layout)
+        dashboard = serve(tmp_path, port=0)
+        url = dashboard.url + "api/batch/0/results"
+
+        def read_rows(request=url):
+            status, content, _ = self.get(request)
+            assert status == 200
+            table = json.loads(content)
+            labels = {column["id"]: column["label"] for column in table["columns"]}
+            rows = [
+                {labels[key]: value for key, value in row.items()}
+                for row in table["rows"]
+            ]
+            return sorted(rows, key=lambda row: row["x"])
+
+        try:
+            empty = [{"x": 1}, {"x": 2}]
+            assert read_rows() == empty
+            initial_calls = layout.call_count
+            assert initial_calls <= 1
+            assert read_rows() == empty
+            assert layout.call_count == initial_calls
+
+            manifest["queue"].remove(first)
+            manifest["experiments"][0]["attempts"][0]["status"] = "running"
+            store.save_manifest(manifest)
+            dashboard.refresh()
+            assert read_rows() == empty
+            assert layout.call_count == initial_calls
+
+            metrics.log(first, (0,), None, 1, [('["score"]', 5.0)])
+            partial = [{"x": 1, "score": 5}, {"x": 2}]
+            assert read_rows() == partial
+            assert layout.call_count == initial_calls + 1
+            assert read_rows() == partial
+            assert layout.call_count == initial_calls + 1
+
+            metrics.log(second, (0,), None, 1, [('["score"]', 5.0)])
+            complete = [{"x": 1, "score": 5}, {"x": 2, "score": 5}]
+            assert read_rows() == complete
+            assert layout.call_count == initial_calls + 2
+
+            status, _, headers = self.get(url)
+            assert status == 200 and headers["ETag"]
+            conditional = Request(url, headers={"If-None-Match": headers["ETag"]})
+            metrics.log(second, (0,), None, 2, [('["score"]', 5.0)])
+            dashboard.refresh()
+            status, content, _ = self.get(conditional)
+            assert (status, content) == (304, b"")
+            assert layout.call_count == initial_calls + 2
+
+            metrics.log(second, (0,), None, 2, [('["score"]', 8.0)])
+            assert read_rows(conditional) == [
+                {"x": 1, "score": 5},
+                {"x": 2, "score": 8},
+            ]
+            assert layout.call_count == initial_calls + 3
+
+            metrics.log(first, (0,), None, 1, [('["loss"]', 0.5)])
+            assert read_rows() == [
+                {"x": 1, "score": 5, "loss": 0.5},
+                {"x": 2, "score": 8},
+            ]
+            assert layout.call_count == initial_calls + 4
         finally:
             dashboard.close()
 
