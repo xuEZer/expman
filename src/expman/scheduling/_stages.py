@@ -83,13 +83,32 @@ class StageWork:
         return groups, set(active)
 
     def completion(self):
-        """Return completed and total reusable parameter groups per Stage."""
+        """Return (completed, total, running, queued) counts per Stage.
+
+        Runs sharing a group contribute once. Completed groups take precedence
+        over running groups, and running groups over queued groups.
+        """
+        state = self.batch.state
+        queued = set(state.queue)
         completed = self._completed_groups()
-        result = []
+        result = {}
         for index in range(len(self.batch.pipeline.stages)):
-            groups = {self.group(run_id, index) for run_id in self.batch.by_id}
-            result.append((index, len(groups & completed), len(groups)))
-        return tuple(result)
+            groups, running, pending = set(), set(), set()
+            for run_id in self.batch.by_id:
+                group = self.group(run_id, index)
+                groups.add(group)
+                if state.stage_progress.get(run_id) == index:
+                    if run_id in state.active_gpu:
+                        running.add(group)
+                    elif run_id in queued:
+                        pending.add(group)
+            result[index] = (
+                len(groups & completed),
+                len(groups),
+                len(running - completed),
+                len(pending - completed - running),
+            )
+        return result
 
     def _encoding(self, stage_index):
         """Encode each run's declared dependency prefix for a Stage input."""

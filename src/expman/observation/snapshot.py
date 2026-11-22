@@ -165,6 +165,7 @@ def _resources(device_memory, host_memory, workers, plan):
                 "uuid": observation.get("uuid"),
                 "total_kb": total,
                 "free_kb": free,
+                "utilization_percent": number(observation.get("utilization_percent")),
                 "other_kb": None
                 if used is None or mine.get("actual_kb", 0.0) is None
                 else max(0.0, used - mine.get("actual_kb", 0.0)),
@@ -192,6 +193,7 @@ def _resources(device_memory, host_memory, workers, plan):
         "host": {
             "total_kb": host_total,
             "available_kb": host_available,
+            "utilization_percent": number(host_memory.get("utilization_percent")),
             "used_kb": used,
             "other_kb": None
             if used is None or resident is None
@@ -231,24 +233,25 @@ def stage_samples(history):
     return counts
 
 
-def stage_record(
-    index, name, known, completed, total, unit, samples, approximate=False
-):
+def stage_record(index, name, counts, unit, samples, approximate=False):
     """One Stage's row in a snapshot, shared by both reading paths.
 
     Live rows have known group counts when the scheduler reports them and can
-    include its per-group time interval. Archived rows use completed run
-    counts as an approximation and leave the interval empty.
+    include its per-group time interval. Archived rows count runs in each
+    state from the manifest and leave the interval empty.
     """
     unit = unit or {}
+    completed, total, running, pending = counts or (None, None, None, None)
     return {
         "index": index,
         "name": name,
-        "known": known,
+        "known": counts is not None,
         "groups_total": total,
         "groups_done": completed,
+        "groups_running": running,
+        "groups_pending": pending,
         "groups_remaining": None
-        if not known or total is None or completed is None
+        if total is None or completed is None
         else max(0, total - completed),
         "unit_lower_seconds": number(unit.get("unit_lower_seconds")),
         "unit_upper_seconds": number(unit.get("unit_upper_seconds")),
@@ -259,20 +262,19 @@ def stage_record(
 
 
 def _stages(completion, names, view, samples):
-    """Per-Stage remaining group counts plus the unit interval to multiply them by.
+    """Per-Stage group counts, duration bounds and sample counts.
 
     Reported before the scheduler exists as well: the Stage list is known from
     the Pipeline, so the dashboard can show the shape of the batch while its
     first attempt is still being prepared.
     """
-    counts = {index: (done, total) for index, done, total in completion or ()}
+    counts = completion or {}
     units = (view or {}).get("stages") or {}
     return [
         stage_record(
             index,
             name,
-            index in counts,
-            *counts.get(index, (None, None)),
+            counts.get(index),
             units.get(index),
             samples.get(index, {}),
         )
@@ -281,9 +283,10 @@ def _stages(completion, names, view, samples):
 
 
 def gantt_rows(history, names, workers=()):
-    """Completed and running attempts on the same Batch effective clock.
+    """Return timed history entries and active workers on the batch clock.
 
-    Only entries with a recorded span belong on the axis.
+    Cache hits have zero duration in the snapshot. The timeline draws only
+    actual worker attempts.
     """
     records = list(history)
     completed = {

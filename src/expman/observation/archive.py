@@ -2,6 +2,7 @@
 
 import json
 import os
+from collections import Counter
 from contextlib import suppress
 from pathlib import Path
 from time import time
@@ -60,13 +61,16 @@ def _stage_name(spec: object) -> str | None:
 def _stages(manifest: dict) -> list[dict]:
     """Per-Stage progress as the durable records describe it.
 
-    Count runs that completed each Stage, including cache reuses. The manifest
-    stores stage history. Only the live scheduler computes per-group time intervals.
+    History identifies completed runs, including cache hits. The saved queue,
+    active runs and their stage positions supply the pending and running counts.
     """
     signature = manifest.get("pipeline") or []
     runs = len(manifest.get("experiments") or [])
     history = manifest.get("stage_history") or []
     samples = stage_samples(history)
+    progress = manifest.get("stage_progress", {})
+    pending = Counter(progress.get(run_id) for run_id in manifest.get("queue", ()))
+    active = Counter(progress.get(run_id) for run_id in manifest.get("active_gpu", {}))
     reached: dict[int, set] = {}
     for entry in history:
         index, run_id = entry.get("stage"), entry.get("run_id")
@@ -78,9 +82,12 @@ def _stages(manifest: dict) -> list[dict]:
         stage_record(
             index,
             _stage_name(signature[index]),
-            True,
-            min(len(reached.get(index, ())), runs),
-            runs,
+            (
+                min(len(reached.get(index, ())), runs),
+                runs,
+                active[index],
+                pending[index],
+            ),
             None,
             samples.get(index, {}),
             approximate=True,

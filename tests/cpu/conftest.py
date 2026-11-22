@@ -25,8 +25,8 @@ read -r cmd
 case "$cmd" in ps) echo "$PPID 1 2 $CUDA_VISIBLE_DEVICES";; quit|terminate_client*) exit 0;; *) exit 1;; esac
 """,
         "nvidia-smi": """case "$1" in
---query-gpu=index,uuid,memory.total,memory.free)
- for d in $(echo "${3#--id=}" | tr , ' '); do echo "$d, GPU-test-$d, 16384, 16000"; done;;
+--query-gpu=index,uuid,memory.total,memory.free,utilization.gpu)
+ for d in $(echo "${3#--id=}" | tr , ' '); do echo "$d, GPU-test-$d, 16384, 16000, 0"; done;;
 --query-compute-apps=pid,used_gpu_memory) echo "$PPID, 0";;
 *) exit 1;;
 esac

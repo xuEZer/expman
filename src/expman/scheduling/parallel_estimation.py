@@ -35,11 +35,7 @@ def _publish(batch, coverage, *, degraded=None, **fields):
 
 
 def _stage_view(groups, active_groups, tasks):
-    """Per-Stage group counts and the median representative interval.
-
-    One entry per remaining Stage group, so the dashboard can multiply a
-    remaining count by the same unit interval the makespan used.
-    """
+    """Summarize remaining groups and median duration bounds for each Stage."""
     stages = {}
     for group, (_run_id, stage_index) in groups.items():
         entry = stages.setdefault(

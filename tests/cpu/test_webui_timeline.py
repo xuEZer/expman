@@ -81,79 +81,90 @@ def test_overlaps_and_a_running_retry_use_their_real_lanes():
     assert 'class="gantt-fold"' in html
 
 
-def test_cache_reuses_do_not_increase_worker_concurrency():
-    html = render(
-        [
-            row("worker", 0, 200),
-            row("reuse1", 120, 120, reused=True),
-            row("reuse2", 150, 150, reused=True),
-        ]
+def test_cache_reuses_do_not_change_the_worker_timeline():
+    worker = row("worker", 0, 200)
+    cache_hit = row("reuse", 350, 350, reused=True)
+    assert render([worker, cache_hit]) == render([worker])
+
+
+def test_reuse_only_history_shows_the_empty_timeline():
+    assert render([row("reuse", 120, 120, reused=True)]) == render([])
+
+
+def test_worker_bars_label_used_and_reserved_memory_on_the_same_scale():
+    gib = 1024**2
+    html = render_js(
+        "workers",
+        {
+            "workers": [
+                {
+                    "host": {
+                        "resident_kb": 4 * gib,
+                        "reserved_kb": 2 * gib,
+                        "cap_kb": 8 * gib,
+                    },
+                    "gpu": {"used_kb": gib, "budget_kb": 4 * gib, "cap_kb": 8 * gib},
+                }
+            ],
+        },
     )
 
-    assert html.count('class="gantt-lane"') == 1
-    assert html.count('class="gantt-bar ') == 1
-    assert html.count('class="gantt-reuse"') == 2
+    assert "<span>内存</span><span>显存</span>" in html
+    assert html.count('class="worker-meter"') == 2
+    assert "width:50%;background:var(--other)" in html
+    assert "width:100%;background:var(--actual)" in html
+    assert "width:100%;background:var(--other)" in html
+    assert "width:25%;background:var(--actual)" in html
+    assert 'class="cap"' not in html
+    assert "8.0 GiB" not in html
+    for label in ("1.0 GiB", "2.0 GiB", "4.0 GiB"):
+        assert label in html
 
 
-def test_reuse_only_history_has_markers_without_concurrent_workers():
-    html = render([row("reuse", 120, 120, reused=True)])
-
-    assert 'class="gantt-lane"' not in html
-    assert 'class="gantt-bar ' not in html
-    assert html.count('class="gantt-reuse"') == 1
-
-
-def test_unverified_host_limit_has_no_cap_and_reports_usage_fallback():
+def test_missing_worker_usage_only_labels_the_reservation():
     html = render_js(
         "workerRow",
         {
-            "run": "sample",
-            "host": {
-                "reserved_kb": 100,
-                "resident_kb": None,
-                "requested_cap_kb": 50,
-                "cap_kb": None,
-                "usage_source": "proc",
-                "usage_error": "cgroup <unavailable>",
-            },
+            "host": {"resident_kb": None, "reserved_kb": 0},
         },
     )
 
-    assert 'class="cap"' not in html
-    assert "内存 实际占用 –" in html
-    assert "内存采样 进程观测" in html
-    assert "内存上限未核验" in html
-    assert "cgroup &lt;unavailable&gt;" in html
+    assert "worker-used" not in html
+    assert html.count("0.0 GiB") == 1
 
 
-def test_unknown_host_total_is_not_rendered_as_zero():
+def test_unknown_memory_and_utilization_are_not_rendered_as_zero():
     html = render_js(
-        "hostRow",
-        {
-            "total_kb": 64 * 1024 * 1024,
-            "expman_actual_kb": None,
-            "expman_budget_kb": 8 * 1024 * 1024,
-            "other_kb": None,
-        },
+        "resources",
+        {"resources": {"host": {"total_kb": 64 * 1024**2, "other_kb": None}}},
     )
 
-    assert "实际驻留 观测不可用" in html
-    assert "实际驻留 0.0" not in html
-    assert "内存观测不可用" in html
+    assert " GiB" not in html
+    assert 'class="resource-utilization mono">–</span>' in html
 
 
-def test_gpu_bar_shows_the_reservation_and_actual_usage():
+def test_resource_bar_labels_the_memory_endpoints_and_total_utilization():
+    gib = 1024**2
+    card = {
+        "index": 0,
+        "total_kb": 100 * gib,
+        "other_kb": 20 * gib,
+        "expman_actual_kb": 10 * gib,
+        "expman_budget_kb": 40 * gib,
+        "utilization_percent": 43,
+    }
     html = render_js(
-        "deviceRow",
-        {
-            "total_kb": 100,
-            "other_kb": 20,
-            "expman_actual_kb": 10,
-            "expman_budget_kb": 40,
-        },
+        "resources",
+        {"resources": {"devices": [card], "host": {"utilization_percent": 0}}},
     )
     assert 'class="env" style="left:20%;width:40%' in html
     assert "left:20%;width:10%" in html
+    assert 'class="memory-mark resource-other" style="--at:20%' in html
+    assert 'class="memory-mark resource-used" style="--at:30%' in html
+    assert 'class="memory-mark resource-budget" style="--at:60%' in html
+    assert all(f">{value}.0 GiB</span>" in html for value in (20, 30, 60))
+    assert 'class="resource-utilization mono">43%</span>' in html
+    assert 'class="resource-utilization mono">0%</span>' in html
 
 
 def test_stale_snapshot_retains_live_group_counts_and_process_state():
@@ -168,12 +179,17 @@ def test_stale_snapshot_retains_live_group_counts_and_process_state():
                 "approximate": False,
                 "groups_total": 2,
                 "groups_done": 1,
+                "groups_running": 1,
+                "groups_pending": 0,
             },
         ],
     }
     assert "批次进程仍在运行" in render_js("sourceNote", snapshot)
-    assert "共 2 组" in render_js("stages", snapshot)
-    assert "批次未在运行" not in render_js("admissionTile", snapshot)
+    assert render_js("sourceNote", snapshot | {"running": False}) == (
+        '<div class="notice warn">批次已停止。</div>'
+    )
+    assert ">1/1/0<" in render_js("stages", snapshot)
+    assert ">1/0/0<" in render_js("stages", snapshot | {"running": False})
 
 
 def test_dashboard_eta_uses_the_same_outward_rounding_as_the_cli():
@@ -184,3 +200,19 @@ def test_dashboard_eta_uses_the_same_outward_rounding_as_the_cli():
         "tiles", {"batch": {"remaining": {"lower_seconds": 61, "upper_seconds": 119}}}
     )
     assert str(eta) in html
+
+
+def test_event_details_keep_attempts_outcomes_and_reasons():
+    attempt = {"run": "abc123", "stage_index": 0, "attempt": 2, "device": 0}
+    events = [
+        {**attempt, "kind": "launch", "detail": "host 512M gpu 256M MPS 请求上限 282M"},
+        {**attempt, "kind": "finish", "status": "failed", "detail": "2.7s 峰值 43M"},
+        {"kind": "reuse", "detail": "等价配置命中前缀缓存"},
+        {"kind": "shed", "detail": "设备 0 显存不足以兑现已分配的配额，撤销最新的尝试"},
+    ]
+    html = render_js("events", {"events": events})
+
+    assert html.count("abc123 S0 a2 GPU0") == 2
+    assert "failed" in html and "2.7s" in html
+    assert events[2]["detail"] in html and events[3]["detail"] in html
+    assert all(field not in html for field in ("host 512M", "gpu 256M", "MPS", "峰值"))

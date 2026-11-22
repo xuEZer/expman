@@ -38,7 +38,13 @@ def test_eta_counts_only_unmaterialized_stage_parameter_groups(tmp_path):
     cfg.write_text("device: [0]\nseed: 0\nitem: 0\ngrid:\n  item: [0, 1, 2]\n")
     batch = make_batch(Pipeline([First, Second]), cfg, output_dir=tmp_path / "batch")
     first = batch.experiments[0]
+    scheduler = GpuScheduler(batch)
+    # Three runs can share the queued first Stage. No run has reached the second.
+    assert scheduler.stages.completion() == {0: (0, 1, 0, 1), 1: (0, 3, 0, 0)}
     batch.state.queue.remove(first.run_id)
+    batch.state.active_gpu[first.run_id] = 0
+    assert scheduler.stages.completion()[0] == (0, 1, 1, 0)
+    del batch.state.active_gpu[first.run_id]
     batch.state.stage_history.extend(
         [
             {
@@ -61,8 +67,6 @@ def test_eta_counts_only_unmaterialized_stage_parameter_groups(tmp_path):
             },
         ]
     )
-    scheduler = GpuScheduler(batch)
-
     estimate = batch.estimate()
 
     # Stage 0 has one config-independent cache group, already completed.
@@ -75,7 +79,7 @@ def test_eta_counts_only_unmaterialized_stage_parameter_groups(tmp_path):
     assert estimate.completed_samples == 2
     assert estimate.remaining_experiments == 2
     assert batch._scheduler is scheduler
-    assert scheduler.stages.completion() == ((0, 1, 1), (1, 1, 3))
+    assert scheduler.stages.completion() == {0: (1, 1, 0, 0), 1: (1, 3, 0, 0)}
 
 
 RUNNING = StageDuration(30.0, 20.0, 40.0)

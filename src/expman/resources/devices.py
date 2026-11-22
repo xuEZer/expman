@@ -1,4 +1,4 @@
-"""GPU and host memory readings and scheduler resource budgets."""
+"""GPU and host resource observations and scheduler memory budgets."""
 
 import math
 import shutil
@@ -39,6 +39,7 @@ class DeviceMemory:
     uuid: str
     total: float
     free: float
+    utilization_percent: int | None = None
 
 
 def nvidia_smi() -> str:
@@ -62,7 +63,7 @@ class NvidiaMemory:
             result = subprocess.run(
                 [
                     nvidia_smi(),
-                    "--query-gpu=index,uuid,memory.total,memory.free",
+                    "--query-gpu=index,uuid,memory.total,memory.free,utilization.gpu",
                     "--format=csv,noheader,nounits",
                     "--id=" + ",".join(map(str, self.devices)),
                 ],
@@ -73,7 +74,9 @@ class NvidiaMemory:
             )
             values = {}
             for line in result.stdout.splitlines():
-                index, uuid, total, free = [item.strip() for item in line.split(",")]
+                index, uuid, total, free, utilization = (
+                    item.strip() for item in line.split(",")
+                )
                 total, free = float(total), float(free)
                 if (
                     not uuid.startswith("GPU-")
@@ -83,7 +86,11 @@ class NvidiaMemory:
                     or not 0 <= free <= total
                 ):
                     raise ValueError("invalid GPU memory observation")
-                values[int(index)] = DeviceMemory(uuid, total, free)
+                # Some devices report N/A for utilization while memory is readable.
+                percent = int(utilization) if utilization.isdecimal() else None
+                if percent is not None and percent > 100:
+                    percent = None
+                values[int(index)] = DeviceMemory(uuid, total, free, percent)
             if set(values) != set(self.devices):
                 raise ValueError("selected GPUs are missing from nvidia-smi")
             identities = {index: value.uuid for index, value in values.items()}
@@ -99,17 +106,17 @@ class NvidiaMemory:
 
 @dataclass(frozen=True)
 class HostMemory:
-    """Host RAM reported by /proc/meminfo; the reading alone stops launches.
+    """Host RAM and swap in KiB, with optional CPU utilization in percent.
 
-    Swap is reported for diagnostics and never gates a launch: occupancy is a
-    latch that outlives the shortage which caused it, so it describes history
-    rather than the memory available now.
+    The scheduler uses available RAM for admission. Swap and CPU utilization
+    are reported for observation.
     """
 
     total_kb: float
     available_kb: float
     swap_total_kb: float
     swap_free_kb: float
+    utilization_percent: float | None = None
 
     @property
     def available_ratio(self) -> float:
@@ -139,10 +146,34 @@ def fits_reserve(host: HostMemory | None, needed_kb: float) -> bool:
 
 
 class MeminfoMonitor:
-    """Read host RAM availability for scheduling; a failed read pauses launches."""
+    """Read /proc/meminfo for admission and /proc/stat for CPU utilization."""
 
     def __init__(self, path: Path | None = None):
         self.path = MEMINFO_PATH if path is None else Path(path)
+        self._cpu_ticks: tuple[int, int] | None = None
+
+    def _cpu_utilization(self) -> float | None:
+        """Percent of aggregate CPU time spent outside idle and I/O wait."""
+        try:
+            with self.path.with_name("stat").open() as stream:
+                fields = stream.readline().split()
+            if len(fields) < 5 or fields[0] != "cpu":
+                raise ValueError("missing aggregate CPU counters")
+            # Guest times are already included in user and nice.
+            ticks = [int(field) for field in fields[1:9]]
+            total = sum(ticks)
+            idle = sum(ticks[3:5])
+        except (OSError, ValueError):
+            self._cpu_ticks = None
+            return None
+        previous = self._cpu_ticks
+        self._cpu_ticks = total, idle
+        if previous is None:
+            return None
+        elapsed, idle_delta = total - previous[0], idle - previous[1]
+        if elapsed <= 0 or not 0 <= idle_delta <= elapsed:
+            return None
+        return 100 * (elapsed - idle_delta) / elapsed
 
     def sample(self) -> HostMemory:
         try:
@@ -170,4 +201,6 @@ class MeminfoMonitor:
             or not 0 <= swap_free <= swap_total
         ):
             raise MemoryObservationError("invalid host memory observation")
-        return HostMemory(total, available, swap_total, swap_free)
+        return HostMemory(
+            total, available, swap_total, swap_free, self._cpu_utilization()
+        )

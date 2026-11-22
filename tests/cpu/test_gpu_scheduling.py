@@ -1652,7 +1652,7 @@ class TestDevice:
             patch("expman.resources.devices.NVIDIA_SMI_FALLBACKS", (fallback,)),
             patch("expman.resources.devices.subprocess.run") as query,
         ):
-            query.return_value.stdout = "0, GPU-first, 100, 10\n"
+            query.return_value.stdout = "0, GPU-first, 100, 10, 0\n"
             NvidiaMemory((0,)).sample()
         assert query.call_args.args[0][0] == str(fallback)
         with patch(
@@ -1663,18 +1663,21 @@ class TestDevice:
     def test_nvidia_memory_validates_observations_and_identities(self):
         with patch("expman.resources.devices.subprocess.run") as query:
             query.return_value.stdout = (
-                "0, GPU-first, 100, 10\n1, GPU-second, 200, 150\n"
+                "0, GPU-first, 100, 10, 72\n1, GPU-second, 200, 150, [N/A]\n"
             )
             monitor = NvidiaMemory((0, 1))
-            observation = monitor.sample()[0]
+            cards = monitor.sample()
+            assert cards[1].utilization_percent is None
+            observation = cards[0]
+            assert observation.utilization_percent == 72
             assert observation.free / observation.total == 0.1
             assert "--id=0,1" in query.call_args.args[0]
             query.return_value.stdout = (
-                "0, GPU-replaced, 100, 10\n1, GPU-second, 200, 150\n"
+                "0, GPU-replaced, 100, 10, 72\n1, GPU-second, 200, 150, 0\n"
             )
             with pytest.raises(RuntimeError, match="identities changed"):
                 monitor.sample()
-            query.return_value.stdout = "0, GPU-first, N/A, N/A\n"
+            query.return_value.stdout = "0, GPU-first, N/A, N/A, 0\n"
             with pytest.raises(RuntimeError):
                 NvidiaMemory((0,)).sample()
 
@@ -1704,6 +1707,22 @@ class TestDevice:
             MemoryObservationError, match="could not observe host memory"
         ):
             MeminfoMonitor(path).sample()
+
+    def test_host_cpu_utilization_uses_aggregate_counter_deltas(self, tmp_path):
+        meminfo = tmp_path / "meminfo"
+        meminfo.write_text("MemTotal: 1000 kB\nMemAvailable: 500 kB\n")
+        monitor = MeminfoMonitor(meminfo)
+        stat = tmp_path / "stat"
+        stat.write_text("cpu  10 0 0 20 0 0 0 0 4 0\n")
+        assert monitor.sample().utilization_percent is None
+        # Ten busy ticks, six idle and four waiting for I/O. Guest ticks
+        # already contribute to user time and do not count a second time.
+        stat.write_text("cpu  20 0 0 26 4 0 0 0 6 0\n")
+        assert monitor.sample().utilization_percent == 50.0
+        stat.unlink()
+        observation = monitor.sample()
+        assert observation.utilization_percent is None
+        assert observation.available_kb == 500
 
     def test_host_memory_reports_availability_and_swap_occupancy(self, tmp_path):
         meminfo = tmp_path / "meminfo"

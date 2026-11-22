@@ -128,6 +128,7 @@ class GpuScheduler:
                 "available_ratio": host.available_ratio,
                 "available_kb": host.available_kb,
                 "total_kb": host.total_kb,
+                "utilization_percent": host.utilization_percent,
                 "headroom_kb": host.headroom_kb,
                 "swap_total_kb": host.swap_total_kb,
                 "swap_free_kb": host.swap_free_kb,
@@ -135,14 +136,13 @@ class GpuScheduler:
                 "admits_next": admits_next,
                 "observed_at": time(),
             }
-            # Device readings are published alongside the host reading: the
-            # dashboard shows allocation against actual usage, and nothing else
-            # keeps the per-card totals the scheduler just queried.
+            # Reuse this admission sample for the dashboard's per-GPU readings.
             self.batch.live.device_memory = {
                 device: {
                     "uuid": observation.uuid,
                     "total_kb": observation.total * 1024,
                     "free_kb": observation.free * 1024,
+                    "utilization_percent": observation.utilization_percent,
                     "observed_at": time(),
                 }
                 for device, observation in memory.items()
@@ -362,8 +362,7 @@ class GpuScheduler:
                     "status": Status.SUCCEEDED.value,
                     "reused": True,
                     "dependencies": completed.get("config_dependencies"),
-                    # Reuse consumes no wall time; mark it as a
-                    # zero-length point so it still lands on the axis.
+                    # A cache hit records no worker execution time.
                     "start_seconds": timestamp,
                     "end_seconds": timestamp,
                 }

@@ -54,14 +54,14 @@ class Memory:
 
     def sample(self):
         return {
-            device: DeviceMemory(f"GPU-test-{device}", 24 * 1024, 16 * 1024)
+            device: DeviceMemory(f"GPU-test-{device}", 24 * 1024, 16 * 1024, 72)
             for device in self.devices
         }
 
 
 class Host:
     def sample(self):
-        return HostMemory(64 * GIB, 40 * GIB, 0, 0)
+        return HostMemory(64 * GIB, 40 * GIB, 0, 0, 31.5)
 
 
 class Broken:
@@ -370,9 +370,11 @@ def test_a_finished_batch_reports_stage_and_resource_facts(tmp_path):
     assert stage["groups_remaining"] == 0
     assert stage["samples"]["measured"] == 2
     assert snapshot["resources"]["host"]["total_kb"] == pytest.approx(64 * GIB)
+    assert snapshot["resources"]["host"]["utilization_percent"] == 31.5
     card = snapshot["resources"]["devices"][0]
     assert card["total_kb"] == pytest.approx(24 * GIB)
     assert card["free_kb"] == pytest.approx(16 * GIB)
+    assert card["utilization_percent"] == 72
     assert snapshot["schedule"]["pending_runs"] == 0
     kinds = [event["kind"] for event in snapshot["events"]]
     assert "launch" in kinds
@@ -520,7 +522,7 @@ def test_unavailable_worker_usage_does_not_become_zero_in_the_host_total(tmp_pat
 
 
 @POSIX
-def test_the_estimate_publishes_the_unit_interval_the_page_multiplies(tmp_path):
+def test_the_estimate_publishes_per_stage_group_counts_and_duration_bounds(tmp_path):
     batch = seed_finished_first(make_batch(tmp_path, count=3))
     scheduler = GpuScheduler(batch)
 
