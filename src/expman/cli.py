@@ -2,7 +2,7 @@
 
 The CLI resolves a bare pipeline name in the configured ``pipeline_module``
 (built-in default ``src.pipeline``) or accepts an explicit ``module:attr``.
-The run command reads ``./configs/<config>.yaml`` for the given config name.
+The run command reads ``./configs/experiments/<config>.yaml`` for the given config name.
 The batch manifest records the resolved ``module:attr`` for
 ``expman resume``. Each batches directory (default ``./batches/``) has its own
 integer IDs recorded in ``.batches.sqlite3``. ``expman status`` refreshes the
@@ -22,7 +22,7 @@ from pathlib import Path
 from time import sleep, strftime
 
 from expman.config.loader import _load_configs
-from expman.config.schema import CONFIGS_DIR, _safe_segment
+from expman.config.schema import EXPERIMENT_CONFIGS_DIR, _safe_segment
 from expman.core.events import Status
 from expman.core.pipeline import Pipeline
 from expman.estimation.estimate import _clock as _fmt_elapsed
@@ -68,10 +68,12 @@ def _experiment_yaml(name: str) -> Path:
         raise argparse.ArgumentTypeError(
             "expected a config name without a directory or YAML extension, e.g. baseline"
         )
-    directory = CONFIGS_DIR.resolve()
+    directory = EXPERIMENT_CONFIGS_DIR.resolve()
     path = directory / f"{name}.yaml"
     if not path.resolve().is_relative_to(directory):
-        raise argparse.ArgumentTypeError(f"{name!r} points outside ./configs/")
+        raise argparse.ArgumentTypeError(
+            f"{name!r} points outside ./{EXPERIMENT_CONFIGS_DIR}/"
+        )
     return path
 
 
@@ -264,7 +266,7 @@ def _parser() -> argparse.ArgumentParser:
         "config",
         type=_experiment_yaml,
         metavar="CONFIG",
-        help="experiment name, e.g. baseline for ./configs/baseline.yaml",
+        help=f"experiment name, e.g. baseline for ./{EXPERIMENT_CONFIGS_DIR}/baseline.yaml",
     )
     resume = commands.add_parser("resume", help="continue a stopped Batch")
     resume.add_argument("ID", type=int, help="batch ID from expman status")

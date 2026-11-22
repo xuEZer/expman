@@ -77,8 +77,8 @@ def prepare_batch_only(monkeypatch):
 
 
 def write_config(project, name="baseline", *, fail=False):
-    directory = project / "configs"
-    directory.mkdir(exist_ok=True)
+    directory = project / "configs" / "experiments"
+    directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{name}.yaml").write_text(
         f"device: [0]\nseed: 0\nfail: {str(fail).lower()}\n"
     )
@@ -111,7 +111,7 @@ def test_run_creates_a_named_batch_under_the_output_parent(
 ):
     monkeypatch.setattr(cli, "strftime", datetime(2026, 1, 2, 3, 4, 5).strftime)
     config = write_config(tmp_path, "experiment.large")
-    (tmp_path / f"{config}.yaml").write_text("invalid: project root copy")
+    (tmp_path / "configs" / f"{config}.yaml").write_text("invalid: config root copy")
     command = ["run", f"{pipeline_module}:train", config]
 
     assert main(command) == 0
@@ -129,8 +129,8 @@ def test_run_creates_a_named_batch_under_the_output_parent(
 def test_run_requires_a_config_name(tmp_path, pipeline_module, capsys):
     name = write_config(tmp_path)
     for argument in (
-        str(tmp_path / "configs" / name),
-        f"configs/{name}",
+        str(tmp_path / "configs" / "experiments" / name),
+        f"configs/experiments/{name}",
         f"../{name}",
         f"{name}.yaml",
         f"{name}.yml",
@@ -141,24 +141,25 @@ def test_run_requires_a_config_name(tmp_path, pipeline_module, capsys):
     assert not (tmp_path / "batches").exists()
 
 
-def test_run_loads_only_the_yaml_extension(tmp_path, pipeline_module):
+def test_run_requires_a_yaml_file_in_experiments(tmp_path, pipeline_module):
     name = write_config(tmp_path)
-    config = tmp_path / "configs" / f"{name}.yaml"
+    config = tmp_path / "configs" / "experiments" / f"{name}.yaml"
+    shutil.copyfile(config, tmp_path / "configs" / config.name)
     config.rename(config.with_suffix(".yml"))
-    with pytest.raises(expman.ConfigError, match=r"baseline\.yaml"):
+    with pytest.raises(expman.ConfigError, match=r"configs/experiments/baseline\.yaml"):
         main(["run", f"{pipeline_module}:empty", name])
 
 
-def test_run_rejects_a_config_symlink_outside_configs(
+def test_run_rejects_a_config_symlink_outside_experiments(
     tmp_path, pipeline_module, capsys
 ):
     name = write_config(tmp_path)
-    config = tmp_path / "configs" / f"{name}.yaml"
-    outside = config.rename(tmp_path / config.name)
+    config = tmp_path / "configs" / "experiments" / f"{name}.yaml"
+    outside = config.rename(tmp_path / "configs" / config.name)
     config.symlink_to(outside)
     with pytest.raises(SystemExit):
         main(["run", f"{pipeline_module}:empty", name])
-    assert "points outside ./configs/" in capsys.readouterr().err
+    assert "points outside ./configs/experiments/" in capsys.readouterr().err
     assert not (tmp_path / "batches").exists()
 
 

@@ -47,7 +47,7 @@ flowchart LR
 
 CLI 以当前工作目录作为实验项目根目录。如果该目录有 `pyproject.toml`，CLI 在解析命令行参数前应用其中的 `[tool.expman]` 设置。CLI、调度器、资源采样和看板共用一处设置定义，显式命令行参数可以覆盖对应选项。流程模块在导入时可调用 `expman.set(...)` 覆盖当前进程的值。主进程启动独立 worker 时传入生效的设置。恢复时，重试次数和耗时区间覆盖率取自原批次清单，资源与调度参数采用本次会话的设置。[全局设置](src/expman/settings.py) · [命令入口](src/expman/cli.py) · [worker 入口](src/expman/scheduling/_worker.py)
 
-`expman run` 从 `./configs/<配置名>.yaml` 读取实验配置，解析命名默认参数，展开各个 run 的配置，并校验整个批次共享的设备列表。[配置加载](src/expman/config/loader.py) · [变体展开](src/expman/config/variants.py) · [批次约束](src/expman/config/schema.py)
+`expman run` 从 `./configs/experiments/<配置名>.yaml` 读取实验配置，解析命名默认参数，展开各个 run 的配置，并校验整个批次共享的设备列表。[配置加载](src/expman/config/loader.py) · [变体展开](src/expman/config/variants.py) · [批次约束](src/expman/config/schema.py)
 
 - 展开按 `combines → grid → scan` 嵌套。`combines` 的每项是对基础参数的一份覆盖。`grid` 做各轴的笛卡尔积。`scan` 先取各轴首值组成基准点，再逐轴改变单个参数。配置解析默认值后按首次出现的顺序去重。
 - 映射节点可以写 `defaults: name`。加载器从当前工作目录读取 `./configs/<字段路径>/<name>.yaml`。字典递归合并，显式值优先，数组和 `null` 整体替换。默认文件缺失会告警，同一文件在一次加载中只提示一次。

@@ -3,6 +3,7 @@
 from pathlib import Path
 
 CONFIGS_DIR = Path("configs")
+EXPERIMENT_CONFIGS_DIR = CONFIGS_DIR / "experiments"
 
 COMBINES_KEY = "combines"
 GRID_KEY = "grid"

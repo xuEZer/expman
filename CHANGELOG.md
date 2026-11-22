@@ -5,7 +5,7 @@
 ### Breaking changes
 
 - `expman run` 省略模块名时，默认导入模块由 `pipeline` 改为 `src.pipeline`。例如，`expman run train baseline` 从实验项目的 `src/pipeline.py` 导入 `train`。使用根目录 `pipeline.py` 的项目可显式运行 `expman run pipeline:train baseline`。恢复批次时，清单中的完整模块路径优先，只有清单仅记录属性名时才使用内置默认模块。
-- 从实验项目根目录执行 `expman run` 时，配置参数使用省略 `.yaml` 扩展名的配置名。例如，`expman run train baseline` 读取 `./configs/baseline.yaml`。YAML 的 `defaults` 按字段路径从 `./configs/` 读取，各条 CLI 命令的项目设置只读取 `./pyproject.toml` 中的 `[tool.expman]`。
+- 实验 YAML 的目录从 `configs/` 改为 `configs/experiments/`。从实验项目根目录执行 `expman run train baseline` 会读取 `configs/experiments/baseline.yaml`，命令中只需写配置名。YAML 的 `defaults` 按字段路径从 `./configs/` 读取，各条 CLI 命令的项目设置只读取 `./pyproject.toml` 中的 `[tool.expman]`。
 - 非空 `Pipeline` 在构造时检查最后一个 Stage 的 `process()` 定义。叶子须为同步普通方法，只允许自然结束、`return` 和 `return None`。该约束也适用于独立和嵌套的 Pipeline。批次中的标量结果可通过 `ctx.log_metrics()` 保存，模型等产物由实验代码显式写入。尝试和实验结果移除按需读取最终返回值的 `output` 属性。
 - 移除 Python 的 `Batch(pipeline, cfg)` 和 `Batch.resume(...)` 接口。批次统一通过 `expman run train config` 创建并运行，通过 `expman resume ID` 恢复。缺少流程位置的批次无法通过 CLI 恢复。
 - 批次默认父目录由 `./runs/` 改为 `./batches/`。CLI 各子命令统一使用 `--batches-dir` 指定父目录，移除 `run` 的 `-o` / `--output-dir` 和 `web` 的 `--root`。CLI 新建批次时使用 `<pipeline-attr>_<config-stem>_<YYYYMMDDHHMMSS>` 命名子目录，并打印批次 ID 和目录。时间戳采用本地时间，精确到秒，目录重名时命令报错退出。
