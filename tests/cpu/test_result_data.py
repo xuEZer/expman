@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from expman.observation.results import read_results
+from expman.observation.results import read_plot, read_results
 from expman.storage.base import StorageError, write_record
 from expman.storage.batch import BatchStore
 from expman.storage.metrics import MetricStore, flatten_metrics
@@ -111,6 +111,65 @@ def test_single_config_without_recorded_metrics_still_produces_one_row(tmp_path)
         "columns": [],
         "rows": [{}],
     }
+
+
+def test_plot_keeps_axis_types_and_gets_only_selected_stages_and_steps(tmp_path):
+    configs = [
+        ("b", {"rate": 0.25, "typed": 1, "tag": "001", "large": 2**60}),
+        ("a", {"rate": 1, "typed": 1.0, "tag": "1", "large": 2**60 + 1}),
+        ("waiting", {"rate": 0, "typed": 2, "tag": "2", "large": 2**60 + 2}),
+    ]
+    save_configs(tmp_path, configs)
+    plot = read_plot(tmp_path, None, frozenset())
+    assert plot["steps"] == []
+    assert label_rows(plot["variables"], plot["rows"]) == [
+        {**cfg, "typed": str(cfg["typed"]), "large": str(cfg["large"])}
+        for _, cfg in configs
+    ]
+    metrics = MetricStore(tmp_path / "metrics.sqlite3")
+    metrics.log("b", (1, 0), 7, 1, flatten_metrics({"loss": 3}))
+    with closing(sqlite3.connect(metrics.path)) as connection:
+        (original,) = read_plot(tmp_path, connection, frozenset())["metrics"]
+        metrics.log("a", (0,), 3, 1, flatten_metrics({"loss": 100}))
+        metrics.log("b", (1, 0), 2, 1, flatten_metrics({"loss": 5}))
+        metrics.log("b", (1, 0), 2, 2, flatten_metrics({"loss": 4}))
+        metrics.log("b", (1, 0), None, 2, flatten_metrics({"loss": 9}))
+        metrics.log("other", (1, 0), 0, 1, flatten_metrics({"loss": 99}))
+        plot = read_plot(tmp_path, connection, frozenset([original["id"]]))
+
+    assert {column["label"]: column["id"] for column in plot["metrics"]}[
+        "S1.0 · loss"
+    ] == original["id"]
+    assert label_rows(plot["metrics"], plot["rows"]) == [
+        {"S1.0 · loss": 3},
+        {"S0 · loss": 100},
+        {},
+    ]
+    assert plot["steps"] == [{original["id"]: [(2, 4), (7, 3)]}, {}, {}]
+
+
+def test_plot_catalog_identifies_metrics_that_vary_in_controlled_comparisons(tmp_path):
+    configs = [
+        ("first", {"width": 1, "depth": 1}),
+        ("deep", {"width": 1, "depth": 2}),
+        ("wide", {"width": 2, "depth": 2}),
+    ]
+    save_configs(tmp_path, configs)
+    store = MetricStore(tmp_path / "metrics.sqlite3")
+    for run, config in configs:
+        store.log(run, (0,), None, 1, flatten_metrics({"quality": config["depth"]}))
+    store.log("deep", (0,), 0, 1, flatten_metrics({"cost": 1}))
+    store.log("wide", (0,), 0, 1, flatten_metrics({"cost": 5}))
+    with closing(sqlite3.connect(store.path)) as connection:
+        plot = read_plot(tmp_path, connection, frozenset())
+    axes = {column["id"]: column["label"] for column in plot["variables"]}
+    assert {
+        metric["label"]: (
+            [axes[key] for key in metric["depends_on"]],
+            metric["has_steps"],
+        )
+        for metric in plot["metrics"]
+    } == {"quality": (["depth"], False), "cost": (["width"], True)}
 
 
 def test_unreadable_metrics_are_reported(tmp_path):

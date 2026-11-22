@@ -1,0 +1,119 @@
+.plot-controls {
+  --axis-width: clamp(10rem, 18%, 14rem);
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.plot-axes, .plot-filters:not([hidden]) {
+  display: grid;
+  grid-template-columns: var(--axis-width) minmax(0, 1fr);
+  gap: 14px 24px;
+  padding: 14px 18px;
+}
+.plot-controls fieldset { min-width: 0; padding: 0; margin: 0; border: 0; }
+.plot-controls legend { padding: 0; }
+.plot-axis-x > label, .plot-axis-y > legend, #plot-filter-title {
+  display: block;
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.plot-select { position: relative; }
+.plot-select::after {
+  content: "";
+  position: absolute;
+  right: 13px; top: calc(50% - 5px);
+  width: 6px; height: 6px;
+  border: solid var(--muted);
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+.plot-select select {
+  display: block; width: 100%; min-height: 34px;
+  padding: 5px 30px 5px 11px;
+  appearance: none;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  font: inherit;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  color-scheme: dark;
+}
+[data-theme="light"] .plot-select select { color-scheme: light; }
+.plot-select select:hover { border-color: var(--faint); }
+.plot-checks { display: flex; flex-wrap: wrap; gap: 6px; }
+.plot-checks label {
+  display: inline-flex; align-items: center; gap: 7px;
+  max-width: 100%; min-height: 34px; padding: 4px 11px;
+  border: 1px solid var(--border-strong); border-radius: 7px;
+  color: var(--muted); cursor: pointer;
+}
+.plot-checks label span { min-width: 0; overflow-wrap: anywhere; }
+.plot-checks input {
+  appearance: none; display: grid; place-content: center; flex: none;
+  margin: 0; width: 13px; height: 13px; border: 1px solid var(--faint);
+  border-radius: 50%; color: var(--panel); cursor: inherit;
+}
+.plot-checks input:checked {
+  border-color: transparent; background: var(--series-color, var(--muted));
+}
+.plot-checks input:checked::before {
+  content: ""; width: 6px; height: 3px; margin-top: -2px;
+  border: solid currentColor; border-width: 0 0 1.5px 1.5px; transform: rotate(-45deg);
+}
+.plot-axis-y label:has(:checked) {
+  border-color: color-mix(in srgb, var(--series-color) 55%, var(--border));
+  background: color-mix(in srgb, var(--series-color) 11%, var(--panel));
+  color: var(--text);
+}
+.plot-filters {
+  border-top: 1px solid var(--border); border-radius: 0 0 12px 12px;
+  background: color-mix(in srgb, var(--panel-2) 48%, var(--panel));
+}
+#plot-filter-title { margin: 0; }
+#plot-values { display: flex; flex-wrap: wrap; align-items: start; gap: 12px 24px; }
+#plot-values fieldset { max-width: 100%; }
+#plot-values legend {
+  max-width: 100%; margin-bottom: 5px;
+  font: 12px/1.6 ui-monospace, monospace; overflow-wrap: anywhere;
+}
+#plot-values .plot-checks { gap: 3px; }
+#plot-values label {
+  min-height: 26px; gap: 5px; padding: 2px 7px; border-radius: 5px;
+  border-color: transparent; font-variant-numeric: tabular-nums;
+}
+#plot-values label:has(:checked) { color: var(--text); background: var(--track); }
+#plot-values input { width: 9px; height: 9px; border-radius: 2px; }
+#plot-values input:checked { background: transparent; color: var(--text); }
+.plot-checks label:hover { color: var(--text); border-color: var(--faint); }
+#plot-values label:hover { border-color: var(--faint); }
+.plot-select select:focus-visible, .plot-checks label:has(:focus-visible) {
+  outline: 2px solid var(--actual); outline-offset: 2px;
+}
+@media (forced-colors: active) {
+  .plot-checks input { appearance: auto; }
+  .plot-checks input:checked::before { content: none; }
+}
+#plot-message, .plot-empty { padding: 12px 14px; color: var(--muted); }
+.plot-figure {
+  margin: 0; padding: 14px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+}
+.plot-svg { display: block; width: 100%; height: auto; max-height: 65vh; }
+.plot-legend {
+  display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 16px;
+  font-size: 12px; color: var(--muted); overflow-wrap: anywhere;
+}
+.plot-legend > span { display: inline-flex; align-items: baseline; gap: 5px; max-width: 100%; }
+.plot-legend i { display: inline-block; width: 14px; flex: none; height: 3px; align-self: center; }
+@media (max-width: 650px) {
+  .plot-axes, .plot-filters:not([hidden]) { grid-template-columns: minmax(0, 1fr); padding: 12px 14px; }
+  .plot-filters:not([hidden]) { row-gap: 8px; }
+  #plot-values { column-gap: 16px; }
+  .plot-figure { padding: 6px; }
+}

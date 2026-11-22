@@ -5,17 +5,17 @@ from nodejs_wheel import node
 from expman.webui.server import STATIC_ROOT
 
 
-def evaluate(expression, payload=None):
+def evaluate(expression, payload=None, scripts=("results.js",)):
     harness = """
     const fs = require("node:fs");
     const vm = require("node:vm");
     const context = vm.createContext({payload: JSON.parse(fs.readFileSync(0, "utf8"))});
-    vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), context);
-    Promise.resolve(vm.runInContext(process.argv[2], context))
+    for (const path of process.argv.slice(2)) vm.runInContext(fs.readFileSync(path, "utf8"), context);
+    Promise.resolve(vm.runInContext(process.argv[1], context))
       .then(value => process.stdout.write(JSON.stringify(value)));
     """
     result = node(
-        ["-e", harness, str(STATIC_ROOT / "results.js"), expression],
+        ["-e", harness, expression, *(str(STATIC_ROOT / script) for script in scripts)],
         input=json.dumps(payload),
         text=True,
         capture_output=True,
@@ -23,6 +23,40 @@ def evaluate(expression, payload=None):
         return_completed_process=True,
     )
     return json.loads(result.stdout)
+
+
+def test_plot_choices_follow_measured_axes_and_preserve_explicit_empty_selections():
+    result = evaluate(
+        """
+        (() => {
+          const data = {
+            variables: [{id: "x1", label: "x1"}, {id: "x2", label: "x2"}],
+            metrics: [{id: "y", label: "score", depends_on: ["x2"], has_steps: false}]
+          };
+          const first = plotXAxis(data);
+          const manual = plotXAxis(data, "x1");
+          data.metrics.push({id: "loss", label: "loss", depends_on: [], has_steps: true});
+          const stepped = plotXAxis(data, "step");
+          const seeds = new Map();
+          setPlotChoice(seeds, "seed", [1, 2], 1, false);
+          const single = [...seeds.get("seed")];
+          setPlotChoice(seeds, "seed", [1, 2, 3], 2, false);
+          return [first.choices.map(x => x.id), first.id, manual.id, stepped.id,
+            ["x1", "y", "loss", "step"].map(x => plotHistoryIds(data, x)),
+            single, [...seeds.get("seed")]];
+        })()
+        """,
+        scripts=("plot.js", "plot-panel.js"),
+    )
+    assert result == [
+        ["x1", "x2", "y"],
+        "x2",
+        "x1",
+        "step",
+        [[], [], ["loss"], ["loss"]],
+        [2],
+        [],
+    ]
 
 
 def test_each_column_merges_its_own_consecutive_values():
@@ -120,3 +154,58 @@ def test_live_refresh_preserves_the_table_and_retries_the_final_read():
         ],
         "draws": 2,
     }
+
+
+def test_plot_deep_link_and_keyboard_navigation_refresh_only_the_active_tab():
+    script = """
+    const names = ["status", "results", "plot"];
+    const nodes = {"batch-header": {}, app: {}};
+    const calls = [];
+    let stream;
+    const buttons = names.map(name => {
+      const id = name + "-panel";
+      nodes[id] = {id, hidden: name !== "status"};
+      return {
+        id: "tab-" + name, "aria-controls": id,
+        getAttribute(key) { return this[key]; },
+        setAttribute(key, value) { this[key] = value; }, focus() {}
+      };
+    });
+    const tabs = nodes["batch-tabs"] = {children: buttons};
+    globalThis.document = {body: {dataset: {page: "batch"}}, documentElement: {dataset: {}},
+      getElementById: id => nodes[id], querySelectorAll: () => []};
+    globalThis.location = {pathname: "/b/7/plot/"};
+    globalThis.history = {pushState(_state, _title, path) { location.pathname = path; }};
+    globalThis.EventSource = class { constructor() { stream = this; } };
+    globalThis.refreshResultPlot = globalThis.refreshResultTable =
+      (panel, id, running, force) => calls.push([panel.id, id, running, force]);
+    require(process.argv[1]);
+    const key = (target, key) => tabs.onkeydown({target, key, preventDefault() {}});
+    const stopped = {data: JSON.stringify({batch: {running: false}})};
+    stream.onmessage(stopped);
+    key(buttons[2], "ArrowRight");
+    stream.onmessage(stopped);
+    const statusVisible = !nodes["status-panel"].hidden && nodes["plot-panel"].hidden;
+    key(buttons[0], "ArrowRight");
+    key(buttons[1], "End");
+    stream.onopen();
+    process.stdout.write(JSON.stringify([statusVisible, location.pathname, calls]));
+    """
+    result = node(
+        ["-e", script, str(STATIC_ROOT / "app.js")],
+        text=True,
+        capture_output=True,
+        check=True,
+        return_completed_process=True,
+    )
+    assert json.loads(result.stdout) == [
+        True,
+        "/b/7/plot/",
+        [
+            ["plot-panel", 7, True, True],
+            ["plot-panel", 7, False, False],
+            ["results-panel", 7, False, True],
+            ["plot-panel", 7, False, True],
+            ["plot-panel", 7, False, True],
+        ],
+    ]

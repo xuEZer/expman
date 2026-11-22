@@ -10,6 +10,7 @@ from time import perf_counter, time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import batch_helpers
@@ -737,7 +738,14 @@ class TestDashboard:
             assert status == 200
             assert b"/static/results.js" in body
             assert self.get(dashboard.url + "b/0/results/")[:2] == (200, body)
-            for asset in ("results.js", "results.css"):
+            assert self.get(dashboard.url + "b/0/plot/")[:2] == (200, body)
+            for asset in (
+                "results.js",
+                "results.css",
+                "plot.js",
+                "plot-panel.js",
+                "plot.css",
+            ):
                 assert self.get(dashboard.url + "static/" + asset)[0] == 200
 
             status, _body, headers = self.get(dashboard.url + "static/app.js")
@@ -773,6 +781,59 @@ class TestDashboard:
             detail = json.loads(body)
             assert (detail["id"], detail["batch"]["name"]) == (finished["id"], "run_a")
             assert self.get(dashboard.url + "api/batch/99")[0] == 404
+        finally:
+            dashboard.close()
+
+    def test_plot_refreshes_when_a_selected_earlier_step_changes(self, tmp_path):
+        directory = write_batch_dir(tmp_path, "example", runs=1, status="pending")
+        store = BatchStore(directory)
+        run = store.read_manifest()["experiments"][0]["run_id"]
+        write_record(
+            directory / "experiments" / run / "config.pkl", {}, store.serializer
+        )
+        metrics = MetricStore(directory / "metrics.sqlite3")
+        dashboard = serve(tmp_path, port=0)
+        url = dashboard.url + "api/batch/0/plot"
+        try:
+            assert self.get(dashboard.url + "api/batch/99/plot")[0] == 404
+            assert json.loads(self.get(url)[1]) == {
+                "variables": [],
+                "metrics": [],
+                "rows": [{}],
+                "steps": [],
+            }
+            values = [('["score"]', 8), ('["loss"]', 2)]
+            metrics.log(run, (0,), None, 1, values)
+            _, body, headers = self.get(url)
+            assert all(
+                not metric["has_steps"] for metric in json.loads(body)["metrics"]
+            )
+            # The first explicit step can have the same value as its summary.
+            metrics.log(run, (0,), 5, 1, values)
+            status, body, _ = self.get(
+                Request(url, headers={"If-None-Match": headers["ETag"]})
+            )
+            assert status == 200
+            catalog = json.loads(body)
+            assert all(metric["has_steps"] for metric in catalog["metrics"])
+            score, loss = (
+                next(
+                    item["id"] for item in catalog["metrics"] if item["label"] == label
+                )
+                for label in ("score", "loss")
+            )
+            query = url + "?" + urlencode({"metric": [score, loss]}, doseq=True)
+            status, body, headers = self.get(query)
+            assert status == 200
+            assert json.loads(body)["steps"] == [{score: [[5, 8]], loss: [[5, 2]]}]
+            conditional = Request(query, headers={"If-None-Match": headers["ETag"]})
+            assert self.get(conditional)[:2] == (304, b"")
+            metrics.log(run, (0,), 2, 1, [('["score"]', 6)])
+            status, body, _ = self.get(conditional)
+            assert status == 200
+            assert json.loads(body)["steps"] == [
+                {score: [[2, 6], [5, 8]], loss: [[5, 2]]}
+            ]
         finally:
             dashboard.close()
 

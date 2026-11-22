@@ -10,7 +10,7 @@ import json
 import sqlite3
 import threading
 from collections import OrderedDict
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from time import monotonic, time
@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlparse
 
 from expman.observation.archive import read_batch, summarize
 from expman.observation.registry import ensure_ids
-from expman.observation.results import read_results
+from expman.observation.results import read_plot, read_results
 from expman.observation.snapshot import SCHEMA
 from expman.process_control import request_stop
 from expman.settings import settings
@@ -30,6 +30,9 @@ STATIC_FILES = {
     "app.js": "text/javascript; charset=utf-8",
     "batch.html": "text/html; charset=utf-8",
     "index.html": "text/html; charset=utf-8",
+    "plot.css": "text/css; charset=utf-8",
+    "plot.js": "text/javascript; charset=utf-8",
+    "plot-panel.js": "text/javascript; charset=utf-8",
     "results.js": "text/javascript; charset=utf-8",
     "results.css": "text/css; charset=utf-8",
     "style.css": "text/css; charset=utf-8",
@@ -245,7 +248,7 @@ class Handler(BaseHTTPRequestHandler):
             len(parts) >= 2
             and parts[0] == "b"
             and parts[1].isdigit()
-            and parts[2:] in ([], ["results"])
+            and parts[2:] in ([], ["results"], ["plot"])
         ):
             self._static("batch.html")
         elif len(parts) == 2 and parts[0] == "static":
@@ -258,11 +261,14 @@ class Handler(BaseHTTPRequestHandler):
             len(parts) == 4
             and parts[:2] == ["api", "batch"]
             and parts[2].isdigit()
-            and parts[3] == "results"
+            and parts[3] in ("results", "plot")
         ):
             directory = self._directory(int(parts[2]))
             if directory is not None:
-                payload, tag = self.dashboard.results(directory)
+                selection = (
+                    frozenset(query.get("metric", ())) if parts[3] == "plot" else None
+                )
+                payload, tag = self.dashboard.results(directory, selection)
                 if self.headers.get("If-None-Match") == tag:
                     self.send_response(304)
                     self.send_header("ETag", tag)
@@ -364,8 +370,13 @@ def _batch_key(query: dict) -> int | None:
     return int(values[0])
 
 
+def _tagged_json(data: dict) -> tuple[str, str]:
+    payload = json.dumps(data)
+    return payload, '"' + hashlib.sha256(payload.encode()).hexdigest() + '"'
+
+
 class _BatchResults:
-    """Keep the layout and observe metric commits on one read-only connection."""
+    """Cache the table and most recent plot selection on one SQLite reader."""
 
     def __init__(self):
         self.db: sqlite3.Connection | None = None
@@ -373,6 +384,8 @@ class _BatchResults:
         self.stamp = None
         self.inputs = None
         self.response = ("", "")
+        self.plot_stamp = None
+        self.plot_response = ("", "")
 
     def close(self):
         if self.db is not None:
@@ -380,7 +393,9 @@ class _BatchResults:
             self.db = None
         self.database_id = None
 
-    def read(self, directory: Path) -> tuple[str, str]:
+    def read(
+        self, directory: Path, selection: frozenset[str] | None
+    ) -> tuple[str, str]:
         database = directory / "metrics.sqlite3"
         try:
             stat = database.stat()
@@ -407,15 +422,24 @@ class _BatchResults:
             self.db.execute("PRAGMA data_version").fetchone()[0] if self.db else None
         )
         stamp = (run_set, database_id, version)
+        if selection is not None:
+            if (stamp, selection) != self.plot_stamp:
+                # Keep the latest values and step histories on the same snapshot
+                # while workers commit new steps through their own connections.
+                with self.db if self.db is not None else nullcontext():
+                    if self.db is not None:
+                        self.db.execute("BEGIN")
+                    plot = read_plot(directory, self.db, selection)
+                self.plot_response = _tagged_json(plot)
+                self.plot_stamp = (stamp, selection)
+            return self.plot_response
         if stamp != self.stamp:
             inputs = read_results(directory, self.db)
             # Repeated writes also update attempt metadata and commit, but only
             # the configuration and metric values participate in dependency analysis.
             if inputs != self.inputs:
                 table = layout_results(*inputs)
-                payload = json.dumps({"name": directory.name, **table})
-                tag = '"' + hashlib.sha256(payload.encode()).hexdigest() + '"'
-                self.response = payload, tag
+                self.response = _tagged_json({"name": directory.name, **table})
                 self.inputs = inputs
             self.stamp = stamp
         return self.response
@@ -435,7 +459,9 @@ class DashboardServer(ThreadingHTTPServer):
         self.stream = Stream(workspace, interval)
         self.host, self.port = self.server_address[0], self.server_address[1]
 
-    def results(self, directory: Path) -> tuple[str, str]:
+    def results(
+        self, directory: Path, selection: frozenset[str] | None = None
+    ) -> tuple[str, str]:
         with self._results_lock:
             if directory not in self._tables:
                 # Bound both memory and open SQLite readers as users visit batches.
@@ -443,7 +469,7 @@ class DashboardServer(ThreadingHTTPServer):
                     self._tables.popitem(last=False)[1].close()
                 self._tables[directory] = _BatchResults()
             self._tables.move_to_end(directory)
-            return self._tables[directory].read(directory)
+            return self._tables[directory].read(directory, selection)
 
     def server_close(self):
         super().server_close()

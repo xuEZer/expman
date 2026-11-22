@@ -2,7 +2,7 @@
 
 const PAGE = document.body.dataset.page === "batch" ? "batch" : "list";
 const BATCH_ID = (() => {
-  const match = location.pathname.match(/^\/b\/(\d+)(?:\/results)?\/?$/);
+  const match = location.pathname.match(/^\/b\/(\d+)(?:\/|$)/);
   return match ? Number(match[1]) : null;
 })();
 
@@ -352,34 +352,33 @@ function statusBody(detail) {
   return html;
 }
 
-function resultsRequested() {
-  return /\/results\/?$/.test(location.pathname);
+function requestedBatchTab() {
+  return location.pathname.match(/\/(results|plot)\/?$/)?.[1] || "status";
 }
 
-function renderBatchPanels(s, snapshotUpdated = false) {
+function renderBatchPanels(s, update) {
   const detail = s?.batch;
   const missing = s && Object.hasOwn(s, "batch") && !detail && !s.starting && !s.degraded;
-  const results = !missing && resultsRequested();
-  const statusPanel = document.getElementById("status-panel");
-  const resultsPanel = document.getElementById("results-panel");
-  const enteringResults = results && resultsPanel.hidden;
-  statusPanel.hidden = results;
-  resultsPanel.hidden = !results;
+  const name = missing ? "status" : requestedBatchTab();
+  const panel = document.getElementById(name + "-panel");
+  const entering = panel.hidden;
   const tabs = document.getElementById("batch-tabs");
   tabs.hidden = Boolean(missing);
   for (const tab of tabs.children) {
-    const selected = (tab.id === "tab-results") === results;
+    const selected = tab.id === "tab-" + name;
+    document.getElementById(tab.getAttribute("aria-controls")).hidden = !selected;
     tab.setAttribute("aria-selected", String(selected));
     tab.tabIndex = selected ? 0 : -1;
   }
-  if (results) {
-    if (enteringResults || snapshotUpdated) {
-      refreshResultTable(resultsPanel, BATCH_ID, detail?.running ?? true, enteringResults);
+  if (name !== "status") {
+    if (entering || update) {
+      const refresh = name === "plot" ? refreshResultPlot : refreshResultTable;
+      refresh(panel, BATCH_ID, detail?.running ?? true, entering || update === "reconnect");
     }
   } else if (detail) {
-    statusPanel.innerHTML = sourceNote(detail) + statusBody(detail);
+    panel.innerHTML = sourceNote(detail) + statusBody(detail);
   } else {
-    statusPanel.innerHTML = '<div class="card empty">' + (missing
+    panel.innerHTML = '<div class="card empty">' + (missing
       ? "当前目录中没有批次 " + esc(BATCH_ID)
       : "正在读取批次 " + esc(BATCH_ID) + " 的快照，稍后自动刷新…") + "</div>";
   }
@@ -389,7 +388,8 @@ function wireBatchTabs() {
   const tabs = document.getElementById("batch-tabs");
   function select(tab) {
     if (tab.getAttribute("aria-selected") === "true") return;
-    const path = "/b/" + BATCH_ID + "/" + (tab.id === "tab-results" ? "results/" : "");
+    const name = tab.id.slice("tab-".length);
+    const path = "/b/" + BATCH_ID + "/" + (name === "status" ? "" : name + "/");
     history.pushState(null, "", path);
     renderBatchPanels(state.snapshot);
   }
@@ -398,13 +398,15 @@ function wireBatchTabs() {
     if (tab) select(tab);
   };
   tabs.onkeydown = (event) => {
-    const [status, results] = tabs.children;
+    const buttons = Array.from(tabs.children);
+    const index = buttons.indexOf(event.target);
+    if (index < 0) return;
     let target;
     switch (event.key) {
-      case "Home": target = status; break;
-      case "End": target = results; break;
-      case "ArrowLeft":
-      case "ArrowRight": target = event.target === status ? results : status; break;
+      case "Home": target = buttons[0]; break;
+      case "End": target = buttons.at(-1); break;
+      case "ArrowLeft": target = buttons[(index + buttons.length - 1) % buttons.length]; break;
+      case "ArrowRight": target = buttons[(index + 1) % buttons.length]; break;
       default: return;
     }
     event.preventDefault();
@@ -414,15 +416,15 @@ function wireBatchTabs() {
   globalThis.onpopstate = () => renderBatchPanels(state.snapshot);
 }
 
-function renderBatch(s, snapshotUpdated) {
+function renderBatch(s, update) {
   document.getElementById("batch-header").innerHTML = (s ? notices(s) : "") + topBar(s?.batch);
-  renderBatchPanels(s, snapshotUpdated);
+  renderBatchPanels(s, update);
   wire();
 }
 
-function render(snapshotUpdated = false) {
+function render(update) {
   const s = state.snapshot;
-  if (PAGE === "batch") renderBatch(s, snapshotUpdated);
+  if (PAGE === "batch") renderBatch(s, update);
   else if (s) renderList(s);
   else app.innerHTML = '<p class="muted pad">等待第一个快照…</p>';
 }
@@ -448,11 +450,7 @@ function connect() {
   const source = new EventSource(url);
   source.onopen = () => {
     state.connected = true;
-    render();
-    const previousBatch = state.snapshot?.batch;
-    if (previousBatch && resultsRequested()) {
-      refreshResultTable(document.getElementById("results-panel"), BATCH_ID, previousBatch.running, true);
-    }
+    render(state.snapshot?.batch ? "reconnect" : undefined);
   };
   source.onerror = () => { state.connected = false; render(); };
   source.onmessage = (message) => {
@@ -463,7 +461,7 @@ function connect() {
       location.reload();
       return;
     }
-    render(true);
+    render("snapshot");
   };
 }
 
@@ -471,6 +469,6 @@ document.title = PAGE === "batch" ? "expman 看板 · 批次 " + BATCH_ID : "exp
 
 if (PAGE === "batch") {
   wireBatchTabs();
-  if (resultsRequested()) render();
+  if (requestedBatchTab() !== "status") render();
 }
 connect();

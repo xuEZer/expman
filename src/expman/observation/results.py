@@ -10,6 +10,7 @@ from typing import Any
 
 import yaml
 
+from expman.observation.metric_relations import compare_metrics
 from expman.storage.base import StorageError
 from expman.storage.batch import BatchStore
 
@@ -53,16 +54,26 @@ class _ValueDumper(yaml.SafeDumper):
         return True
 
 
-def _cells(values: dict[int, Any]) -> dict[int, _Cell]:
+def _cells(values: dict[int, Any], *, numeric_axis: bool) -> dict[int, _Cell]:
     """Send ordinary scalars directly and preserve richer YAML types as text."""
     non_null = [value for value in values.values() if value is not None]
     types = {type(value) for value in non_null}
-    if len(types) <= 1 and (
-        types <= {str, bool}
-        or (types == {int} and all(abs(value) < 2**53 for value in non_null))
-        or (types == {float} and all(math.isfinite(value) for value in non_null))
-    ):
+    if len(types) <= 1 and types <= {str, bool}:
         return values
+    if types <= {int, float} and (numeric_axis or len(types) == 1):
+        within_range = all(
+            abs(value) < 2**53 if type(value) is int else math.isfinite(value)
+            for value in non_null
+        )
+        # A numeric plot axis needs distinct coordinates for distinct settings.
+        # Keep YAML spellings when JavaScript would merge 1 with 1.0 or ±0.0.
+        preserves_levels = (
+            not numeric_axis
+            or float not in types
+            or len(set(non_null)) == len({repr(value) for value in non_null})
+        )
+        if within_range and preserves_levels:
+            return values
     # Encode the entire column together so a timestamp and its spelling as a
     # quoted string, for example, stay distinct all the way to the browser.
     return {
@@ -77,10 +88,12 @@ def _cells(values: dict[int, Any]) -> dict[int, _Cell]:
     }
 
 
-def _variables(configs: dict[int, dict], rows: list[_Row]) -> list[_Column]:
+def _variables(
+    configs: dict[int, dict], rows: list[_Row], *, numeric_axes: bool
+) -> list[_Column]:
     columns: list[_Column] = []
     for path, values in _fields(configs):
-        cells = _cells(values)
+        cells = _cells(values, numeric_axis=numeric_axes)
         if len(cells) == len(rows) and len(set(cells.values())) == 1:
             continue
         column_id = f"x{len(columns)}"
@@ -91,17 +104,20 @@ def _variables(configs: dict[int, dict], rows: list[_Row]) -> list[_Column]:
 
 
 def _metrics(
-    connection: sqlite3.Connection | None, rows: dict[str, _Row]
-) -> list[_Column]:
+    connection: sqlite3.Connection | None,
+    rows: dict[str, _Row],
+    plot_keys: dict[tuple[str, str], str] | None = None,
+) -> tuple[list[_Column], set[str]]:
+    stepped: set[str] = set()
     if connection is None:
-        return []
+        return [], stepped
     keys: dict[tuple[tuple[int, ...], _Path], str] = {}
     stages: dict[_Path, set[tuple[int, ...]]] = defaultdict(set)
     try:
         if not connection.execute(
             "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='metrics'"
         ).fetchone():
-            return []
+            return [], stepped
         # Summary metrics use step -1, below every explicit step.
         for run_id, stage_json, metric_json, step, value in connection.execute(
             """WITH latest AS (
@@ -131,9 +147,17 @@ def _metrics(
                 raise ValueError("invalid metric record")
             key = (stage, metric)
             if key not in keys:
-                keys[key] = f"y{len(keys)}"
+                if plot_keys is None:
+                    keys[key] = f"y{len(keys)}"
+                else:
+                    # A metric selected in the plot must keep its identity when
+                    # another stage starts reporting a metric with the same name.
+                    keys[key] = f"{'.'.join(map(str, stage))}:{_label(metric)}"
+                    plot_keys[stage_json, metric_json] = keys[key]
                 stages[metric].add(stage)
             rows[run_id][keys[key]] = value
+            if plot_keys is not None and step >= 0:
+                stepped.add(keys[key])
     except (sqlite3.Error, ValueError, TypeError) as error:
         raise StorageError(f"cannot read metrics: {error}") from error
 
@@ -143,18 +167,12 @@ def _metrics(
         if len(stages[metric]) > 1:
             label = f"S{'.'.join(map(str, stage))} · {label}"
         columns.append({"id": keys[(stage, metric)], "label": label})
-    return columns
+    return columns, stepped
 
 
-def read_results(
-    directory: Path, connection: sqlite3.Connection | None
-) -> tuple[list[_Column], list[_Column], list[_Row]]:
-    """Read one sparse row per manifest run, in YAML expansion order.
-
-    Missing cells have no key. Each stage and metric path supplies one column,
-    using the highest recorded step for each run in the caller's database
-    snapshot. Pass None until the first metric database exists.
-    """
+def _config_rows(
+    directory: Path, *, numeric_axes: bool = False
+) -> tuple[list[_Column], dict[str, _Row]]:
     store = BatchStore(directory)
     entries = store.read_manifest()["experiments"]
     configs: dict[int, dict] = {}
@@ -167,7 +185,65 @@ def read_results(
             raise StorageError("invalid or duplicate experiment ID in batch manifest")
         configs[index] = store.load_config(run_id)
         by_run[run_id] = {}
-    rows = list(by_run.values())
-    variables = _variables(configs, rows)
-    metrics = _metrics(connection, by_run)
-    return variables, metrics, rows
+    return _variables(configs, list(by_run.values()), numeric_axes=numeric_axes), by_run
+
+
+def read_results(
+    directory: Path, connection: sqlite3.Connection | None
+) -> tuple[list[_Column], list[_Column], list[_Row]]:
+    """Read one sparse row per manifest run, in YAML expansion order.
+
+    Missing cells have no key. Each stage and metric path supplies one column,
+    using the highest recorded step for each run in the caller's database
+    snapshot. Pass None until the first metric database exists.
+    """
+    variables, rows = _config_rows(directory)
+    metrics, _ = _metrics(connection, rows)
+    return variables, metrics, list(rows.values())
+
+
+def read_plot(
+    directory: Path, connection: sqlite3.Connection | None, requested: frozenset[str]
+) -> dict:
+    """Read axes and latest values, with explicit step histories for the chosen metrics."""
+    variables, rows = _config_rows(directory, numeric_axes=True)
+    keys: dict[tuple[str, str], str] = {}
+    metrics, stepped = _metrics(connection, rows, keys)
+    records = list(rows.values())
+    dependencies = compare_metrics(variables, metrics, records)[1] if metrics else []
+    history: dict[str, dict[str, list[tuple[int, float]]]] = (
+        {run: {} for run in rows} if requested else {}
+    )
+    selected = {key: metric for key, metric in keys.items() if metric in requested}
+    if connection is not None and selected:
+        # Bind only paths present in the catalog. SQL filters summaries and
+        # unselected histories before any individual steps reach Python.
+        pairs = ",".join("(?, ?)" for _ in selected)
+        parameters = [part for key in selected for part in key]
+        try:
+            for run, stage, metric, step, value in connection.execute(
+                f"""SELECT run_id, stage_path, metric_path, step, value FROM metrics
+                    WHERE step >= 0 AND (stage_path, metric_path) IN (VALUES {pairs})
+                    ORDER BY run_id, step""",
+                parameters,
+            ):
+                if run in history:
+                    if type(step) is not int or not math.isfinite(value):
+                        raise ValueError("invalid metric record")
+                    series = selected[stage, metric]
+                    history[run].setdefault(series, []).append((step, value))
+        except (sqlite3.Error, TypeError, ValueError) as error:
+            raise StorageError(f"cannot read metric history: {error}") from error
+    return {
+        "variables": variables,
+        "metrics": [
+            {
+                **metric,
+                "has_steps": metric["id"] in stepped,
+                "depends_on": [variables[axis]["id"] for axis in axes],
+            }
+            for metric, axes in zip(metrics, dependencies, strict=True)
+        ],
+        "rows": records,
+        "steps": list(history.values()),
+    }
