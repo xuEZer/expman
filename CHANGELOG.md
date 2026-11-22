@@ -4,6 +4,7 @@
 
 ### Breaking changes
 
+- `expman run` 省略模块名时，默认导入模块由 `pipeline` 改为 `src.pipeline`。例如，`expman run train baseline` 从实验项目的 `src/pipeline.py` 导入 `train`。使用根目录 `pipeline.py` 的项目可显式运行 `expman run pipeline:train baseline`。恢复批次时，清单中的完整模块路径优先，只有清单仅记录属性名时才使用内置默认模块。
 - 从实验项目根目录执行 `expman run` 时，配置参数使用省略 `.yaml` 扩展名的配置名。例如，`expman run train baseline` 读取 `./configs/baseline.yaml`。YAML 的 `defaults` 按字段路径从 `./configs/` 读取，各条 CLI 命令的项目设置只读取 `./pyproject.toml` 中的 `[tool.expman]`。
 - 非空 `Pipeline` 在构造时检查最后一个 Stage 的 `process()` 定义。叶子须为同步普通方法，只允许自然结束、`return` 和 `return None`。该约束也适用于独立和嵌套的 Pipeline。批次中的标量结果可通过 `ctx.log_metrics()` 保存，模型等产物由实验代码显式写入。尝试和实验结果移除按需读取最终返回值的 `output` 属性。
 - 移除 Python 的 `Batch(pipeline, cfg)` 和 `Batch.resume(...)` 接口。批次统一通过 `expman run train config` 创建并运行，通过 `expman resume ID` 恢复。缺少流程位置的批次无法通过 CLI 恢复。
@@ -21,7 +22,6 @@
 - 批次详情页新增“运行情况”和“实验结果”选项卡。结果表列出全部展开配置，按配置显示每个指标最大 step 对应的数值，在展示值新增或改变时按单变量对照更新列顺序，并合并相邻同值单元格。
 - 运行参数集中在 `src/expman/settings.py`。各条 CLI 命令可以共用项目 `pyproject.toml` 的 `[tool.expman]` 配置，Python 调用者可以用 `expman.set(...)` 和 `expman.get(key)` 覆盖或读取当前进程的设置。支持设置批次目录、看板端口、刷新间隔、资源预算和 worker 环境。
 - 新增 `expman delete ID`，可删除指定批次的目录及登记记录并释放 ID。命令支持 `--batches-dir`，也可清除已手动移走目录的批次记录。运行中的批次须先停止。
-- `expman run` 支持省略流程模块名。例如 `expman run train experiments` 会从默认模块 `pipeline` 导入 `train`。
 - 默认 pytest 和提交检查均要求真实 CUDA/MPS 测试通过。测试从可见、显存足够且未被其他测试预留的物理 GPU 中选择利用率最低的一张，已有计算任务的卡也可入选。
 - 运行看板由独立进程 `expman web` 提供。实验进程定期把只读快照写入 `live.json`，看板通过 HTTP 和 SSE 展示运行状态、调度与资源观测。支持指定地址、端口和批次根目录，并为发现的批次登记稳定编号。
 - worker 默认将受支持的线程池环境变量设为 4，未设置 `HF_ENDPOINT` 时使用 `https://hf-mirror.com`。shell 已导出任一受支持的线程池变量时，整组线程设置由 shell 决定。可用 `EXPMAN_THREADS`（`off` 或正整数）和 `EXPMAN_HF_MIRROR`（`off`、`cn` 或端点）调整默认值。框架写入的值记录在每次尝试的 `bootstrap.pkl` 中。无效的 `EXPMAN_THREADS` 会在创建批次目录前报错。

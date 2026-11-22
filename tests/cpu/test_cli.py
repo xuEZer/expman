@@ -18,7 +18,7 @@ from expman.scheduling.batch import _Batch
 from expman.storage.base import run_lock
 from expman.storage.batch import BatchStore
 
-MODULE_NAME = "pipeline"
+MODULE_NAME = "src.pipeline"
 
 MODULE_SOURCE = """\
 from expman import Pipeline, Stage
@@ -48,15 +48,19 @@ train = expman.Pipeline([])
 
 @pytest.fixture()
 def pipeline_module(tmp_path, monkeypatch):
-    """Publish the pipeline module in an isolated working directory."""
-    (tmp_path / f"{MODULE_NAME}.py").write_text(MODULE_SOURCE)
+    """Expose the default pipeline module from an isolated experiment project."""
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "pipeline.py").write_text(MODULE_SOURCE)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.delitem(sys.modules, "src", raising=False)
     monkeypatch.delitem(sys.modules, MODULE_NAME, raising=False)
     try:
         yield MODULE_NAME
     finally:
         sys.modules.pop(MODULE_NAME, None)
+        sys.modules.pop("src", None)
 
 
 @pytest.fixture
@@ -187,13 +191,13 @@ def test_run_reads_settings_set_by_the_pipeline_module(
     assert manifest["estimate_coverage"] == 0.9
 
 
-def test_resume_of_a_short_pipeline_location_uses_its_original_module(
+def test_resume_of_a_short_pipeline_location_uses_the_builtin_module(
     tmp_path, pipeline_module, prepare_batch_only
 ):
     assert main(["run", "train", write_config(tmp_path)]) == 0
     store = BatchStore(ensure_ids(tmp_path / "batches")[0])
     manifest = store.read_manifest()
-    assert manifest["pipeline_spec"] == "pipeline:train"
+    assert manifest["pipeline_spec"] == "src.pipeline:train"
     manifest["pipeline_spec"] = "train"
     store.save_manifest(manifest)
     (tmp_path / "pyproject.toml").write_text(

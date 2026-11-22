@@ -25,7 +25,7 @@ class Defaults:
 
     # Batch creation and CLI
     batches_dir: Path = Path("./batches/")
-    pipeline_module: str = "pipeline"
+    pipeline_module: str = "src.pipeline"
     retries: int = _number(1, _NONNEGATIVE)
     coverage: float = _number(0.8, (lambda n: 0 < n < 1, "strictly between 0 and 1"))
     status_interval: float = _number(2.0)  # Terminal status refresh period.

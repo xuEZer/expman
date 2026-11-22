@@ -21,7 +21,7 @@ uv sync
 source .venv/bin/activate
 ```
 
-在实验项目根目录的 `pipeline.py` 中定义 `train`，将实验配置保存为 `configs/baseline.yaml`。从项目根目录运行 `expman run train baseline` 即可启动批次。运行与恢复的完整示例见[命令行](#命令行)。
+在实验项目的 `src/pipeline.py` 中定义 `train`，将实验配置保存为 `configs/baseline.yaml`。从项目根目录运行 `expman run train baseline` 即可启动批次。运行与恢复的完整示例见[命令行](#命令行)。
 
 ## 定义实验阶段
 
@@ -217,7 +217,7 @@ d_model: 128
 
 ## 执行实验集合
 
-将上面含有 `models` 的 `grid` 示例保存为 `configs/experiment.yaml`，并在项目根目录的 `pipeline.py` 中定义流程。
+将上面含有 `models` 的 `grid` 示例保存为 `configs/experiment.yaml`，并在 `src/pipeline.py` 中定义流程。
 
 ```python
 from expman import Pipeline, Stage
@@ -234,7 +234,7 @@ class ModelSummary(Stage[None, None]):
 summary = Pipeline([ModelSummary])
 ```
 
-从项目根目录运行 `expman run summary experiment`。命令导入 `pipeline.summary`，为展开后的 8 份配置各创建一个 run，并在开始调度时打印批次 ID 和目录。
+从项目根目录运行 `expman run summary experiment`。命令从 `src.pipeline` 导入 `summary`，为展开后的 8 份配置各创建一个 run，并在开始调度时打印批次 ID 和目录。
 
 示例中的 `-> None` 让 Pyright 可以在编辑时指出 `return 0` 等类型错误。注解可选，`Pipeline([ModelSummary])` 会直接检查叶子方法的定义，因此方法的 Python 源码须可读取。若叶子需要保存模型，可以写 `save_model(model)` 后自然结束。`return save_model(model)` 属于返回表达式，会在构造 Pipeline 时被拒绝。
 
@@ -248,10 +248,10 @@ summary = Pipeline([ModelSummary])
 
 ## 命令行
 
-实验 YAML 直接放在项目的 `configs/` 目录下。启动批次时只写配置名，省略 `.yaml` 扩展名。`expman run train baseline` 会打开 `./configs/baseline.yaml`，并按内置默认值从当前目录的 `pipeline.py` 导入 `train`。流程定义在其他模块时，写成 `module:attr`，例如 `mypkg.pipelines:train`。
+实验 YAML 直接放在项目的 `configs/` 目录下。启动批次时只写配置名，省略 `.yaml` 扩展名。从项目根目录执行 `expman run train baseline`，默认从 `src/pipeline.py` 导入名为 `train` 的 `Pipeline` 实例，读取 `configs/baseline.yaml`。流程定义在其他模块时，写成 `module:attr`，例如 `mypkg.pipelines:train`。
 
 ```python
-# pipeline.py
+# src/pipeline.py
 from expman import Pipeline
 from mypkg.stages import LoadData, Train, Eval
 

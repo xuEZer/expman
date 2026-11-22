@@ -1,7 +1,7 @@
 """Command-line interface: run, resume, inspect, stop and delete experiment Batches.
 
 The CLI resolves a bare pipeline name in the configured ``pipeline_module``
-(built-in default ``pipeline``) or accepts an explicit ``module:attr``.
+(built-in default ``src.pipeline``) or accepts an explicit ``module:attr``.
 The run command reads ``./configs/<config>.yaml`` for the given config name.
 The batch manifest records the resolved ``module:attr`` for
 ``expman resume``. Each batches directory (default ``./batches/``) has its own
@@ -142,7 +142,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     directory = _batch_directory(args.batches_dir, args.ID)
     store = BatchStore(directory)
     manifest = store.read_resumable_manifest()
-    # A short name in an existing manifest was recorded against the built-in module.
+    # Bare names in a manifest use the built-in default regardless of project settings.
     _, pipeline = _resolve_pipeline(
         manifest["pipeline_spec"], Defaults().pipeline_module
     )

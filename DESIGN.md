@@ -24,7 +24,7 @@ flowchart LR
     V --> UI["独立 Web 服务"]
 ```
 
-1. **创建批次。** `expman run` 按 `module:attr` 导入 Pipeline，省略模块名时从 `pipeline_module` 指定的模块读取属性，默认为 `pipeline`。命令把 YAML 展开为一组配置，批次调度代码校验设备和种子，为每份配置创建一个 run 目录，把解析后的 `module:attr` 和初始队列写入批次清单。[CLI](src/expman/cli.py) · [批次调度](src/expman/scheduling/batch.py)
+1. **创建批次。** `expman run` 按 `module:attr` 导入 Pipeline，省略模块名时从 `pipeline_module` 指定的模块读取属性，默认为 `src.pipeline`。命令把 YAML 展开为一组配置，批次调度代码校验设备和种子，为每份配置创建一个 run 目录，把解析后的 `module:attr` 和初始队列写入批次清单。[CLI](src/expman/cli.py) · [批次调度](src/expman/scheduling/batch.py)
 2. **选择任务。** 主进程取每个 run 当前就绪的顶层阶段。可以共享前缀的成员按组处理。命中缓存时，主进程只读元数据，把指标和共享节点引用写到目标 run，推进它的阶段位置。需要计算时，主进程从各阶段的就绪队列选取候选，再按主机内存和各卡显存余量决定派发哪些任务及其设备。启动 worker 前先持久化该成员的活动状态。[调度循环](src/expman/scheduling/scheduler.py) · [阶段分组](src/expman/scheduling/_stages.py)
 3. **计算一个阶段。** worker 在独立解释器内核验 MPS 客户端，加载用户模块并重建 Experiment。执行第 `i` 个顶层阶段时，第一阶段从初始随机状态和输入 `None` 开始，其余阶段只需从第 `i - 1` 个阶段的快照取得输入和随机状态。目标阶段已有有效 checkpoint 时，从该保存点继续。[worker 入口](src/expman/scheduling/_worker.py) · [Experiment](src/expman/core/experiment.py) · [托管阶段执行](src/expman/core/execution.py)
 4. **收集结果。** worker 通过本地 socket 把完成摘要传给主进程。主进程记录历史，释放占用，安排下一阶段或重试。成功的叶子留下完成记录，业务指标保存在 SQLite。调度结束后，CLI 按配置展开顺序打印每个 run 的 ID 和最终状态。[进程间通信](src/expman/scheduling/ipc.py) · [结果对象](src/expman/core/experiment.py)
