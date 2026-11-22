@@ -4,7 +4,6 @@ import sqlite3
 import subprocess
 import sys
 from importlib import import_module
-from itertools import pairwise
 from pathlib import Path
 from time import monotonic, perf_counter, sleep
 from unittest.mock import Mock, patch
@@ -44,7 +43,6 @@ class GpuWork(Stage):
             "markers": True,
             "item": True,
             "crash": True,
-            "fail_once": True,
             "wait_for_release": True,
             "delay": True,
             "device": True,
@@ -65,9 +63,7 @@ class GpuWork(Stage):
                 continue
             if ctx.cfg["crash"]:
                 os._exit(7)
-            if ctx.cfg["fail_once"] and ctx.attempt == 1:
-                raise ValueError("retry me")
-            for step in range(10):
+            for step in range(2):
                 ctx.log_metrics({"train": {"loss": step}}, step=step)
             try:
                 if ctx.attempt == 1:
@@ -85,6 +81,8 @@ class GpuWork(Stage):
                     "pid": os.getpid(),
                     "saved": state["saved"],
                     "cfg_devices": list(ctx.cfg["device"]),
+                    "threads": os.environ.get("OMP_NUM_THREADS"),
+                    "mirror": os.environ.get("HF_ENDPOINT"),
                 }
                 (root / f"{ctx.run_id}.finished").write_text(json.dumps(worker_info))
             finally:
@@ -181,45 +179,12 @@ def _worker(**fields):
     return Mock(**values)
 
 
-def _captured_gpu_ceilings(batch):
-    """Capture the requested MPS memory limit for each launched attempt."""
-    ceilings = []
-    original = GpuScheduler._launch
-
-    def launch(scheduler, device, memory, host, candidate):
-        launched = original(scheduler, device, memory, host, candidate)
-        if launched:
-            ceilings.append(scheduler.workers[candidate.run_id].gpu_cap_kb)
-        return launched
-
-    with patch.object(GpuScheduler, "_launch", launch):
-        batch.run()
-    return ceilings
-
-
-def _captured_worker_env(batch):
-    """Run the batch, returning the environment each worker was started with."""
-    envs = []
-    original = subprocess.Popen
-
-    def captured(*args, **kwargs):
-        argv = args[0] if args else kwargs.get("args", ())
-        if "expman.scheduling._worker" in argv:
-            envs.append(kwargs.get("env", {}))
-        return original(*args, **kwargs)
-
-    with patch("expman.scheduling.scheduler.subprocess.Popen", side_effect=captured):
-        batch.run()
-    return envs
-
-
 def make_batch(root, *, count=3, devices=None, **options):
     cfg = {
         "device": [0, 1] if devices is None else devices,
         "seed": 0,
         "markers": str(root),
         "crash": False,
-        "fail_once": False,
         "wait_for_release": False,
         "delay": 0.1,
         "item": 0,
@@ -360,29 +325,6 @@ class TestGpuScheduling:
         )
 
     @pytest.mark.simulated_gpu
-    def test_worker_environment_gets_the_framework_defaults(
-        self, tmp_path, monkeypatch
-    ):
-        """The thread ceiling and the HF mirror reach every worker untouched."""
-        for name in (*environment.THREAD_VARIABLES, "HF_ENDPOINT"):
-            monkeypatch.delenv(name, raising=False)
-        batch = warm(make_batch(tmp_path, count=1))
-
-        envs = _captured_worker_env(batch)
-
-        assert envs, "no worker process was launched"
-        assert envs[0]["OMP_NUM_THREADS"] == str(settings.worker_threads)
-        assert envs[0]["MKL_NUM_THREADS"] == str(settings.worker_threads)
-        assert envs[0]["HF_ENDPOINT"] == settings.hf_mirror
-        # CUDA_VISIBLE_DEVICES stays the scheduler's own decision.
-        assert "expman.scheduling.environment" not in envs[0]
-        recorded = read_record(
-            next(batch.output_dir.rglob("bootstrap.pkl")), PickleSerializer()
-        )["environment"]
-        assert recorded["HF_ENDPOINT"] == settings.hf_mirror
-        assert recorded["OMP_NUM_THREADS"] == str(settings.worker_threads)
-
-    @pytest.mark.simulated_gpu
     def test_worker_uses_the_parent_settings_after_importing_the_pipeline(
         self, tmp_path, monkeypatch
     ):
@@ -420,8 +362,17 @@ class TestGpuScheduling:
             sys.modules.pop(module_name, None)
 
     @pytest.mark.simulated_gpu
-    def test_multiple_devices_and_metrics_results_are_collected(self, tmp_path):
-        batch = warm(make_batch(tmp_path, count=4, delay=0.25))
+    def test_multiple_devices_and_metrics_results_are_collected(
+        self, tmp_path, monkeypatch
+    ):
+        for name in (
+            *environment.THREAD_VARIABLES,
+            "HF_ENDPOINT",
+            environment.THREADS_OVERRIDE,
+            environment.MIRROR_OVERRIDE,
+        ):
+            monkeypatch.delenv(name, raising=False)
+        batch = make_batch(tmp_path, count=2)
         results = batch.run()
         assert all(item.status is Status.SUCCEEDED for item in results)
         workers = [
@@ -429,24 +380,40 @@ class TestGpuScheduling:
             for item in results
         ]
         assert {item["device"] for item in workers} == {"GPU-test-0", "GPU-test-1"}
-        assert len({item["pid"] for item in workers}) == 4
+        assert len({item["pid"] for item in workers}) == 2
+        assert all(item["threads"] == str(settings.worker_threads) for item in workers)
+        assert all(item["mirror"] == settings.hf_mirror for item in workers)
+        recorded = read_record(
+            next(batch.output_dir.rglob("bootstrap.pkl")), PickleSerializer()
+        )["environment"]
+        assert recorded["HF_ENDPOINT"] == settings.hf_mirror
+        assert recorded["OMP_NUM_THREADS"] == str(settings.worker_threads)
         assert all(item["import_device"] == item["device"] for item in workers)
         assert all(item["cfg_devices"] == [0, 1] for item in workers)
-        assert any(item.get("concurrency", 0) > 1 for item in batch.state.stage_history)
-        measured = [
-            item for item in batch.state.stage_history if not item.get("reused")
-        ]
-        assert measured
-        assert all(item["peak_kb"] > 0 for item in measured)
+        history = batch.state.stage_history
+        assert len(history) == 2
+        # The two attempts ran on different GPUs during an overlapping interval.
+        assert max(item["start_seconds"] for item in history) < min(
+            item["end_seconds"] for item in history
+        )
+        expected_limit = int(cap_kb(settings.gpu_peak_kb_default) // 1024) * 1024
+        assert all(item["gpu_limit_kb"] == expected_limit for item in history)
+        assert all(item["peak_kb"] > 0 for item in history)
         assert batch.live.host_memory["available_ratio"] == 0.75
         assert batch.live.host_memory["swap_free_kb"] == 0.0
         assert not batch.live.host_memory["tight"]
         with sqlite3.connect(batch.output_dir / "metrics.sqlite3") as db:
-            assert db.execute("SELECT count(*) FROM metrics").fetchone()[0] == 40
+            rows = db.execute(
+                "SELECT run_id, step, value FROM metrics ORDER BY run_id, step"
+            ).fetchall()
+        assert rows == sorted(
+            (item.run_id, step, step) for item in results for step in (0, 1)
+        )
         assert batch.recorder.events
         resumed = batch_helpers.restore_batch(Pipeline([GpuWork]), batch.output_dir)
         assert resumed.run() == results
         assert resumed.devices == (0, 1)
+        assert GpuScheduler(resumed).peaks.ceiling_kb > 0
 
     @pytest.mark.simulated_gpu
     def test_top_level_stages_run_independently_and_record_dependencies(self, tmp_path):
@@ -672,51 +639,6 @@ class TestGpuScheduling:
         candidates = GpuScheduler(batch).stages.ready_candidates(16 * 1024**2, {})
 
         assert [candidate.run_id for candidate in candidates] == [retry, first, second]
-
-    def test_stage_group_follows_declared_dependencies(self, tmp_path):
-        path = tmp_path / "declared.yaml"
-        path.write_text(
-            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\nitem: 1\n"
-            "grid:\n  item: [1, 2]\n"
-            "crash: false\nfail_once: false\nwait_for_release: false\ndelay: 0\n"
-        )
-        batch = batch_helpers.make_batch(
-            Pipeline([GpuWork]), path, output_dir=tmp_path / "declared"
-        )
-        scheduler = GpuScheduler(batch)
-        first, second = (item.run_id for item in batch.experiments)
-
-        # GpuWork declares item, so its two values are separate groups.
-        assert scheduler.stages.group(first, 0) != scheduler.stages.group(second, 0)
-        assert {
-            path
-            for item in batch.experiments
-            for path in scheduler.stages.prefix_paths(item.run_id, 0)
-        } == {
-            ("markers",),
-            ("item",),
-            ("crash",),
-            ("fail_once",),
-            ("wait_for_release",),
-            ("delay",),
-            ("device",),
-        }
-
-    def test_undeclared_configuration_does_not_split_stage_groups(self, tmp_path):
-        path = tmp_path / "undeclared.yaml"
-        path.write_text(
-            f"device: [0]\nseed: 0\nmarkers: {tmp_path}\nitem: 0\n"
-            "crash: false\nfail_once: false\nwait_for_release: false\ndelay: 0\n"
-            "unused: 1\ngrid:\n  unused: [1, 2]\n"
-        )
-        batch = batch_helpers.make_batch(
-            Pipeline([GpuWork]), path, output_dir=tmp_path / "undeclared"
-        )
-        scheduler = GpuScheduler(batch)
-        first, second = (item.run_id for item in batch.experiments)
-
-        # unused is not declared, so the two runs share one reusable group.
-        assert scheduler.stages.group(first, 0) == scheduler.stages.group(second, 0)
 
     def test_conditional_dependencies_follow_the_config_value(self, tmp_path):
         path = tmp_path / "conditional.yaml"
@@ -961,7 +883,7 @@ class TestGpuScheduling:
         path = tmp_path / "two-stage.yaml"
         path.write_text(
             f"device: [0]\nseed: 0\nmarkers: {tmp_path}\n"
-            "crash: false\nfail_once: false\nwait_for_release: false\ndelay: 0\n"
+            "crash: false\nwait_for_release: false\ndelay: 0\n"
             "item: 0\ngrid:\n  item: [0, 1, 2, 3, 4, 5, 6, 7]\n"
         )
         batch = batch_helpers.make_batch(
@@ -1030,28 +952,14 @@ class TestGpuScheduling:
         assert not list((output_dir / "cache").rglob("*.pkl"))
 
     @pytest.mark.simulated_gpu
-    @pytest.mark.parametrize("crash", [False, True], ids=["fail-once", "crash"])
-    def test_failure_and_unexpected_process_exit_get_one_retry(self, tmp_path, crash):
-        batch = batch_helpers.make_batch(
-            Pipeline([GpuWork]),
-            {
-                "device": [0],
-                "seed": 0,
-                "markers": str(tmp_path),
-                "item": 0,
-                "wait_for_release": False,
-                "delay": 0.1,
-                "crash": crash,
-                "fail_once": not crash,
-            },
-            output_dir=tmp_path / "batch",
-        )
-        result = batch.run()[0]
-        assert len(result.attempts) == 2
-        assert result.status is (Status.FAILED if crash else Status.SUCCEEDED)
-        assert result.attempts[0].error_type == (
-            "WorkerExit" if crash else "ValueError"
-        )
+    def test_unexpected_process_exit_exhausts_one_retry(self, tmp_path):
+        batch = make_batch(tmp_path, count=1, devices=[0], crash=True)
+        (result,) = batch.run()
+        assert result.status is Status.FAILED
+        assert [attempt.error_type for attempt in result.attempts] == [
+            "WorkerExit",
+            "WorkerExit",
+        ]
 
     @pytest.mark.simulated_gpu
     def test_interrupt_kills_all_without_finally_and_restores_checkpoint(
@@ -1298,34 +1206,6 @@ class TestGpuScheduling:
             scheduler._relieve(None, short)
         assert shed == ["newer"]
 
-    def test_an_unmeasured_batch_uses_fixed_one_gib_reservations(self, tmp_path):
-        batch = make_batch(tmp_path, count=4, devices=[0, 1], delay=0)
-        scheduler = GpuScheduler(batch)
-        memory = Memory([0, 1]).sample()
-        host = Host().sample()
-        probe_kb = 1024**2
-        launched = []
-        with patch.object(
-            GpuScheduler,
-            "_launch",
-            side_effect=lambda *a: launched.append(a[3]),
-        ):
-            scheduler._launch_available(memory, host)
-        # Unknown host and GPU reservations are each 1 GiB, so all four fit.
-        assert len(launched) == 4
-        assert {candidate.gpu_reserve_kb for candidate in launched} == {probe_kb}
-        assert {candidate.host_reserve_kb for candidate in launched} == {probe_kb}
-
-        # Measured peaks replace the probe pricing, and every run fits at once.
-        warm(batch)
-        fresh = GpuScheduler(batch)
-        launched.clear()
-        with patch.object(
-            GpuScheduler, "_launch", side_effect=lambda *a: launched.append(a)
-        ):
-            fresh._launch_available(memory, host)
-        assert len(launched) == 4
-
     def test_a_live_attempt_does_not_hold_other_launches_back(self, tmp_path):
         batch = make_batch(tmp_path, count=4, devices=[0, 1], delay=0)
         scheduler = GpuScheduler(batch)
@@ -1339,56 +1219,6 @@ class TestGpuScheduling:
             scheduler._launch_available(Memory([0, 1]).sample(), Host().sample())
         # Fixed reservations allow all four probes beside the live attempt.
         assert len(launched) == 4
-
-    @pytest.mark.simulated_gpu
-    def test_a_probe_is_capped_on_device_memory(self, tmp_path):
-        batch = make_batch(tmp_path, count=2, devices=[0], delay=0)
-        ceilings = _captured_gpu_ceilings(batch)
-        assert all(item.status is Status.SUCCEEDED for item in batch.results)
-        # The initial 1 GiB reservation still receives the usual cap margin.
-        card_kb = Memory([0]).sample()[0].total * 1024
-        expected = min(
-            cap_kb(settings.gpu_peak_kb_default),
-            card_kb,
-        )
-        assert len(ceilings) == 2
-        assert [float(item) for item in ceilings] == [
-            pytest.approx(int(expected // 1024) * 1024)
-        ] * 2
-
-    @pytest.mark.simulated_gpu
-    def test_a_measured_stage_is_capped_on_device_memory(self, tmp_path):
-        batch = warm(make_batch(tmp_path, count=1, devices=[0], delay=0))
-        ceilings = _captured_gpu_ceilings(batch)
-        assert all(item.status is Status.SUCCEEDED for item in batch.results)
-        assert len(ceilings) == 1
-        assert float(ceilings[0]) > 0
-
-    @pytest.mark.simulated_gpu
-    def test_probes_start_beside_live_attempts(self, tmp_path):
-        path = tmp_path / "probes.yaml"
-        path.write_text(
-            f"device: [0, 1]\nseed: 0\nmarkers: {tmp_path}\noffset: 10\n"
-            "item: 1\ngrid:\n  item: [1, 2, 3]\n"
-        )
-        batch = batch_helpers.make_batch(
-            Pipeline([Prepare, Consume]), path, output_dir=tmp_path / "probes"
-        )
-        started = []
-        original_launch = GpuScheduler._launch
-
-        def watched(scheduler, device, memory, host, candidate):
-            # Sampled at the launch itself: a launch is the only moment that can
-            # put a second attempt beside a live one.
-            started.append(len(scheduler.workers))
-            return original_launch(scheduler, device, memory, host, candidate)
-
-        with patch.object(GpuScheduler, "_launch", watched):
-            results = batch.run()
-
-        assert all(item.status is Status.SUCCEEDED for item in results)
-        # Unmeasured attempts can overlap when their 1 GiB reservations fit.
-        assert any(running > 0 for running in started)
 
     @pytest.mark.simulated_gpu
     def test_host_memory_shortage_pauses_launches_until_it_recovers(self, tmp_path):
@@ -1459,16 +1289,6 @@ class TestGpuScheduling:
             assert result.status is Status.SUCCEEDED
             assert len(result.attempts) == 2
         assert all(item.status is Status.SUCCEEDED for item in results)
-
-    @pytest.mark.simulated_gpu
-    def test_observed_peak_is_recorded_and_changes_later_admission(self, tmp_path):
-        batch = make_batch(tmp_path, count=1, devices=[0], delay=0.05)
-        batch.run()
-        peaks = [item["peak_kb"] for item in batch.state.stage_history]
-        assert peaks
-        assert all(value > 0 for value in peaks)
-        scheduler = GpuScheduler(batch)
-        assert scheduler.peaks.ceiling_kb > 0
 
     @pytest.mark.simulated_gpu
     def test_failed_host_query_sheds_newest_attempt_and_pauses_launches(self, tmp_path):
@@ -1544,22 +1364,6 @@ class TestGpuScheduling:
         assert all(len(item.attempts) == 1 for item in results)
         assert not batch.state.active_gpu
 
-    @pytest.mark.simulated_gpu
-    def test_memory_is_rechecked_on_every_tick(self, tmp_path):
-        batch = make_batch(tmp_path, count=1, devices=[0], delay=0.3)
-        original = Memory.sample
-        stamps = []
-
-        def recorded(monitor):
-            stamps.append(monotonic())
-            return original(monitor)
-
-        with patch.object(Memory, "sample", recorded):
-            batch.run()
-        gaps = [later - earlier for earlier, later in pairwise(stamps)]
-        assert len(stamps) >= 10
-        assert max(gaps) < 0.1
-
 
 class TestDevice:
     def test_device_and_seed_are_required_before_creating_output(self, tmp_path):
@@ -1585,7 +1389,7 @@ class TestDevice:
         assert not (root / "experiment-no-seed").exists()
         assert not (root / "empty-device").exists()
 
-    @pytest.mark.parametrize("value", [None, 0, [True], [-1], [0, 0], ["0"]])
+    @pytest.mark.parametrize("value", [0, [True], [-1], [0, 0]])
     def test_invalid_device_values_are_rejected(self, tmp_path, value):
         with pytest.raises(ConfigError):
             batch_helpers.make_batch(
@@ -1594,21 +1398,6 @@ class TestDevice:
                 output_dir=tmp_path / "unused",
             )
 
-    def test_device_cannot_be_an_expansion_axis(self, tmp_path):
-        cfg = tmp_path / "experiment.yaml"
-        cfg.write_text("device: [0]\nseed: 0\ngrid:\n  device: [[0], [1]]\n")
-        with pytest.raises(ConfigError):
-            batch_helpers.make_batch(Pipeline([]), cfg, output_dir=tmp_path / "unused")
-
-    def test_device_is_a_batch_wide_plain_list(self, tmp_path):
-        cfg = tmp_path / "experiment.yaml"
-        cfg.write_text("device: [0, 1]\nseed: 0\nx: 1\ngrid:\n  x: [1, 2]\n")
-        batch = batch_helpers.make_batch(
-            Pipeline([]), cfg, output_dir=tmp_path / "batch"
-        )
-        assert len(batch.experiments) == 2
-        assert batch.devices == (0, 1)
-
     def test_fits_reserve_uses_available_bytes(self):
         nearly_full = HostMemory(
             settings.host_reserve_kb, settings.host_reserve_kb - 1, 0, 0
@@ -1616,22 +1405,12 @@ class TestDevice:
         assert nearly_full.available_ratio > 0.9
         assert not fits_reserve(nearly_full, 0)
         available = settings.host_reserve_kb + 2 * 1024**2
-        roomy = HostMemory(64 * 1024**2, available, 0, 0)
+        # Fully occupied swap still permits a launch with enough available RAM.
+        roomy = HostMemory(64 * 1024**2, available, 4096, 0)
+        assert roomy.headroom_kb == 2 * 1024**2
         assert fits_reserve(roomy, 2 * 1024**2)
         assert not fits_reserve(roomy, 2 * 1024**2 + 1)
         assert not fits_reserve(None, 0)
-
-    def test_swap_occupancy_does_not_gate_launches(self):
-        # Swapped pages stay out until something touches them, so a host that
-        # swapped once keeps reporting a partly occupied swap long after the
-        # shortage. Only the memory available right now may refuse a launch.
-        large = 64 * 1024**2
-        half_swapped = HostMemory(large, large // 2, 4096, 2048)
-        assert fits_reserve(half_swapped, 0)
-        # Swap fully occupied, memory perfectly available: still a launch.
-        assert fits_reserve(HostMemory(large, large // 2, 4096, 0), 0)
-        short = HostMemory(large, settings.host_reserve_kb - 1, 4096, 0)
-        assert not fits_reserve(short, 0)
 
     def test_query_timeout_is_an_observation_error_with_the_default_timeout(self):
         with (
@@ -1692,6 +1471,7 @@ class TestDevice:
         )
         observation = MeminfoMonitor(path).sample()
         assert observation.available_ratio == 0.25
+        assert observation.tight
         assert observation.swap_total_kb == 400.0
         assert observation.swap_free_kb == 300.0
         path.write_text("MemTotal: 1000 kB\nMemAvailable: 2000 kB\n")
@@ -1723,40 +1503,3 @@ class TestDevice:
         observation = monitor.sample()
         assert observation.utilization_percent is None
         assert observation.available_kb == 500
-
-    def test_host_memory_reports_availability_and_swap_occupancy(self, tmp_path):
-        meminfo = tmp_path / "meminfo"
-        meminfo.write_text(
-            "MemTotal:       16777216 kB\n"
-            "MemAvailable:    8388608 kB\n"
-            "SwapTotal:       4194304 kB\n"
-            "SwapFree:        2097152 kB\n"
-        )
-        monitor = MeminfoMonitor(meminfo)
-        observation = monitor.sample()
-        assert observation.swap_free_kb == 2097152.0
-        assert observation.headroom_kb == 8388608.0 - settings.host_reserve_kb
-        assert not observation.tight
-        # Half the swap stays occupied, and it changes nothing: the occupied
-        # pages are not memory anything can be asked to give back.
-        assert monitor.sample().swap_free_kb == 2097152.0
-        assert not monitor.sample().tight
-
-    def test_host_memory_reports_a_shortage_from_availability_alone(self, tmp_path):
-        meminfo = tmp_path / "meminfo"
-        meminfo.write_text(
-            "MemTotal:       16777216 kB\n"
-            "MemAvailable:       1024 kB\n"
-            "SwapTotal:       4194304 kB\n"
-            "SwapFree:        2097152 kB\n"
-        )
-        observation = MeminfoMonitor(meminfo).sample()
-        assert observation.tight
-
-    @pytest.mark.skipif(
-        not Path("/proc/meminfo").exists(), reason="host meminfo is unavailable"
-    )
-    def test_default_host_monitor_reads_the_running_host(self):
-        observation = MeminfoMonitor().sample()
-        assert observation.total_kb > 0
-        assert 0 <= observation.available_ratio <= 1

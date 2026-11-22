@@ -27,16 +27,17 @@ def evaluate(expression, payload=None):
 
 def test_each_column_merges_its_own_consecutive_values():
     rows = [
-        {"x": 1, "y": 7},
-        {"x": 2, "y": 7},
-        {"x": 2, "y": 3},
-        {"x": 1, "y": 7},
+        {"x": 1},
+        {"x": 2},
+        {"x": 2, "y": 0},
+        {"x": 1, "y": 0},
     ]
     spans = evaluate(
-        '["x", "y"].map(id => Array.from(mergedCells(payload, id), c => [c.start, c.span]))',
+        """["x", "y"].map(id => Array.from(mergedCells(payload, id),
+              c => [valueText(c.value, id === "y"), c.span]))""",
         rows,
     )
-    assert spans == [[[0, 1], [1, 2], [3, 1]], [[0, 2], [2, 1], [3, 1]]]
+    assert spans == [[["1", 1], ["2", 2], ["1", 1]], [["", 2], ["0", 2]]]
 
 
 def test_missing_config_keys_and_explicit_values_stay_distinct():
@@ -52,10 +53,6 @@ def test_missing_config_keys_and_explicit_values_stay_distinct():
         ["0", 1],
         ['""', 1],
     ]
-
-
-def test_unrecorded_metrics_render_as_empty_cells():
-    assert evaluate("[valueText(undefined, true), valueText(0, true)]") == ["", "0"]
 
 
 def test_live_refresh_preserves_the_table_and_retries_the_final_read():

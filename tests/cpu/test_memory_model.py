@@ -2,7 +2,7 @@ from expman.estimation.memory_model import (
     LocalQuantileEstimator,
     PeakCeiling,
 )
-from expman.estimation.time_model import Encoding, encode, variable_distance
+from expman.estimation.time_model import Encoding, encode
 from expman.settings import settings
 
 
@@ -41,35 +41,18 @@ def test_zero_gpu_telemetry_is_a_real_sample_when_requested():
     assert estimator.estimate("pending") == 0.0
 
 
-def test_the_peak_model_draws_neighbours_in_the_shared_configuration_distance():
-    """A peak estimate is only as good as the neighborhood it was drawn from.
+def test_estimates_follow_nearby_configurations(monkeypatch):
+    monkeypatch.setattr(settings, "local_neighbors", 2)
+    monkeypatch.setattr(settings, "local_min_samples", 4)
+    models = ("large", "small", "large", "small", "large", "small")
+    encoding = encode([{"model": model} for model in models])
+    indices = {f"run-{index}": index for index in range(len(models))}
+    estimator = LocalQuantileEstimator(encoding, indices, default=1024)
+    for index, peak in enumerate((1000, 10, 1000, 10)):
+        estimator.record(f"run-{index}", peak)
 
-    Both Stage models must therefore agree on what "nearby" means, so this pins
-    the peak model to the per-variable distance the duration model already uses.
-    """
-    configs = [
-        {"tag": "a" if index % 3 else "b", "steps": index + 1} for index in range(12)
-    ]
-    encoding = encode(configs)
-    assert encoding.variables is not None
-    indices = {f"run-{index}": index for index in range(len(configs))}
-    peaks = {f"run-{index}": 100.0 * (index + 1) for index in range(len(configs))}
-    estimator = LocalQuantileEstimator(encoding, indices, default=0.0)
-    for run_id, peak in peaks.items():
-        estimator.record(run_id, peak)
-
-    query = indices["run-11"]
-    nearest = sorted(
-        peak
-        for _run_id, peak in sorted(
-            peaks.items(),
-            key=lambda item: variable_distance(
-                encoding, encoding.rows[query], encoding.rows[indices[item[0]]]
-            ),
-        )[: settings.local_neighbors]
-    )
-
-    assert sorted(estimator._nearby(query)) == nearest
+    assert estimator.estimate("run-4") == 1000
+    assert estimator.estimate("run-5") == 10
 
 
 def test_rebuild_preserves_capped_history_bump():

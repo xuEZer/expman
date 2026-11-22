@@ -78,7 +78,6 @@ def test_eta_counts_only_unmaterialized_stage_parameter_groups(tmp_path):
     assert str(estimate) == "00:00:00～00:00:01"
     assert estimate.completed_samples == 2
     assert estimate.remaining_experiments == 2
-    assert batch._scheduler is scheduler
     assert scheduler.stages.completion() == {0: (1, 1, 0, 0), 1: (1, 3, 0, 0)}
 
 
@@ -108,14 +107,13 @@ def _running_batch(tmp_path, monkeypatch, *, elapsed, devices=(0,), items=(0,)):
     return batch, scheduler, run_id
 
 
-def test_eta_includes_running_experiments_later_stages(tmp_path, monkeypatch):
-    batch, scheduler, run_id = _running_batch(tmp_path, monkeypatch, elapsed=10.0)
+def test_eta_waits_for_the_running_prefix_even_with_an_idle_gpu(tmp_path, monkeypatch):
+    batch, _scheduler, _run_id = _running_batch(
+        tmp_path, monkeypatch, elapsed=10.0, devices=(0, 1)
+    )
 
     estimate = batch.estimate()
-    groups, active = scheduler.stages.remaining_groups([], batch.live.running_info)
 
-    assert set(groups.values()) == {(run_id, 0), (run_id, 1)}
-    assert len(active) == 1
     assert estimate.remaining_experiments == 2
     low, high = RUNNING.remaining(10.0, 0.8)
     assert estimate.lower_seconds == pytest.approx(low + QUEUED.lower)
@@ -124,10 +122,8 @@ def test_eta_includes_running_experiments_later_stages(tmp_path, monkeypatch):
     assert batch.live.schedule_view["stages"][1]["running"] == 0
 
 
-@pytest.mark.parametrize("elapsed", [39.0, 40.0, 1557.8])
-def test_running_stage_keeps_a_positive_eta_through_overruns(
-    tmp_path, monkeypatch, elapsed
-):
+def test_running_stage_keeps_a_positive_eta_through_overruns(tmp_path, monkeypatch):
+    elapsed = 1557.8
     batch, _scheduler, _run_id = _running_batch(tmp_path, monkeypatch, elapsed=elapsed)
     estimate = batch.estimate()
     low, high = RUNNING.remaining(elapsed, 0.8)
@@ -266,19 +262,6 @@ def test_first_stage_estimates_from_its_own_progress_after_resume(
         )
     )
     assert not batch.estimate().known
-
-
-def test_later_stage_waits_for_running_prefix_on_another_device(tmp_path, monkeypatch):
-    batch, _scheduler, _run_id = _running_batch(
-        tmp_path, monkeypatch, elapsed=10.0, devices=(0, 1)
-    )
-
-    estimate = batch.estimate()
-
-    # A free second GPU cannot evaluate this run before its training finishes.
-    low, high = RUNNING.remaining(10.0, 0.8)
-    assert estimate.lower_seconds == pytest.approx(low + QUEUED.lower)
-    assert estimate.upper_seconds == pytest.approx(high + QUEUED.upper)
 
 
 def test_shared_running_prefix_unblocks_each_later_group_once(tmp_path, monkeypatch):

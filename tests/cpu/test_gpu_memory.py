@@ -15,7 +15,8 @@ def query(monkeypatch):
 
 
 def test_measure_only_this_client_not_the_server_or_other_clients(query):
-    query.return_value.stdout = f"1,22\n{os.getpid()},7\n2,151"
+    pid = os.getpid()
+    query.return_value.stdout = f"{pid + 1},22\n{pid},7\n{pid + 2},151"
     assert gpu_memory.sample("GPU-demo") == 7168
     args = query.call_args.args[0]
     assert (
@@ -23,9 +24,10 @@ def test_measure_only_this_client_not_the_server_or_other_clients(query):
     )
 
 
-@pytest.mark.parametrize("rows", ["", "1,2", "{pid},[N/A]", "{pid},nan"])
+@pytest.mark.parametrize("rows", ["{peer},2", "{pid},[N/A]", "{pid},nan"])
 def test_missing_measurement_is_unknown(query, rows):
-    query.return_value.stdout = rows.format(pid=os.getpid())
+    pid = os.getpid()
+    query.return_value.stdout = rows.format(pid=pid, peer=pid + 1)
     assert gpu_memory.sample("GPU-demo") is None
 
 
@@ -37,9 +39,10 @@ def test_timeout_is_not_a_zero_reading(query):
 def test_mps_verification_requires_our_pid_on_our_device(query, monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-abcd1234")
     monkeypatch.setattr(mps, "_retain_primary_context", lambda: None)
-    for row in ("", "1 1 2 GPU-abcd", f"{os.getpid()} 1 2 GPU-other"):
+    pid = os.getpid()
+    for row in ("", f"{pid + 1} 1 2 GPU-abcd", f"{pid} 1 2 GPU-other"):
         query.return_value.stdout = row
         with pytest.raises(RuntimeError, match="did not register"):
             mps.verify_client()
-    query.return_value.stdout = f"{os.getpid()} 1 2 GPU-abcd"
+    query.return_value.stdout = f"{pid} 1 2 GPU-abcd"
     mps.verify_client()

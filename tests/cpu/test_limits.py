@@ -39,19 +39,6 @@ def mount_line(path, *, version=2, root="/"):
     return f"29 23 0:26 {root} {escaped} rw - {tail}\n"
 
 
-def test_v2_resolution_uses_mountinfo_instead_of_fixed_root(monkeypatch, tmp_path):
-    mount = tmp_path / "unified"
-    actual = memory_group(mount / "user.slice/expman-test.scope")
-    proc_layout(
-        monkeypatch,
-        tmp_path,
-        "0::/user.slice/expman-test.scope\n",
-        mount_line(mount),
-        pid=123,
-    )
-    assert limits.cgroup_for_pid(123) == actual
-
-
 def test_resolution_handles_mount_root_and_escaped_mountpoint(monkeypatch, tmp_path):
     mount = tmp_path / "memory mount"
     actual = memory_group(mount / "expman-test.scope")
@@ -60,8 +47,9 @@ def test_resolution_handles_mount_root_and_escaped_mountpoint(monkeypatch, tmp_p
         tmp_path,
         "0::/tenant/expman-test.scope\n",
         mount_line(mount, root="/tenant"),
+        pid=123,
     )
-    assert limits.own_cgroup() == actual
+    assert limits.cgroup_for_pid(123) == actual
 
 
 def test_hybrid_prefers_real_v1_memory_controller_and_rejects_shared_group(
@@ -107,7 +95,9 @@ def test_v1_dedicated_group_is_measured_and_limit_verified(monkeypatch, tmp_path
     monkeypatch.setenv("EXPMAN_HOST_LIMIT_KB", "16")
     monkeypatch.delenv("EXPMAN_CGROUP", raising=False)
     assert _worker._resource_cgroup() == group
+    (group / "memory.failcnt").write_text("2")
     snapshot = _worker._resource_snapshot(group)
+    assert limits.refused(snapshot["memory_events"])
     assert snapshot["host_current_kb"] == 4
     assert snapshot["host_peak_kb"] == 8
     assert snapshot["host_limit_kb"] == 16
@@ -253,12 +243,6 @@ def test_no_readable_accounting_is_reported_as_unavailable():
     assert snapshot["host_peak_kb"] is None
     assert snapshot["host_usage_source"] == "unavailable"
     assert snapshot["host_usage_error"]
-
-
-def test_v1_memory_failcnt_is_reported(tmp_path):
-    group = memory_group(tmp_path / "expman-test", version=1)
-    (group / "memory.failcnt").write_text("2")
-    assert limits.refused(limits.events(group))
 
 
 def test_direct_creation_does_not_remove_preexisting_group(tmp_path):

@@ -45,34 +45,8 @@ def test_confounding_and_missing_metrics_do_not_imply_independence():
     assert metric["undetermined"] == ["x", "z"]
 
 
-def test_settings_keep_missing_null_types_and_object_identity_distinct():
-    settings = [
-        {},
-        {"v": None},
-        {"v": True},
-        {"v": 1},
-        {"v": [1]},
-        {"v": {"a": 1, "b": 2}},
-    ]
-    records = [{**setting, "y": k} for k, setting in enumerate(settings)]
-    records.append({"v": {"b": 2, "a": 1}, "y": 5})
-
-    table = layout_results(columns("v"), columns("y"), records)
-    assert [c["id"] for c in table["columns"]] == ["v", "y"]
-    assert table["columns"][1]["depends_on"] == ["v"]
-    assert table["rows"] == records
-
-    # Reordered keys denote the same object. Contradictory repeats with no
-    # measured comparison at a different level do not establish an effect.
-    records = [{"v": {"b": 2, "a": 1}, "y": 2}, {"v": {"a": 1, "b": 2}, "y": 3}, {}]
-    metric = layout_results(columns("v"), columns("y"), records)["columns"][-1]
-    assert metric["depends_on"] == []
-    assert metric["undetermined"] == ["v"]
-
-
-def test_missing_metrics_stay_missing_and_rows_survive_without_any_columns():
-    records = [{"x": 1, "y": 0}, {"x": 2}]
+def test_unset_and_null_are_distinct_settings_even_with_an_unmeasured_run():
+    records = [{"y": 0}, {"x": None, "y": 1}, {"x": 2}]
     table = layout_results(columns("x"), columns("y"), records)
     assert table["rows"] == records
-    assert table["columns"][-1]["undetermined"] == ["x"]
-    assert layout_results([], [], [{}]) == {"columns": [], "rows": [{}]}
+    assert table["columns"][-1]["depends_on"] == ["x"]

@@ -37,6 +37,10 @@ def test_nonempty_cuda_snapshot_must_match_visible_device_count():
 def test_incomplete_snapshot_preserves_random_state(backend):
     manager = RandomStateManager(45)
     previous = manager.capture()
+    advanced = random.Random()
+    advanced.setstate(previous["python"])
+    advanced.random()
+    incomplete = {**previous, "python": advanced.getstate(), backend: None}
     with pytest.raises(StorageError, match="could not validate random state"):
-        manager.restore({**previous, backend: None})
+        manager.restore(incomplete)
     assert manager.capture() == previous

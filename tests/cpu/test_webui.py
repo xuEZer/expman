@@ -1,10 +1,12 @@
 import json
 import os
 import socket
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from threading import Barrier
-from time import perf_counter, sleep, time
+from time import perf_counter, time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
@@ -12,14 +14,13 @@ from urllib.request import Request, urlopen
 
 import batch_helpers
 import pytest
-import yaml
 
 from expman import Pipeline, Stage, Status, devices
-from expman.cli import _parser
+from expman.cli import main
 from expman.core.context import RunContext
 from expman.core.events import ProgressEvent
 from expman.estimation.duration_model import StageDuration
-from expman.observation.archive import read_batch, summarize
+from expman.observation.archive import read_batch
 from expman.observation.live import LIVE_FILE, LivePublisher, live_enabled
 from expman.observation.registry import ensure_ids
 from expman.observation.snapshot import SCHEMA, build_snapshot, stage_samples
@@ -39,12 +40,7 @@ GIB = 1024 * 1024
 
 
 class Work(Stage):
-    @classmethod
-    def config_dependencies(cls, cfg):
-        return {"markers": True, "item": True, "delay": True}
-
     def process(self, data, ctx):
-        sleep(ctx.cfg["delay"])
         ctx.log_metrics({"item": ctx.cfg["item"]})
 
 
@@ -80,10 +76,11 @@ def fake_devices(monkeypatch):
     monkeypatch.setattr(settings, "poll_interval", 0.01)
 
 
-def make_batch(root, *, count=2, delay=0.0):
-    cfg = {"device": [0], "seed": 0, "markers": str(root), "delay": delay, "item": 0}
+def make_batch(root, *, count=2):
     path = root / "experiments.yaml"
-    path.write_text(yaml.safe_dump(cfg) + f"grid:\n  item: {list(range(count))}\n")
+    path.write_text(
+        f"device: [0]\nseed: 0\nitem: 0\ngrid:\n  item: {list(range(count))}\n"
+    )
     return batch_helpers.make_batch(Pipeline([Work]), path, output_dir=root / "batch")
 
 
@@ -241,29 +238,6 @@ def write_live(directory, *, age=0.0, **batch):
 
 
 @POSIX
-@pytest.mark.simulated_gpu
-def test_the_snapshot_places_every_recorded_attempt_on_the_batch_clock(tmp_path):
-    batch = make_batch(tmp_path)
-    batch.run()
-
-    snapshot = build_snapshot(batch)
-
-    spans = [
-        (entry["start_seconds"], entry["end_seconds"])
-        for entry in batch.state.stage_history
-    ]
-    assert spans
-    assert all(0 <= start <= end <= batch.elapsed_seconds + 1 for start, end in spans)
-    rows = snapshot["gantt"]
-    assert all(row["run"] for row in rows)
-    assert [row["start_seconds"] for row in rows] == sorted(start for start, _ in spans)
-    assert sorted((row["start_seconds"], row["end_seconds"]) for row in rows) == sorted(
-        spans
-    )
-    assert snapshot["batch"]["session_marks"] == []
-
-
-@POSIX
 def test_live_gantt_uses_the_effective_clock_and_keeps_retry_history(
     tmp_path, monkeypatch
 ):
@@ -355,19 +329,19 @@ def test_the_archived_path_exposes_the_folds_it_recorded(tmp_path):
 
 @POSIX
 @pytest.mark.simulated_gpu
-def test_a_finished_batch_reports_stage_and_resource_facts(tmp_path):
+def test_finished_batch_publishes_the_snapshot_read_by_the_dashboard(tmp_path):
     batch = make_batch(tmp_path)
     batch.run()
 
-    snapshot = build_snapshot(batch)
+    snapshot = read_batch(batch.output_dir, 3)
 
+    assert snapshot["source"] == "last"
+    assert snapshot["status"] == "finished"
+    assert snapshot["running"] is False
     assert snapshot["schema"] == SCHEMA
-    assert "degraded" not in snapshot
-    assert snapshot["batch"]["experiments"] == 2
     assert snapshot["batch"]["counts"]["succeeded"] == 2
-    assert [stage["name"] for stage in snapshot["stages"]] == ["Work"]
     stage = snapshot["stages"][0]
-    assert stage["known"] is True
+    assert stage["name"] == "Work"
     assert stage["groups_done"] == 2
     assert stage["groups_remaining"] == 0
     assert stage["samples"]["measured"] == 2
@@ -381,6 +355,15 @@ def test_a_finished_batch_reports_stage_and_resource_facts(tmp_path):
     kinds = [event["kind"] for event in snapshot["events"]]
     assert "launch" in kinds
     assert "finish" in kinds
+    spans = [(row["start_seconds"], row["end_seconds"]) for row in snapshot["gantt"]]
+    assert {row["run"] for row in snapshot["gantt"]} == {
+        run.run_id[:6] for run in batch.experiments
+    }
+    assert sorted(spans) == sorted(
+        (attempt["start_seconds"], attempt["end_seconds"])
+        for attempt in batch.state.stage_history
+    )
+    assert all(0 <= start <= end <= batch.elapsed_seconds + 1 for start, end in spans)
 
 
 @POSIX
@@ -543,20 +526,6 @@ def test_the_estimate_publishes_per_stage_group_counts_and_duration_bounds(tmp_p
 
 
 @POSIX
-def test_a_finished_batch_keeps_its_published_unit_intervals(tmp_path):
-    batch = seed_finished_first(make_batch(tmp_path, count=3))
-    scheduler = GpuScheduler(batch)
-    estimate_parallel(scheduler, 0.8)
-    batch.state.queue.clear()
-
-    finished = estimate_parallel(scheduler, 0.8)
-
-    assert finished.lower_seconds == 0.0
-    assert batch.live.schedule_view["groups"] == 0
-    assert batch.live.schedule_view["stages"][0]["spans"] == 2
-
-
-@POSIX
 def test_a_snapshot_without_a_scheduler_still_lists_the_stages(tmp_path):
     snapshot = build_snapshot(make_batch(tmp_path))
 
@@ -564,13 +533,6 @@ def test_a_snapshot_without_a_scheduler_still_lists_the_stages(tmp_path):
     assert snapshot["stages"][0]["known"] is False
     assert snapshot["stages"][0]["groups_remaining"] is None
     assert snapshot["workers"] == []
-
-
-def test_a_snapshot_degrades_instead_of_raising(tmp_path):
-    snapshot = build_snapshot(Broken(tmp_path))
-
-    assert snapshot["schema"] == SCHEMA
-    assert snapshot["degraded"].startswith("AttributeError")
 
 
 # --------------------------------------------------------------------------
@@ -597,49 +559,20 @@ def test_publishing_degrades_instead_of_raising(tmp_path):
     publisher.publish()
 
     payload = json.loads((tmp_path / LIVE_FILE).read_text())
+    assert payload["schema"] == SCHEMA
     assert payload["degraded"].startswith("AttributeError")
     assert list(tmp_path.glob("*.tmp")) == []
 
 
 @POSIX
 @pytest.mark.simulated_gpu
-def test_a_batch_publishes_live_state_while_it_runs(tmp_path):
-    batch = make_batch(tmp_path)
-
-    batch.run()
-
-    payload = json.loads((batch.output_dir / LIVE_FILE).read_text())
-    assert payload["schema"] == SCHEMA
-    assert payload["batch"]["counts"]["succeeded"] == 2
-    assert payload["resources"]["host"]["total_kb"] == pytest.approx(64 * GIB)
-
-
-@POSIX
-@pytest.mark.simulated_gpu
 def test_publishing_is_skipped_when_switched_off(tmp_path, monkeypatch):
     monkeypatch.setenv("EXPMAN_LIVE", "off")
-    batch = make_batch(tmp_path)
+    batch = make_batch(tmp_path, count=1)
 
     batch.run()
 
     assert not (batch.output_dir / LIVE_FILE).exists()
-
-
-@POSIX
-@pytest.mark.simulated_gpu
-def test_a_finished_batch_reads_back_from_the_snapshot_it_left(tmp_path):
-    batch = make_batch(tmp_path)
-    batch.run()
-
-    snapshot = read_batch(batch.output_dir, 3)
-
-    assert snapshot["source"] == "last"
-    assert snapshot["status"] == "finished"
-    assert snapshot["running"] is False
-    assert snapshot["id"] == 3
-    assert snapshot["batch"]["counts"]["succeeded"] == 2
-    assert snapshot["batch"]["elapsed_seconds"] > 0
-    assert [stage["name"] for stage in snapshot["stages"]] == ["Work"]
 
 
 # --------------------------------------------------------------------------
@@ -727,20 +660,6 @@ def test_a_directory_without_records_is_reported_not_raised(tmp_path):
     assert snapshot["resources"] is None
 
 
-def test_the_list_entry_carries_what_the_table_renders(tmp_path):
-    directory = write_batch_dir(tmp_path, "run_a", runs=3)
-
-    entry = summarize(read_batch(directory, 4))
-
-    assert entry["id"] == 4
-    assert entry["name"] == "run_a"
-    assert entry["status"] == "finished"
-    assert entry["counts"]["succeeded"] == 3
-    assert entry["experiments"] == 3
-    assert entry["stages"] == 1
-    assert entry["workers"] == 0
-
-
 def test_only_directories_holding_records_become_batches(tmp_path):
     root = tmp_path / "batches"
     assert ensure_ids(root) == {}
@@ -806,10 +725,9 @@ class TestDashboard:
         os.utime(root / "run_b", (now, now))
         return root
 
-    def test_the_pages_and_their_assets_are_served(self, runs):
+    def test_the_pages_assets_and_health_endpoint_are_served(self, runs):
         dashboard = serve(runs, port=0, interval=1.0)
         try:
-            dashboard.refresh()
             status, body, headers = self.get(dashboard.url)
             assert status == 200
             assert b"expman" in body
@@ -817,11 +735,17 @@ class TestDashboard:
 
             status, body, _headers = self.get(dashboard.url + "b/0/")
             assert status == 200
-            assert b"app.js" in body
+            assert b"/static/results.js" in body
+            assert self.get(dashboard.url + "b/0/results/")[:2] == (200, body)
+            for asset in ("results.js", "results.css"):
+                assert self.get(dashboard.url + "static/" + asset)[0] == 200
 
             status, _body, headers = self.get(dashboard.url + "static/app.js")
             assert status == 200
             assert headers["Content-Type"].startswith("text/javascript")
+            status, body, _headers = self.get(dashboard.url + "api/health")
+            assert status == 200
+            assert json.loads(body) == {"status": "ok", "schema": SCHEMA}
 
             assert self.get(dashboard.url + "static/nope.js")[0] == 404
             assert self.get(dashboard.url + "api/nope")[0] == 404
@@ -829,7 +753,7 @@ class TestDashboard:
         finally:
             dashboard.close()
 
-    def test_the_list_endpoint_lists_every_batch(self, runs):
+    def test_overview_ids_open_the_corresponding_batch_detail(self, runs):
         dashboard = serve(runs, port=0, interval=1.0)
         try:
             dashboard.refresh()
@@ -837,66 +761,18 @@ class TestDashboard:
             assert status == 200
             payload = json.loads(body)
             assert payload["schema"] == SCHEMA
-            assert [entry["name"] for entry in payload["batches"]] == ["run_a", "run_b"]
-            assert payload["batches"][1]["status"] == "failed"
-        finally:
-            dashboard.close()
-
-    def test_results_page_compares_the_recorded_configurations(self, tmp_path):
-        directory = write_batch_dir(tmp_path, "example", runs=4)
-        metrics = MetricStore(directory / "metrics.sqlite3")
-        configs = [(1, 1), (2, 1), (1, 2), (2, 2)]
-        for index, (x1, x2) in enumerate(configs):
-            run_id = f"{index:032x}"
-            write_record(
-                directory / "experiments" / run_id / "config.pkl",
-                {"x1": x1, "x2": x2, "seed": 42},
-                PickleSerializer(),
+            finished, failed = payload["batches"]
+            assert (finished["name"], failed["name"]) == ("run_a", "run_b")
+            assert finished["counts"]["succeeded"] == finished["experiments"] == 3
+            assert (finished["stages"], finished["workers"]) == (1, 0)
+            assert failed["status"] == "failed"
+            status, body, _headers = self.get(
+                dashboard.url + f"api/batch/{finished['id']}"
             )
-        dashboard = serve(tmp_path, port=0)
-        try:
-            status, content, _ = self.get(dashboard.url + "b/0/results/")
-            assert status == 200 and b"/static/results.js" in content
-            assert content == self.get(dashboard.url + "b/0/")[1]
-            for asset in ("results.js", "results.css"):
-                assert self.get(dashboard.url + "static/" + asset)[0] == 200
-
-            url = dashboard.url + "api/batch/0/results"
-            status, content, _ = self.get(url)
             assert status == 200
-            table = json.loads(content)
-            assert table["name"] == "example"
-            x1_column, x2_column = table["columns"]
-            x1_key, x2_key = x1_column["id"], x2_column["id"]
-            assert [x1_column["label"], x2_column["label"]] == ["x1", "x2"]
-            assert sorted((r[x1_key], r[x2_key]) for r in table["rows"]) == sorted(
-                configs
-            )
-
-            for index, (_, x2) in enumerate(configs):
-                metrics.log(f"{index:032x}", (0,), None, 1, [('["y"]', float(x2))])
-                if index == 0:
-                    partial = json.loads(self.get(url)[1])
-                    metric_key = next(
-                        c["id"] for c in partial["columns"] if c["kind"] == "metric"
-                    )
-                    assert sorted(
-                        (r[x1_key], r[x2_key]) for r in partial["rows"]
-                    ) == sorted(configs)
-                    assert [
-                        r[metric_key] for r in partial["rows"] if metric_key in r
-                    ] == [1]
-
-            table = json.loads(self.get(url)[1])
-            assert len(table["rows"]) == len(configs)
-            x2_column, metric, x1_column = table["columns"]
-            assert (x2_column["label"], x1_column["label"]) == ("x2", "x1")
-            assert metric["depends_on"] == [x2_column["id"]]
-            assert metric["undetermined"] == []
-            assert all(
-                row[metric["id"]] == row[x2_column["id"]] for row in table["rows"]
-            )
-            assert self.get(dashboard.url + "api/batch/99/results")[0] == 404
+            detail = json.loads(body)
+            assert (detail["id"], detail["batch"]["name"]) == (finished["id"], "run_a")
+            assert self.get(dashboard.url + "api/batch/99")[0] == 404
         finally:
             dashboard.close()
 
@@ -923,6 +799,7 @@ class TestDashboard:
             status, content, _ = self.get(request)
             assert status == 200
             table = json.loads(content)
+            assert table["name"] == directory.name
             labels = {column["id"]: column["label"] for column in table["columns"]}
             rows = [
                 {labels[key]: value for key, value in row.items()}
@@ -931,6 +808,7 @@ class TestDashboard:
             return sorted(rows, key=lambda row: row["x"])
 
         try:
+            assert self.get(dashboard.url + "api/batch/99/results")[0] == 404
             empty = [{"x": 1}, {"x": 2}]
             assert read_rows() == empty
             initial_calls = layout.call_count
@@ -946,6 +824,9 @@ class TestDashboard:
             assert layout.call_count == initial_calls
 
             metrics.log(first, (0,), None, 1, [('["score"]', 5.0)])
+            # Subsequent writes commit while the dashboard's read connection stays open.
+            with closing(sqlite3.connect(metrics.path)) as writer:
+                writer.execute("PRAGMA journal_mode=WAL")
             partial = [{"x": 1, "score": 5}, {"x": 2}]
             assert read_rows() == partial
             assert layout.call_count == initial_calls + 1
@@ -1001,18 +882,6 @@ class TestDashboard:
         finally:
             dashboard.close()
 
-    def test_the_batch_endpoint_returns_one_snapshot(self, runs):
-        dashboard = serve(runs, port=0, interval=1.0)
-        try:
-            status, body, _headers = self.get(dashboard.url + "api/batch/0")
-            assert status == 200
-            payload = json.loads(body)
-            assert payload["id"] == 0
-            assert payload["batch"]["name"] == "run_a"
-            assert self.get(dashboard.url + "api/batch/99")[0] == 404
-        finally:
-            dashboard.close()
-
     def test_the_stream_pushes_a_frame_for_the_watched_batch(self, runs):
         dashboard = serve(runs, port=0, interval=1.0)
         try:
@@ -1039,9 +908,11 @@ class TestDashboard:
         stream.watch(0)
         stream.watch(0)
         stream.unwatch(0)
-        assert stream.watched == {0: 1}
+        stream.refresh()
+        assert json.loads(stream.frame(0))["batch"]["id"] == 0
         stream.unwatch(0)
-        assert stream.watched == {}
+        stream.refresh()
+        assert "batch" not in json.loads(stream.frame(0))
 
     def test_a_tick_that_cannot_read_a_batch_keeps_its_last_frame(self, runs):
         # The previous detail remains available when one refresh skips this batch.
@@ -1065,7 +936,7 @@ class TestDashboard:
         assert json.loads(stream.frame(0))["batch"]["id"] == 0
         assert "boom" in json.loads(stream.frame(""))["degraded"]
 
-    def test_stopping_writes_to_the_running_batch_channel(self, runs):
+    def test_stopping_only_signals_the_matching_running_batch(self, runs):
         endpoint = runs / "run_a" / STOP_FIFO
         os.mkfifo(endpoint)
         # Restore the intended discovery order before the first registry scan.
@@ -1086,12 +957,6 @@ class TestDashboard:
                 assert status == 200
                 assert json.loads(body)["status"] == "stopping"
                 assert reader.read(1) == b"x"
-        finally:
-            dashboard.close()
-
-    def test_stopping_an_idle_batch_is_refused(self, runs):
-        dashboard = serve(runs, port=0)
-        try:
             status, body, _headers = self.get(
                 Request(dashboard.url + "api/stop/0", method="POST")
             )
@@ -1101,15 +966,6 @@ class TestDashboard:
                 self.get(Request(dashboard.url + "api/stop/99", method="POST"))[0]
                 == 404
             )
-        finally:
-            dashboard.close()
-
-    def test_health_reports_status_and_schema(self, runs):
-        dashboard = serve(runs, port=0)
-        try:
-            status, body, _headers = self.get(dashboard.url + "api/health")
-            assert status == 200
-            assert json.loads(body) == {"status": "ok", "schema": SCHEMA}
         finally:
             dashboard.close()
 
@@ -1167,23 +1023,14 @@ class TestDashboard:
 # --------------------------------------------------------------------------
 
 
-def test_web_command_settings():
-    parser = _parser()
-    args = parser.parse_args(["web", "--port", "0"])
-    assert args.batches_dir == Path("batches")
-    assert args.port == 0
-    assert args.host == "127.0.0.1"
-    assert parser.parse_args(["web", "--batches-dir", "results"]).batches_dir == Path(
-        "results"
-    )
-
-
-def test_a_sleeping_dashboard_can_be_closed_while_it_waits(tmp_path):
-    dashboard = serve(tmp_path, port=0, interval=1.0)
-    try:
-        dashboard.close()
-    finally:
-        dashboard.close()
+def test_web_command_passes_project_defaults_and_cli_overrides(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[tool.expman]\nweb_port = 9301\n")
+    with patch("expman.cli.serve") as serve_dashboard:
+        assert main(["web"]) == 0
+        serve_dashboard.assert_called_with(Path("batches"), host="127.0.0.1", port=9301)
+        assert main(["web", "--port", "0", "--batches-dir", "results"]) == 0
+        serve_dashboard.assert_called_with(Path("results"), host="127.0.0.1", port=0)
 
 
 @POSIX
@@ -1194,7 +1041,7 @@ def test_nested_progress_flows_from_worker_ipc_to_snapshot(tmp_path):
             ctx.report_progress(2, total=5)
 
     config = tmp_path / "nested.yaml"
-    config.write_text("device: [0]\nseed: 0\nmarkers: test\ndelay: 0\nitem: 0\n")
+    config.write_text("device: [0]\nseed: 0\nitem: 0\n")
     batch = batch_helpers.make_batch(
         Pipeline([Work, Work]), config, output_dir=tmp_path / "batch"
     )

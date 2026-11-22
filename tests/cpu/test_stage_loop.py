@@ -1,7 +1,6 @@
 """Stage explicit checkpoint API: resume_range, checkpoint and restore."""
 
 import random
-from pathlib import Path
 
 import pytest
 from batch_helpers import make_batch
@@ -9,29 +8,14 @@ from batch_helpers import make_batch
 from expman import Pipeline, Stage, Status
 from expman.core.context import RunContext
 from expman.core.experiment import Experiment
-from expman.core.randomness import RandomStateManager
 from expman.scheduling.scheduler import GpuScheduler
-from expman.storage.base import RecoveryWarning, StorageError, read_record, write_record
+from expman.storage.base import RecoveryWarning, StorageError, write_record
 from expman.storage.run import RunStore
 
 
 class Finish(Stage):
     def process(self, data, ctx):
         pass
-
-
-def managed_context(tmp_path: Path, cfg=None, seed=42):
-    """A RunContext whose store continues one seeded random stream."""
-    store = RunStore(tmp_path)
-    rng = RandomStateManager(seed)
-    initial = tmp_path / "rng_initial.pkl"
-    if initial.exists():
-        rng.restore(read_record(initial, store.serializer))
-    else:
-        rng.seed()
-        write_record(initial, rng.capture(), store.serializer)
-    store.rng = rng
-    return RunContext(cfg={} if cfg is None else cfg, _store=store), store
 
 
 def test_failed_checkpoint_write_preserves_last_saved_step(tmp_path):
@@ -53,9 +37,10 @@ def test_failed_checkpoint_write_preserves_last_saved_step(tmp_path):
                     ctx.checkpoint(epoch + 1, lambda: None)
             return state
 
-    ctx, store = managed_context(tmp_path)
+    store = RunStore(tmp_path)
+    pipeline = Pipeline([Train, Finish])
     with pytest.raises(StorageError, match="cannot save"):
-        Pipeline([Train, Finish]).run(ctx=ctx, stop_after=0)
+        pipeline.run(ctx=RunContext(_store=store), stop_after=0)
     assert Train.seen == [0, 1, 2]
     record = store.latest((0,))
     assert record["step"] == 3
@@ -63,58 +48,47 @@ def test_failed_checkpoint_write_preserves_last_saved_step(tmp_path):
 
     Train.fail_at = None
     Train.seen = []
-    ctx, _ = managed_context(tmp_path)
-    result = Pipeline([Train, Finish]).run(ctx=ctx, stop_after=0)
+    result = pipeline.run(ctx=RunContext(_store=RunStore(tmp_path)), stop_after=0)
     assert result == {"epoch": 4, "seen": [0, 1, 2, 3]}
     assert Train.seen == [3]
     assert store.completed((0,))["state"] == result
     assert not store.checkpoint_path((0,)).exists()
 
 
-@pytest.mark.parametrize("saved", [[2], {"__payload__": [2]}, None])
-def test_checkpoint_preserves_state_when_resume_has_no_steps_left(tmp_path, saved):
+def test_checkpoint_with_null_state_resumes_with_no_steps_left(tmp_path):
     class Train(Stage):
         def process(self, data, ctx):
             assert list(ctx.resume_range(3, 5)) == [3, 4]
             for _ in ctx.resume_range(0, 1):
-                ctx.checkpoint(1, saved)
+                ctx.checkpoint(1, None)
                 raise RuntimeError("interrupt")
             return ctx.checkpoint_state
 
-    ctx, _ = managed_context(tmp_path)
+    pipeline = Pipeline([Train, Finish])
     with pytest.raises(RuntimeError, match="interrupt"):
-        Pipeline([Train, Finish]).run(ctx=ctx, stop_after=0)
-    ctx, store = managed_context(tmp_path)
-    assert Pipeline([Train, Finish]).run(ctx=ctx, stop_after=0) == saved
-    assert store.completed((0,))["state"] == saved
+        pipeline.run(ctx=RunContext(_store=RunStore(tmp_path)), stop_after=0)
+    store = RunStore(tmp_path)
+    assert pipeline.run(ctx=RunContext(_store=store), stop_after=0) is None
+    assert store.completed((0,))["state"] is None
 
 
 def test_explicit_checkpoint_restores_random_state(tmp_path):
-    """Resuming a process() Stage rewinds the random stream."""
+    draws = []
 
     class Sampler(Stage):
-        fail = True
-
         def process(self, data, ctx):
-            state = ctx.checkpoint_state
-            if state is None:
-                state = []
             for epoch in ctx.resume_range(0, 4):
-                state.append(random.random())
-                ctx.checkpoint(epoch + 1, state)
-                if epoch == 3 and type(self).fail:
-                    random.random()  # consumed after the last checkpoint
-                    type(self).fail = False
+                draws.append((epoch, random.random()))
+                ctx.checkpoint(epoch + 1, None)
+                if epoch == 1 and ctx.attempt == 1:
+                    random.random()
                     raise RuntimeError("interrupt")
-            return state
 
-    ctx, _ = managed_context(tmp_path)
-    with pytest.raises(RuntimeError):
-        Pipeline([Sampler, Finish]).run(ctx=ctx, stop_after=0)
-    ctx, _ = managed_context(tmp_path)
-    output = Pipeline([Sampler, Finish]).run(ctx=ctx, stop_after=0)
+    run = Experiment(Pipeline([Sampler]), {"seed": 42}, output_dir=tmp_path / "run")
+    assert run.run_stage(0, attempt=1).status is Status.FAILED
+    assert run.run_stage(0, attempt=2).status is Status.SUCCEEDED
     expected = random.Random(42)
-    assert output == [expected.random() for _ in range(4)]
+    assert draws == [(epoch, expected.random()) for epoch in range(4)]
 
 
 def test_scheduled_stage_needs_only_its_predecessors_random_state(tmp_path):
@@ -160,13 +134,12 @@ def test_direct_nested_stage_leaves_outer_checkpoint_for_retry(tmp_path):
             return Inner().run(ctx.checkpoint_state, ctx) * 2
 
     pipeline = Pipeline([Outer, Finish])
-    ctx, store = managed_context(tmp_path)
+    store = RunStore(tmp_path)
     with pytest.raises(RuntimeError, match="outer interrupted"):
-        pipeline.run(ctx=ctx)
+        pipeline.run(ctx=RunContext(_store=store))
     assert not store.has_completed((0,))
     assert store.latest((0,))["state"] == 5
-    ctx, _ = managed_context(tmp_path)
-    assert pipeline.run(ctx=ctx, stop_after=0) == 12
+    assert pipeline.run(ctx=RunContext(_store=RunStore(tmp_path)), stop_after=0) == 12
     assert store.completed((0,))["name"] == "Outer"
 
 

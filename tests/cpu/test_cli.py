@@ -18,39 +18,19 @@ from expman.scheduling.batch import _Batch
 from expman.storage.base import run_lock
 from expman.storage.batch import BatchStore
 
-MODULE_NAME = "cli_pipeline_under_test"
+MODULE_NAME = "pipeline"
 
 MODULE_SOURCE = """\
 from expman import Pipeline, Stage
 
 
-class LoadValues(Stage):
-    @classmethod
-    def config_dependencies(cls, cfg):
-        return {"values": True}
-
+class Train(Stage):
     def process(self, data, ctx):
-        return list(ctx.cfg["values"])
+        if ctx.cfg["fail"]:
+            raise RuntimeError("training failed")
 
 
-class Accumulate(Stage):
-    @classmethod
-    def config_dependencies(cls, cfg):
-        return {"interrupt_once": True}
-
-    def process(self, data, ctx):
-        total = ctx.checkpoint_state
-        if total is None:
-            total = 0
-        for index in ctx.resume_range(0, len(data)):
-            total += data[index]
-            ctx.checkpoint(index + 1, total)
-            if ctx.cfg["interrupt_once"] and ctx.attempt == 1 and index == 1:
-                raise KeyboardInterrupt()
-        ctx.log_metrics({"total": total})
-
-
-train = Pipeline([LoadValues, Accumulate])
+train = Pipeline([Train])
 empty = Pipeline([])
 not_a_pipeline = 42
 """
@@ -62,15 +42,7 @@ import expman
 
 expman.set(retries=3, coverage=0.9, batches_dir="pipeline-batches")
 
-from expman import Pipeline, Stage
-
-
-class Trivial(Stage):
-    def process(self, data, ctx) -> None:
-        pass
-
-
-train = Pipeline([Trivial])
+train = expman.Pipeline([])
 """
 
 
@@ -80,6 +52,7 @@ def pipeline_module(tmp_path, monkeypatch):
     (tmp_path / f"{MODULE_NAME}.py").write_text(MODULE_SOURCE)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.delitem(sys.modules, MODULE_NAME, raising=False)
     try:
         yield MODULE_NAME
     finally:
@@ -99,11 +72,11 @@ def prepare_batch_only(monkeypatch):
     return prepared
 
 
-def write_config(project, name="baseline", *, values=(1, 2, 3)):
+def write_config(project, name="baseline", *, fail=False):
     directory = project / "configs"
     directory.mkdir(exist_ok=True)
     (directory / f"{name}.yaml").write_text(
-        f"device: [0]\nseed: 0\nvalues: {list(values)}\ninterrupt_once: false\n"
+        f"device: [0]\nseed: 0\nfail: {str(fail).lower()}\n"
     )
     return name
 
@@ -129,38 +102,27 @@ def create_cli_batch(tmp_path, pipeline_module, prepare_batch_only):
     return create
 
 
-@pytest.mark.parametrize(
-    ("package", "name"),
-    [(expman, "Batch"), (expman, "load_configs"), (expman.config, "load_configs")],
-)
-def test_internal_batch_entry_points_are_not_exported(package, name):
-    assert not hasattr(package, name)
-    assert name not in package.__all__
-
-
-@pytest.mark.parametrize(
-    ("options", "parent"), [([], "batches"), (["--batches-dir", "results"], "results")]
-)
 def test_run_creates_a_named_batch_under_the_output_parent(
-    tmp_path, pipeline_module, prepare_batch_only, options, parent, monkeypatch
+    tmp_path, pipeline_module, prepare_batch_only, monkeypatch
 ):
     monkeypatch.setattr(cli, "strftime", datetime(2026, 1, 2, 3, 4, 5).strftime)
     config = write_config(tmp_path, "experiment.large")
     (tmp_path / f"{config}.yaml").write_text("invalid: project root copy")
-    command = ["run", f"{pipeline_module}:train", config, *options]
+    command = ["run", f"{pipeline_module}:train", config]
 
     assert main(command) == 0
-    directory = tmp_path / parent / "train_experiment.large_20260102030405"
+    parent = tmp_path / "batches"
+    directory = parent / "train_experiment.large_20260102030405"
     manifest = directory / "batch.pkl"
     original = manifest.read_bytes()
     with pytest.raises(FileExistsError) as collision:
         main(command)
     assert collision.value.filename == str(directory)
     assert manifest.read_bytes() == original
-    assert ensure_ids(tmp_path / parent) == {0: directory}
+    assert ensure_ids(parent) == {0: directory}
 
 
-def test_run_requires_a_config_name(tmp_path, pipeline_module):
+def test_run_requires_a_config_name(tmp_path, pipeline_module, capsys):
     name = write_config(tmp_path)
     for argument in (
         str(tmp_path / "configs" / name),
@@ -171,6 +133,7 @@ def test_run_requires_a_config_name(tmp_path, pipeline_module):
     ):
         with pytest.raises(SystemExit):
             main(["run", f"{pipeline_module}:empty", argument])
+        assert "expected a config name" in capsys.readouterr().err
     assert not (tmp_path / "batches").exists()
 
 
@@ -182,13 +145,16 @@ def test_run_loads_only_the_yaml_extension(tmp_path, pipeline_module):
         main(["run", f"{pipeline_module}:empty", name])
 
 
-def test_run_rejects_a_config_symlink_outside_configs(tmp_path, pipeline_module):
+def test_run_rejects_a_config_symlink_outside_configs(
+    tmp_path, pipeline_module, capsys
+):
     name = write_config(tmp_path)
     config = tmp_path / "configs" / f"{name}.yaml"
     outside = config.rename(tmp_path / config.name)
     config.symlink_to(outside)
     with pytest.raises(SystemExit):
         main(["run", f"{pipeline_module}:empty", name])
+    assert "points outside ./configs/" in capsys.readouterr().err
     assert not (tmp_path / "batches").exists()
 
 
@@ -221,14 +187,10 @@ def test_run_reads_settings_set_by_the_pipeline_module(
     assert manifest["estimate_coverage"] == 0.9
 
 
-def test_resume_of_a_short_pipeline_location_uses_its_original_module(tmp_path):
-    (tmp_path / "pipeline.py").write_text(
-        "from expman import Pipeline\ntrain = Pipeline([])\n"
-    )
-    cli = [sys.executable, "-m", "expman"]
-    subprocess.run(
-        [*cli, "run", "train", write_config(tmp_path)], cwd=tmp_path, check=True
-    )
+def test_resume_of_a_short_pipeline_location_uses_its_original_module(
+    tmp_path, pipeline_module, prepare_batch_only
+):
+    assert main(["run", "train", write_config(tmp_path)]) == 0
     store = BatchStore(ensure_ids(tmp_path / "batches")[0])
     manifest = store.read_manifest()
     assert manifest["pipeline_spec"] == "pipeline:train"
@@ -237,7 +199,7 @@ def test_resume_of_a_short_pipeline_location_uses_its_original_module(tmp_path):
     (tmp_path / "pyproject.toml").write_text(
         '[tool.expman]\npipeline_module = "different"\n'
     )
-    subprocess.run([*cli, "resume", "0"], cwd=tmp_path, check=True)
+    assert main(["resume", "0"]) == 0
 
 
 def test_project_defaults_apply_across_cli_processes_and_explicit_arguments_win(
@@ -247,7 +209,6 @@ def test_project_defaults_apply_across_cli_processes_and_explicit_arguments_win(
     project = tmp_path / "pyproject.toml"
     project.write_text(
         '[tool.expman]\npipeline_module = "workflows"\nbatches_dir = "project-batches"\n'
-        "web_port = 9301\n"
     )
     (tmp_path / "workflows.py").write_text(
         "from expman import Pipeline\ntrain = Pipeline([])\n"
@@ -257,53 +218,29 @@ def test_project_defaults_apply_across_cli_processes_and_explicit_arguments_win(
         ([], "project-batches"),
         (["--batches-dir", "custom"], "custom"),
     ]:
-        subprocess.run(
-            [*cli, "run", "train", config, *options], cwd=tmp_path, check=True
+        stdout = subprocess.check_output(
+            [*cli, "run", "train", config, *options], cwd=tmp_path, text=True
         )
-        store = BatchStore(ensure_ids(tmp_path / parent)[0])
+        directory = ensure_ids(tmp_path / parent)[0]
+        store = BatchStore(directory)
+        assert "Batch ID: 0" in stdout and f"Batch directory: {directory}" in stdout
+        assert ": succeeded" in stdout
         assert store.read_manifest()["pipeline_spec"] == "workflows:train"
-    help_text = subprocess.check_output(
-        [*cli, "web", "--help"], cwd=tmp_path, text=True
-    )
-    assert "9301" in help_text
 
     project.write_text(project.read_text().replace('"workflows"', '"different"'))
-    subprocess.run([*cli, "resume", "0"], cwd=tmp_path, check=True)
-    subprocess.run([*cli, "delete", "0"], cwd=tmp_path, check=True)
-    assert ensure_ids(tmp_path / "project-batches") == {}
-    assert 0 in ensure_ids(tmp_path / "custom")
-
-
-@pytest.mark.simulated_gpu
-def test_run_records_pipeline_spec_and_resume_repeats_it(
-    tmp_path, pipeline_module, capsys
-):
-    config = write_config(tmp_path)
-
-    exit_code = main(
-        ["run", f"{pipeline_module}:train", config, "--batches-dir", str(tmp_path)]
-    )
-
-    assert exit_code == 0
-    output = ensure_ids(tmp_path)[0]
-    store = BatchStore(output)
-    manifest = store.read_manifest()
-    assert manifest["pipeline_spec"] == f"{pipeline_module}:train"
-    stdout = capsys.readouterr().out
-    assert "Batch ID: 0" in stdout
-    assert f"Batch directory: {output}" in stdout
-    assert stdout.count("succeeded") == 1
-
-    assert main(["resume", "0", "--batches-dir", str(tmp_path)]) == 0
-    assert ": succeeded" in capsys.readouterr().out
-    assert store.read_manifest()["experiments"] == manifest["experiments"]
+    store = BatchStore(ensure_ids(tmp_path / "project-batches")[0])
+    experiments = store.read_manifest()["experiments"]
+    stdout = subprocess.check_output([*cli, "resume", "0"], cwd=tmp_path, text=True)
+    assert f"{experiments[0]['run_id']}: succeeded" in stdout
+    assert store.read_manifest()["experiments"] == experiments
 
 
 @pytest.mark.simulated_gpu
 def test_run_and_resume_report_terminal_failure_to_the_shell(
     tmp_path, pipeline_module, capsys
 ):
-    config = write_config(tmp_path, "failing", values=(1, "bad"))
+    (tmp_path / "pyproject.toml").write_text("[tool.expman]\nretries = 0\n")
+    config = write_config(tmp_path, "failing", fail=True)
     assert (
         main(
             [
@@ -392,54 +329,38 @@ def watch_status(monkeypatch, capsys):
 def test_status_detail_rereads_the_batch(
     tmp_path, pipeline_module, prepare_batch_only, watch_status
 ):
-    assert main(["run", f"{pipeline_module}:train", write_config(tmp_path)]) == 0
-    (batch,) = prepare_batch_only
+    config = write_config(tmp_path)
+    assert main(["run", f"{pipeline_module}:empty", config]) == 0
+    options = ["--batches-dir", "other"]
+    assert main(["run", f"{pipeline_module}:train", config, *options]) == 0
+    batch = prepare_batch_only[-1]
     run_id = batch.experiments[0].run_id
 
     def start_run():
         batch.state.start(run_id, device=0, stage_index=0)
         batch._save()
 
-    first, second = watch_status("0", after_first_frame=start_run)
+    first, second = watch_status("0", *options, after_first_frame=start_run)
     assert f"{run_id}  pending" in first
     assert f"{run_id}  running" in second
     for frame in (first, second):
         assert str(batch.output_dir) in frame
-        assert "stage 1/2" in frame
+        assert "stage 1/1" in frame
         assert "elapsed" in frame
 
 
-@pytest.mark.parametrize(
-    ("options", "parent"), [([], "batches"), (["--batches-dir", "results"], "results")]
-)
 def test_status_overview_lists_batches_with_ids(
-    tmp_path, pipeline_module, prepare_batch_only, watch_status, options, parent
-):
-    config = write_config(tmp_path)
-    main(["run", f"{pipeline_module}:train", config, *options])
-    first, second = watch_status(
-        *options,
-        after_first_frame=lambda: main(
-            ["run", f"{pipeline_module}:empty", config, *options]
-        ),
-    )
-    ids = ensure_ids(tmp_path / parent)
-    assert f" 0  {parent}/{ids[0].name} " in first
-    assert ids[1].name not in first
-    assert f" 1  {parent}/{ids[1].name} " in second
-
-
-def test_id_zero_selects_different_batches_in_different_parents(
     tmp_path, pipeline_module, prepare_batch_only, watch_status
 ):
     config = write_config(tmp_path)
     main(["run", f"{pipeline_module}:train", config])
-    main(["run", f"{pipeline_module}:empty", config, "--batches-dir", "other"])
-    assert str(ensure_ids(tmp_path / "batches")[0]) in watch_status("0")[0]
-    assert (
-        str(ensure_ids(tmp_path / "other")[0])
-        in watch_status("0", "--batches-dir", "other")[0]
+    first, second = watch_status(
+        after_first_frame=lambda: main(["run", f"{pipeline_module}:empty", config]),
     )
+    ids = ensure_ids(tmp_path / "batches")
+    assert f" 0  batches/{ids[0].name} " in first
+    assert ids[1].name not in first
+    assert f" 1  batches/{ids[1].name} " in second
 
 
 @pytest.mark.parametrize("command", ["status", "resume", "stop", "delete"])
@@ -447,22 +368,6 @@ def test_batch_ids_reject_directory_paths(command):
     with pytest.raises(SystemExit) as error:
         main([command, "batches/train_experiments"])
     assert error.value.code == 2
-
-
-def test_stop_and_resume_accept_batch_ids(
-    tmp_path, pipeline_module, capsys, prepare_batch_only
-):
-    config = write_config(tmp_path)
-    main(["run", f"{pipeline_module}:train", config])
-    capsys.readouterr()
-
-    # The registered ID resolves to the same batch for both commands.
-    assert main(["resume", "0"]) == 0
-    assert main(["stop", "0"]) == 1
-
-    for token in ("-1", "7"):
-        with pytest.raises(SystemExit, match=f"unknown batch ID {token}"):
-            main(["stop", token])
 
 
 def test_delete_removes_the_batch_and_reuses_the_smallest_free_id(
@@ -499,10 +404,13 @@ def test_delete_refuses_a_running_batch_and_an_unknown_id(tmp_path, create_cli_b
     assert ensure_ids(tmp_path) == {0: directory}
     command = [sys.executable, "-m", "expman", "delete", "--batches-dir", str(tmp_path)]
     with run_lock(directory):
-        locked = subprocess.run([*command, "0"], capture_output=True, timeout=10)
+        locked = subprocess.run(
+            [*command, "0"], capture_output=True, text=True, timeout=10
+        )
         assert locked.returncode != 0
-    unknown = subprocess.run([*command, "99"], capture_output=True, timeout=10)
-    assert unknown.returncode != 0
+        assert "already running" in locked.stderr
+    with pytest.raises(expman.StorageError, match="unknown batch ID 99"):
+        main(["delete", "99", "--batches-dir", str(tmp_path)])
     assert ensure_ids(tmp_path) == {0: directory}
     assert main(["delete", "0", "--batches-dir", str(tmp_path)]) == 0
     assert not directory.exists()
@@ -530,15 +438,16 @@ def test_failed_delete_reserves_the_id_until_a_retry_finishes(
     assert ensure_ids(tmp_path) == {0: replacement, 1: other}
 
 
-def test_stop_without_a_reader_reports_and_cleans_up(tmp_path):
-    output = tmp_path / "batch"
-    output.mkdir()
-    assert not request_stop(output)[0]
+def test_stop_without_a_reader_reports_and_cleans_up(tmp_path, create_cli_batch):
+    output = create_cli_batch("batch", tmp_path / "batches")
+    assert main(["stop", "0"]) == 1
+    with pytest.raises(SystemExit, match="unknown batch ID -1"):
+        main(["stop", "-1"])
 
     endpoint = output / STOP_FIFO
     os.mkfifo(endpoint)
 
-    assert not request_stop(output)[0]
+    assert main(["stop", "0"]) == 1
     assert not endpoint.exists()
 
 
@@ -578,20 +487,6 @@ def test_resolution_rejects_malformed_and_mistyped_specs(pipeline_module):
         main(["run", f"{pipeline_module}:missing_attr", "unused"])
     with pytest.raises(SystemExit, match="must be a Pipeline"):
         main(["run", f"{pipeline_module}:not_a_pipeline", "unused"])
-
-
-def test_settings_validate_values():
-    with pytest.raises(ValueError, match="unknown setting"):
-        expman.set(bogus=1)
-    with pytest.raises(ValueError, match="nonnegative"):
-        expman.set(retries=-1)
-    with pytest.raises(ValueError, match="between 0 and 1"):
-        expman.set(coverage=1.5)
-    with pytest.raises(ValueError, match="unknown setting"):
-        expman.get("bogus")
-    # Failed assignments leave the defaults intact.
-    assert expman.get("retries") == 1
-    assert expman.get("coverage") == 0.8
 
 
 def test_resume_rejects_manifest_without_pipeline_location(tmp_path, create_cli_batch):

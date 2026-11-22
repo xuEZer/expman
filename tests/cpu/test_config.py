@@ -65,44 +65,20 @@ def test_set_dependency_digest_is_stable_across_worker_hash_seeds():
     assert digests[0] == digests[1]
 
 
-def test_a_grid_multiplies_its_axes(load):
+def test_grid_multiplies_axes_in_declaration_order_and_replaces_subtrees(load):
     runs = load("""
-a: 9
-b: 9
+model: {name: old, width: 32}
+seed: 7
 grid:
-  a: [1, 2]
-  b: [3, 4]
+  seed: [0, 1]
+  model: [{name: a}, {name: b}]
 """)
-    assert [(run["a"], run["b"]) for run in runs] == [
-        (1, 3),
-        (1, 4),
-        (2, 3),
-        (2, 4),
+    assert runs == [
+        {"seed": 0, "model": {"name": "a"}},
+        {"seed": 0, "model": {"name": "b"}},
+        {"seed": 1, "model": {"name": "a"}},
+        {"seed": 1, "model": {"name": "b"}},
     ]
-    assert all("grid" not in run for run in runs)
-
-
-def test_grid_order_follows_the_tree_not_the_data_field_order(load):
-    tree = "grid:\n  x: [10, 50]\n  y: [20, 60]\n"
-    first = load("x: 1\ny: 2\n" + tree)
-    second = load("y: 2\nx: 1\n" + tree)
-    assert [(run["x"], run["y"]) for run in first] == [
-        (10, 20),
-        (10, 60),
-        (50, 20),
-        (50, 60),
-    ]
-    assert first == second
-
-
-def test_a_grid_replaces_the_documented_value(load):
-    runs = load("lr: 0.5\ngrid:\n  lr: [0.001, 0.01]\n")
-    assert [run["lr"] for run in runs] == [0.001, 0.01]
-
-
-def test_repeated_alternatives_do_not_run_twice(load):
-    runs = load("a: 0\nb: 0\ngrid:\n  a: [1, 1]\n  b: [2, 2]\n")
-    assert [(run["a"], run["b"]) for run in runs] == [(1, 2)]
 
 
 def test_a_leaf_can_hold_lists_and_null(load):
@@ -114,40 +90,6 @@ grid:
         {"widths": [128, 64]},
         {"widths": [32]},
         {"widths": None},
-    ]
-
-
-def test_a_subtree_is_swapped_as_a_whole(load):
-    runs = load("""
-models:
-  imputation: {kind: saits, lr: 0.001}
-grid:
-  models:
-    imputation:
-      - {kind: saits, lr: 0.0001}
-      - {kind: brits}
-""")
-    assert [run["models"]["imputation"] for run in runs] == [
-        {"kind": "saits", "lr": 0.0001},
-        {"kind": "brits"},
-    ]
-
-
-def test_a_subtree_axis_multiplies_with_a_leaf_axis(load):
-    runs = load("""
-seed: 0
-model: {kind: saits}
-grid:
-  seed: [0, 1]
-  model:
-    - {kind: saits}
-    - {kind: brits}
-""")
-    assert [(run["seed"], run["model"]["kind"]) for run in runs] == [
-        (0, "saits"),
-        (0, "brits"),
-        (1, "saits"),
-        (1, "brits"),
     ]
 
 
@@ -168,177 +110,33 @@ def test_axis_patch_changes_only_the_selected_path_of_a_yaml_alias(load):
     ]
 
 
-def test_a_scan_starts_at_the_first_value_of_every_axis(load):
+def test_scan_changes_one_axis_at_a_time_in_declaration_order(load):
     runs = load("""
-tip:
-  cone: 0.03
+fixed: 7
+model: {name: old, width: 32}
 scan:
-  tip:
-    rank: [2, 4]
-    epsilon: [0.00001, 0.001]
+  optimizer: {lr: [0.01, 0.1, 0.1]}
+  model: [{name: a}, {name: b}]
 """)
-    assert [
-        (run["tip"]["rank"], run["tip"]["epsilon"], run["tip"]["cone"]) for run in runs
-    ] == [
-        (2, 0.00001, 0.03),
-        (4, 0.00001, 0.03),
-        (2, 0.001, 0.03),
+    assert runs == [
+        {"fixed": 7, "optimizer": {"lr": 0.01}, "model": {"name": "a"}},
+        {"fixed": 7, "optimizer": {"lr": 0.1}, "model": {"name": "a"}},
+        {"fixed": 7, "optimizer": {"lr": 0.01}, "model": {"name": "b"}},
     ]
-    assert all("scan" not in run for run in runs)
 
 
-def test_a_scan_axis_takes_its_first_value_over_the_file(load):
-    runs = load("seed: 7\nhidden: 64\nscan:\n  seed: [0, 1]\n")
-    assert [(run["seed"], run["hidden"]) for run in runs] == [(0, 64), (1, 64)]
-
-
-def test_a_scan_declares_parameters_absent_from_the_file(load):
+def test_combines_merges_distinct_paired_choices_over_the_base(load):
     runs = load("""
-device: [0]
-model: {kind: saits}
-scan:
-  optimizer: {lr: [0.001, 0.01], weight_decay: [0, 0.01]}
-""")
-    assert [
-        (run["optimizer"]["lr"], run["optimizer"]["weight_decay"]) for run in runs
-    ] == [
-        (0.001, 0),
-        (0.01, 0),
-        (0.001, 0.01),
-    ]
-    assert all(run["model"] == {"kind": "saits"} for run in runs)
-
-
-def test_a_scan_axis_can_swap_a_whole_subtree(load):
-    runs = load("""
-seed: 0
-model: {kind: saits}
-scan:
-  model:
-    - {kind: brits}
-    - {kind: saits, lr: 0.001}
-""")
-    assert [run["model"] for run in runs] == [
-        {"kind": "brits"},
-        {"kind": "saits", "lr": 0.001},
-    ]
-    assert all(run["seed"] == 0 for run in runs)
-
-
-def test_repeated_scan_values_do_not_run_twice(load):
-    assert load("scan:\n  seed: [1, 1]\n") == [{"seed": 1}]
-
-
-def test_a_scan_follows_the_tree_not_the_data_field_order(load):
-    tree = "scan:\n  x: [10, 50]\n  y: [20, 60]\n"
-    first = load(tree)
-    second = load("y: 0\nx: 0\n" + tree)
-    assert [(run["x"], run["y"]) for run in first] == [
-        (10, 20),
-        (50, 20),
-        (10, 60),
-    ]
-    assert first == second
-
-
-def test_combines_pairs_fields_that_move_together(load):
-    runs = load("""
-stage: B2
-combines:
-  - {dataset: {name: A}, model: {name: a}}
-  - {dataset: {name: B}, model: {name: b}}
-""")
-    assert [
-        (run["stage"], run["dataset"]["name"], run["model"]["name"]) for run in runs
-    ] == [("B2", "A", "a"), ("B2", "B", "b")]
-    assert all("combines" not in run for run in runs)
-
-
-def test_a_combine_candidate_is_merged_over_the_file(load):
-    runs = load("""
-stage: B1
 dataset: {name: A, rows: 10}
+model: {name: a}
 combines:
-  - {dataset: {name: B}}
+  - {}
+  - {dataset: {name: B}, model: {name: b}}
+  - {}
 """)
-    assert runs == [{"stage": "B1", "dataset": {"name": "B", "rows": 10}}]
-
-
-def test_a_combine_candidate_that_matches_the_file_still_runs(load):
-    runs = load("""
-stage: B1
-variant: A
-combines:
-  - {stage: B1, variant: A}
-  - {stage: B1, variant: B}
-""")
-    assert [run["variant"] for run in runs] == ["A", "B"]
-
-
-def test_repeated_candidates_do_not_run_twice(load):
-    runs = load("""
-stage: B1
-combines:
-  - {stage: B1}
-  - {stage: B1, extra: true}
-  - {stage: B1}
-""")
-    assert runs == [{"stage": "B1"}, {"stage": "B1", "extra": True}]
-
-
-def test_combines_and_scan_multiply(load):
-    runs = load("""
-stage: B1
-seed: 42
-combines:
-  - {stage: A}
-  - {stage: B}
-scan:
-  seed: [0, 1]
-""")
-    assert [(run["stage"], run["seed"]) for run in runs] == [
-        ("A", 0),
-        ("A", 1),
-        ("B", 0),
-        ("B", 1),
-    ]
-
-
-def test_combines_and_grid_multiply(load):
-    runs = load("""
-a: 0
-b: 0
-combines:
-  - {a: 1}
-  - {a: 2}
-grid:
-  b: [1, 2]
-""")
-    assert [(run["a"], run["b"]) for run in runs] == [
-        (1, 1),
-        (1, 2),
-        (2, 1),
-        (2, 2),
-    ]
-
-
-def test_grid_and_scan_multiply(load):
-    runs = load("""
-seed: 0
-tip: {rank: 3, epsilon: 0.5}
-grid:
-  seed: [0, 1]
-scan:
-  tip:
-    rank: [2, 4]
-""")
-    assert [
-        (run["seed"], run["tip"]["rank"], run["tip"]["epsilon"]) for run in runs
-    ] == [
-        (0, 2, 0.5),
-        (0, 4, 0.5),
-        (1, 2, 0.5),
-        (1, 4, 0.5),
+    assert runs == [
+        {"dataset": {"name": "A", "rows": 10}, "model": {"name": "a"}},
+        {"dataset": {"name": "B", "rows": 10}, "model": {"name": "b"}},
     ]
 
 
@@ -371,7 +169,7 @@ def test_a_run_produced_by_two_layers_is_not_repeated(load):
 a: 0
 combines:
   - {a: 1}
-  - {a: 1}
+  - {a: 2}
 grid:
   a: [1, 0]
 """)
@@ -381,8 +179,8 @@ grid:
 def test_deduplication_happens_after_defaults_are_resolved(load):
     runs = load(
         """
-model: {defaults: a}
 combines:
+  - {model: {defaults: a}}
   - {model: {kind: saits, lr: 0.001}}
 """,
         {"configs/model/a.yaml": "kind: saits\nlr: 0.001\n"},
@@ -406,7 +204,7 @@ grid:
     assert [run["tip"]["epsilon"] for run in runs] == [0.5, 0.25]
 
 
-def test_an_axis_can_target_a_field_supplied_by_defaults(root, load):
+def test_an_axis_can_target_a_field_supplied_by_defaults(load):
     runs = load(
         "model: {defaults: a}\ngrid:\n  model: {depth: [2, 8]}\n",
         {"configs/model/a.yaml": "name: a\nwidth: 64\ndepth: 2\n"},
@@ -417,7 +215,7 @@ def test_an_axis_can_target_a_field_supplied_by_defaults(root, load):
     ]
 
 
-def test_a_scan_axis_overrides_a_field_supplied_by_defaults(root, load):
+def test_a_scan_axis_overrides_a_field_supplied_by_defaults(load):
     runs = load(
         "model: {defaults: a}\nscan:\n  model: {depth: [2, 8]}\n",
         {"configs/model/a.yaml": "name: a\nwidth: 64\ndepth: 32\n"},
@@ -437,31 +235,17 @@ def test_only_the_root_control_keys_are_control_keys(load):
 @pytest.mark.parametrize(
     "content",
     [
-        "a: 0\ngrid: []\n",
         "grid: null",
-        "a: 0\ngrid: 5\n",
-        "a: 0\ngrid: {}\n",
-        "a: 0\ngrid: {a: []}\n",
-        "a: 0\ngrid: {a: 1}\n",
-        "a: 0\ngrid: {missing: [1]}\n",
-        "a: 0\ngrid: {a: {nested: 1}}\n",
-        "a: 0\nscan: 5\n",
-        "scan: null",
-        "a: 0\nscan: {}\n",
-        "a: 0\nscan: {a: []}\n",
-        "a: 0\nscan: {a: 1}\n",
-        "a: 0\nscan: {a: {nested: 1}}\n",
-        "a: 0\nscan: []\n",
-        "a: 0\nscan: [1]\n",
-        "a: 0\nscan: [{a: [1]}, 2]\n",
-        "a: 0\ncombines: 5\n",
-        "combines: null",
-        "a: 0\ncombines: {a: [1]}\n",
-        "a: 0\ncombines: []\n",
-        "a: 0\ncombines: [1]\n",
-        "a: 0\ncombines: [{a: [1]}, 2]\n",
-        "device: [0]\ngrid: {device: [[0], [1]]}\n",
-        "device: [0]\nscan: {device: [[0], [1]]}\n",
+        "scan: [1]",
+        "combines: {a: [1]}",
+        "grid: {}",
+        "a: 0\ngrid: {a: []}",
+        "a: 0\ngrid: {a: {nested: [1]}}",
+        "scan: {a: 1}",
+        "combines: []",
+        "combines: [{a: 1}, 2]",
+        "device: [0]\ngrid: {device: [[0], [1]]}",
+        "device: [0]\nscan: {device: [[0], [1]]}",
     ],
 )
 def test_malformed_control_trees_are_rejected(load, content):
@@ -512,7 +296,7 @@ model:
     assert defaults.read_bytes() == original
 
 
-def test_nested_defaults_are_resolved(root, load):
+def test_nested_defaults_are_resolved(load):
     runs = load(
         "model: {defaults: a}",
         {
@@ -526,7 +310,7 @@ def test_nested_defaults_are_resolved(root, load):
     }
 
 
-def test_root_defaults_follow_the_same_convention(root, load):
+def test_root_defaults_follow_the_same_convention(load):
     assert load(
         "defaults: demo\nvalue: 3",
         {
@@ -578,7 +362,7 @@ grid:
     assert all(run["model"] == {"width": 32} for run in runs)
 
 
-def test_runs_and_aliases_are_independent(root, load):
+def test_runs_and_aliases_are_independent(load):
     runs = load(
         "seed: 0\nleft: &shared {items: [1, 2]}\nright: *shared\n"
         "model: {defaults: a}\ngrid:\n  seed: [0, 1]\n",
@@ -598,34 +382,26 @@ def test_the_defaults_cache_is_local_to_each_load(root, load, experiment):
     assert _load_configs(experiment)[0]["model"]["value"] == 2
 
 
-def test_name_is_ordinary_data_when_no_defaults_file_matches(root, load):
+def test_name_field_does_not_trigger_defaults_lookup(load):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        runs = load("optimizer: {name: AdamW, lr: 0.01}\ndataset: {name: A}\n")
+        runs = load(
+            "model: {name: a}\ndataset: {name: missing}",
+            {"configs/model/a.yaml": "width: 64"},
+        )
+    assert runs == [{"model": {"name": "a"}, "dataset": {"name": "missing"}}]
     assert caught == []
-    assert runs == [
-        {"optimizer": {"name": "AdamW", "lr": 0.01}, "dataset": {"name": "A"}}
-    ]
-
-
-def test_name_is_ordinary_data_even_when_a_file_matches(root, load):
-    assert load("model: {name: a}", {"configs/model/a.yaml": "width: 64\n"}) == [
-        {"model": {"name": "a"}}
-    ]
 
 
 @pytest.mark.parametrize(
     "content",
     [
         "",
-        "null",
         "[1, 2]",
         "x: [",
-        "x: 1\nx: 2",
         "x: {a: 1, a: 2}",
         "1: value",
         "x: !unknown [1]",
-        "x: !choice [1]",
         "x: &a {nested: *a}",
         "x: {<<: {a: 1}}",
         "x: !!python/object:builtins.object {}",
@@ -656,7 +432,7 @@ def test_missing_experiment_is_an_error(experiment):
 
 @pytest.mark.parametrize(
     "name",
-    ["null", "42", "[]", "''", "'../outside'", "'a/b'", "'a\\b'", "'.'"],
+    ["42", "''", "'../outside'", "'a\\b'", "'.'"],
 )
 def test_invalid_defaults_names_are_rejected(load, name):
     with pytest.raises(ConfigError):

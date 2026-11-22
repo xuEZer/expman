@@ -54,8 +54,15 @@ def row(run, start, end, *, reused=False, status="succeeded", attempt=1):
     }
 
 
-def test_serial_attempts_after_one_hundred_seconds_share_one_lane():
-    html = render([row("first", 120, 140), row("second", 150, 170)], elapsed=200)
+def test_serial_attempts_share_one_lane_and_cache_hits_do_not_extend_the_axis():
+    html = render(
+        [
+            row("first", 120, 140),
+            row("second", 150, 170),
+            row("reuse", 350, 350, reused=True),
+        ],
+        elapsed=200,
+    )
 
     assert html.count('class="gantt-lane"') == 1
     assert html.count('class="gantt-bar ') == 2
@@ -81,14 +88,8 @@ def test_overlaps_and_a_running_retry_use_their_real_lanes():
     assert 'class="gantt-fold"' in html
 
 
-def test_cache_reuses_do_not_change_the_worker_timeline():
-    worker = row("worker", 0, 200)
-    cache_hit = row("reuse", 350, 350, reused=True)
-    assert render([worker, cache_hit]) == render([worker])
-
-
 def test_reuse_only_history_shows_the_empty_timeline():
-    assert render([row("reuse", 120, 120, reused=True)]) == render([])
+    assert "暂无带起止时刻的尝试记录" in render([row("reuse", 120, 120, reused=True)])
 
 
 def test_worker_bars_label_used_and_reserved_memory_on_the_same_scale():

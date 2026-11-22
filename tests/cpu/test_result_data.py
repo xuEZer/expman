@@ -8,6 +8,7 @@ from expman.observation.results import read_results
 from expman.storage.base import StorageError, write_record
 from expman.storage.batch import BatchStore
 from expman.storage.metrics import MetricStore, flatten_metrics
+from expman.webui.result_layout import layout_results
 
 
 def save_configs(directory, configs):
@@ -27,7 +28,9 @@ def label_rows(columns, rows):
     ]
 
 
-def test_reads_each_config_in_expansion_order_with_its_highest_metric_steps(tmp_path):
+def test_reads_configs_in_expansion_order_with_the_highest_steps_in_the_snapshot(
+    tmp_path,
+):
     configs = [
         ("later", {"fixed": 0, "model": {"alpha": 5}, "model.alpha": 2}),
         ("first", {"fixed": 0, "model": {"alpha": 1}, "weight": None}),
@@ -50,6 +53,11 @@ def test_reads_each_config_in_expansion_order_with_its_highest_metric_steps(tmp_
     metrics.log("foreign", (0,), None, 1, flatten_metrics({"other": 8}))
 
     with closing(sqlite3.connect(metrics.path)) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("BEGIN")
+        connection.execute("SELECT 1 FROM metrics LIMIT 1").fetchone()
+        # A higher step committed after this snapshot belongs to the next read.
+        metrics.log("later", (0,), 11, 2, flatten_metrics({"test": {"loss": 12}}))
         variables, outputs, rows = read_results(tmp_path, connection)
     assert label_rows(variables, rows) == [
         {"model.alpha": 5, '["model.alpha"]': 2},
@@ -99,7 +107,10 @@ def test_preserves_structured_and_typed_yaml_choices(tmp_path):
 
 def test_single_config_without_recorded_metrics_still_produces_one_row(tmp_path):
     save_configs(tmp_path, [("one", {"device": [0], "seed": 42})])
-    assert read_results(tmp_path, None) == ([], [], [{}])
+    assert layout_results(*read_results(tmp_path, None)) == {
+        "columns": [],
+        "rows": [{}],
+    }
 
 
 def test_unreadable_metrics_are_reported(tmp_path):
@@ -111,20 +122,3 @@ def test_unreadable_metrics_are_reported(tmp_path):
         pytest.raises(StorageError, match="cannot read metrics"),
     ):
         read_results(tmp_path, connection)
-
-
-def test_results_use_the_callers_metric_snapshot(tmp_path):
-    save_configs(tmp_path, [("one", {})])
-    metrics = MetricStore(tmp_path / "metrics.sqlite3")
-    metrics.log("one", (0,), None, 1, flatten_metrics({"score": 1}))
-    with closing(sqlite3.connect(metrics.path)) as connection:
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("BEGIN")
-        version = connection.execute("PRAGMA data_version").fetchone()
-        metrics.log("one", (0,), None, 1, flatten_metrics({"score": 2}))
-        _, columns, rows = read_results(tmp_path, connection)
-        assert label_rows(columns, rows) == [{"score": 1.0}]
-        connection.commit()
-        assert connection.execute("PRAGMA data_version").fetchone() != version
-        _, columns, rows = read_results(tmp_path, connection)
-        assert label_rows(columns, rows) == [{"score": 2.0}]
