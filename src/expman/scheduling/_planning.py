@@ -24,6 +24,7 @@ class Plan:
 
     host_left_kb: float
     gpu_left_kb: tuple[float, ...]
+    mps_slots_left: tuple[int, ...]
     placements: tuple[tuple[Candidate, int], ...] = ()
 
 
@@ -43,23 +44,31 @@ def _packing_cost(plan, host_capacity, gpu_totals):
     return unused
 
 
-def pack_candidates(candidates, host_capacity, devices, gpu_capacities, gpu_totals):
-    """Choose placements for the current headroom, balancing load against card totals."""
-    plans = [Plan(host_capacity, gpu_capacities)]
+def pack_candidates(
+    candidates, host_capacity, devices, gpu_capacities, gpu_totals, mps_slots
+):
+    """Fit candidates within memory and client slots, balancing memory across cards."""
+    plans = [Plan(host_capacity, gpu_capacities, mps_slots)]
     for candidate in candidates:
         expanded = list(plans)
         for plan in plans:
             if candidate.host_reserve_kb > plan.host_left_kb:
                 continue
             for index, gpu_left in enumerate(plan.gpu_left_kb):
-                if candidate.gpu_reserve_kb > gpu_left:
+                if (
+                    plan.mps_slots_left[index] == 0
+                    or candidate.gpu_reserve_kb > gpu_left
+                ):
                     continue
                 left = list(plan.gpu_left_kb)
                 left[index] -= candidate.gpu_reserve_kb
+                slots_left = list(plan.mps_slots_left)
+                slots_left[index] -= 1
                 expanded.append(
                     Plan(
                         plan.host_left_kb - candidate.host_reserve_kb,
                         tuple(left),
+                        tuple(slots_left),
                         (*plan.placements, (candidate, devices[index])),
                     )
                 )

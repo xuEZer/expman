@@ -8,7 +8,7 @@ import sys
 import warnings
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from time import perf_counter, sleep, time
 
@@ -40,6 +40,14 @@ from expman.settings import settings
 from expman.storage.base import PickleSerializer, RecoveryWarning, write_record
 
 
+@dataclass
+class _MpsCapacity:
+    """Concurrent clients observed on a card after an MPS refusal in this session."""
+
+    limit: int
+    probe_after: float
+
+
 class GpuScheduler:
     def __init__(self, batch):
         if os.name != "posix":
@@ -50,6 +58,7 @@ class GpuScheduler:
         # Re-read the worker environment at the start of each execution session.
         self._environment = environment.overlay()
         self.mps = MpsService()
+        self._mps_capacity: dict[int, _MpsCapacity] = {}
         self.workers = {}
         self.last_tick = perf_counter()
         # The ETA slot forecast uses host peaks from measured final Stages.
@@ -77,6 +86,56 @@ class GpuScheduler:
     def _note(self, kind, **fields):
         """Record one scheduling event for the dashboard; never a decision input."""
         self.events.append({"at": time(), "kind": kind, **fields})
+
+    def _mps_slots_left(self, device: int) -> int | None:
+        """Return this tick's launch budget, or None before an uncapped card reports 808."""
+        hard_limit = settings.mps_clients_per_gpu
+        capacity = self._mps_capacity.get(device)
+        if capacity is None and not hard_limit:
+            return None
+        workers = [
+            worker for worker in self.workers.values() if worker.device == device
+        ]
+        if capacity is None:
+            return max(0, hard_limit - len(workers))
+        limit = capacity.limit
+        if (
+            len(workers) == limit
+            and perf_counter() >= capacity.probe_after
+            and all(worker.mps_client is not None for worker in workers)
+        ):
+            limit += 1
+        if hard_limit:
+            limit = min(limit, hard_limit)
+        return max(0, limit - len(workers))
+
+    def _read_workers(self, workers):
+        registered, refused = set(), set()
+        for worker in workers:
+            was_ready = worker.mps_client is not None
+            was_refused = worker.mps_slots_full
+            worker.read_messages(self.batch.recorder)
+            if not was_ready and worker.mps_client is not None:
+                registered.add(worker.device)
+            if not was_refused and worker.mps_slots_full:
+                refused.add(worker.device)
+
+        # Drain the whole group before counting. A ready message and a refusal
+        # on the same tick must give the same limit in either arrival order.
+        for device in refused | (registered & self._mps_capacity.keys()):
+            confirmed = sum(
+                worker.device == device
+                and worker.mps_client is not None
+                and worker.process.poll() is None
+                for worker in self.workers.values()
+            )
+            if device in refused:
+                self._mps_capacity[device] = _MpsCapacity(
+                    confirmed, perf_counter() + settings.mps_retry_interval
+                )
+            else:
+                capacity = self._mps_capacity[device]
+                capacity.limit = max(capacity.limit, confirmed)
 
     def _sample_gpu_memory(self, queries: ThreadPoolExecutor) -> None:
         """Share one process table per active GPU across its verified MPS clients."""
@@ -265,7 +324,12 @@ class GpuScheduler:
         """Choose a bounded multi-resource packing plan for this scheduler tick."""
         host_capacity, available_gpu = _resource_left(self.workers, memory, host)
         unknown = {w.device for w in self.workers.values() if w.gpu_used_kb is None}
-        devices_in_plan = tuple(device for device in memory if device not in unknown)
+        mps_slots = {device: self._mps_slots_left(device) for device in memory}
+        devices_in_plan = tuple(
+            device
+            for device in memory
+            if device not in unknown and mps_slots[device] != 0
+        )
         for device in unknown.intersection(available_gpu):
             available_gpu[device] = 0.0
         candidates = None
@@ -283,7 +347,15 @@ class GpuScheduler:
             largest_gpu_kb = max(card.total for card in memory.values()) * 1024
             candidates = self.stages.ready_candidates(largest_gpu_kb, self.workers)
             plan = pack_candidates(
-                candidates, host_capacity, devices_in_plan, gpu_capacities, gpu_totals
+                candidates,
+                host_capacity,
+                devices_in_plan,
+                gpu_capacities,
+                gpu_totals,
+                tuple(
+                    len(candidates) if mps_slots[device] is None else mps_slots[device]
+                    for device in devices_in_plan
+                ),
             )
             placements = tuple(
                 (replace(c, gpu_cap_kb=min(c.gpu_cap_kb, memory[d].total * 1024)), d)
@@ -302,6 +374,7 @@ class GpuScheduler:
             "capacity": {
                 "host_left_kb": host_capacity,
                 "gpu_left_kb": available_gpu,
+                "mps_slots_left": mps_slots,
             },
             "placements": [
                 {
@@ -426,8 +499,10 @@ class GpuScheduler:
         with batch._state_lock:
             if run_id not in batch.state.queue:
                 return False
-            if not _admits(self.workers, host, host_reserve) or not _admits_gpu(
-                self.workers, memory, device, gpu_reserve
+            if (
+                self._mps_slots_left(device) == 0
+                or not _admits(self.workers, host, host_reserve)
+                or not _admits_gpu(self.workers, memory, device, gpu_reserve)
             ):
                 batch.state.queue.remove(run_id)
                 batch.state.queue.appendleft(run_id)
@@ -459,6 +534,7 @@ class GpuScheduler:
                 root / "bootstrap.pkl",
                 {
                     "main_script": str(Path(script).resolve()) if script else None,
+                    "device": device,
                     "sys_path": [str(Path(path).resolve()) for path in sys.path],
                     "settings": asdict(
                         replace(
@@ -566,6 +642,13 @@ class GpuScheduler:
                 expected=candidate.expected,
                 limit=limit,
             )
+            capacity = self._mps_capacity.get(device)
+            if (
+                capacity is not None
+                and sum(worker.device == device for worker in self.workers.values())
+                > capacity.limit
+            ):
+                capacity.probe_after = now + settings.mps_retry_interval
             parent_socket = None
             self._note(
                 "launch",
@@ -594,18 +677,42 @@ class GpuScheduler:
             raise
         return True
 
+    def _release_worker(self, run_id, worker):
+        self.batch.state.release(run_id)
+        self.batch.live.running_info.pop(run_id, None)
+        del self.workers[run_id]
+        if worker.channel is not None:
+            worker.channel.socket.close()
+
     def _finish(self, run_id, *, cancelled=None):
         worker = self.workers[run_id]
         self._account()
         finished = perf_counter()
         if cancelled and worker.process.poll() is None:
-            worker.read_messages(self.batch.recorder)
+            self._read_workers((worker,))
             if worker.mps_client is not None:
                 self.mps.terminate_client(*worker.mps_client)
         _kill_group(worker.process)  # Also reap experiment-owned helper processes.
         worker.process.wait()
         _close_stdin(worker.process)
-        worker.read_messages(self.batch.recorder)
+        self._read_workers((worker,))
+        device = worker.device
+        if worker.mps_slots_full:
+            with self.batch._state_lock:
+                self._release_worker(run_id, worker)
+                # Keep this startup's attempt number and log. No Stage ran.
+                self.batch.state.retry(run_id)
+                self._note(
+                    "finish",
+                    run_id=run_id,
+                    stage_index=worker.stage_index,
+                    stage_attempt=worker.stage_attempt,
+                    device=device,
+                    detail="MPS 客户端名额已满（CUDA 808），任务已回队",
+                )
+                self.batch._save()
+            return
+
         duration = max(0.0, finished - worker.started)
         # The dashboard places each attempt on the Batch's effective clock,
         # which already excludes the gaps between run invocations.  The
@@ -689,11 +796,7 @@ class GpuScheduler:
             }
             self.batch.state.stage_history.append(observation)
             self.stages.invalidate(worker.stage_index)
-            self.batch.state.release(run_id)
-            self.batch.live.running_info.pop(run_id, None)
-            del self.workers[run_id]
-            if worker.channel is not None:
-                worker.channel.socket.close()
+            self._release_worker(run_id, worker)
             if result.status is Status.SUCCEEDED:
                 self._complete_stage(run_id, worker.stage_index, observation)
             else:
@@ -729,8 +832,8 @@ class GpuScheduler:
         try:
             self.prefixes.reclaim_saved()
             while self.batch.state.queue or self.workers:
+                self._read_workers(self.workers.values())
                 for run_id, worker in list(self.workers.items()):
-                    worker.read_messages(self.batch.recorder)
                     if worker.process.poll() is not None:
                         self._finish(run_id)
                 if not self.batch.state.queue and not self.workers:

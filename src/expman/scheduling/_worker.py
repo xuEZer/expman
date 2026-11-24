@@ -154,14 +154,22 @@ def main():
     try:
         server_pid = mps.verify_client()
     except Exception as error:
-        print(f"[expman] MPS startup: {error}", file=sys.stderr, flush=True)
-        channel.send(
-            {
-                "type": "startup_failed",
-                "error_type": type(error).__qualname__,
-                "error_message": str(error),
-            }
+        print(
+            f"[expman] MPS startup on GPU {metadata['device']} "
+            f"({os.environ['CUDA_VISIBLE_DEVICES']}): {error}",
+            file=sys.stderr,
+            flush=True,
         )
+        if isinstance(error, mps.MpsClientLimitReached):
+            channel.send({"type": "mps_slots_full"})
+        else:
+            channel.send(
+                {
+                    "type": "startup_failed",
+                    "error_type": type(error).__qualname__,
+                    "error_message": str(error),
+                }
+            )
         return
     channel.send({"type": "mps_ready", "server": server_pid, "pid": os.getpid()})
     resource_stopped = threading.Event()

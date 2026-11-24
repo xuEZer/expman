@@ -11,9 +11,16 @@ def nvidia_test_tools(tmp_path_factory):
     directory = tmp_path_factory.mktemp("nvidia")
     source = directory / "driver.c"
     source.write_text(
+        "#include <stdlib.h>\n"
+        "#include <unistd.h>\n"
         "int cuInit(unsigned flags) { return 0; }\n"
         "int cuDeviceGet(int *device, int ordinal) { *device = ordinal; return 0; }\n"
-        "int cuDevicePrimaryCtxRetain(void **ctx, int device) { *ctx = (void*)1; return 0; }\n"
+        "int cuDevicePrimaryCtxRetain(void **ctx, int device) {\n"
+        '    const char *reject_once = getenv("EXPMAN_TEST_MPS_REJECT_ONCE");\n'
+        "    if (reject_once && unlink(reject_once) == 0) return 808;\n"
+        "    *ctx = (void*)1;\n"
+        "    return 0;\n"
+        "}\n"
     )
     subprocess.run(
         ["cc", "-shared", "-fPIC", str(source), "-o", str(directory / "libcuda.so.1")],

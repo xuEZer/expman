@@ -11,6 +11,10 @@ from tempfile import TemporaryDirectory
 CONTROL = "nvidia-cuda-mps-control"
 
 
+class MpsClientLimitReached(RuntimeError):
+    """CUDA refused a new client because the device's MPS client slots are full."""
+
+
 class MpsService:
     """One private pipe directory for this batch, across all configured GPUs."""
 
@@ -131,6 +135,10 @@ def _retain_primary_context():
         status = getattr(driver, name)(*args)
         if status == 2:
             raise MemoryError(f"CUDA out of memory during MPS startup ({name})")
+        if status == 808:  # CUDA_ERROR_MPS_MAX_CLIENTS_REACHED
+            raise MpsClientLimitReached(
+                f"MPS client limit reached at {name}: CUDA error {status}"
+            )
         if status:
             raise RuntimeError(
                 f"MPS client startup failed at {name}: CUDA error {status}"

@@ -47,6 +47,10 @@ class Defaults:
     # Worker environment and hardware scheduling
     worker_threads: int = _number(4)
     hf_mirror: str = "https://hf-mirror.com"
+    # Zero lets the batch learn capacity per GPU. A positive value caps all launches.
+    mps_clients_per_gpu: int = _number(0, _NONNEGATIVE)
+    # Seconds to wait before probing for additional MPS client capacity.
+    mps_retry_interval: float = _number(10.0)
     # Exclude this much MemAvailable from the scheduler's admission budget.
     host_reserve_kb: int = _number(1024**2, _NONNEGATIVE)
     # Initial per-stage reservations until usable peak samples exist.

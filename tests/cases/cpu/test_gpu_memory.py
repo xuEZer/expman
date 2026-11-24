@@ -29,6 +29,21 @@ def test_timeout_provides_no_process_readings(query):
     assert gpu_memory.sample("GPU-demo") == {}
 
 
+@pytest.mark.parametrize(
+    "status, kind", [(808, mps.MpsClientLimitReached), (809, RuntimeError)]
+)
+def test_mps_startup_distinguishes_the_client_limit(monkeypatch, status, kind):
+    driver = Mock()
+    driver.cuInit.return_value = driver.cuDeviceGet.return_value = 0
+    driver.cuDevicePrimaryCtxRetain.return_value = status
+    monkeypatch.setattr(mps.ctypes, "CDLL", lambda name: driver)
+    with pytest.raises(
+        RuntimeError, match=f"cuDevicePrimaryCtxRetain: CUDA error {status}"
+    ) as caught:
+        mps.verify_client()
+    assert type(caught.value) is kind
+
+
 def test_mps_verification_requires_our_pid_on_our_device(query, monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-abcd1234")
     monkeypatch.setattr(mps, "_retain_primary_context", lambda: None)

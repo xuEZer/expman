@@ -44,6 +44,7 @@ class Worker:
     # Actual MiB-granularity request sent in the MPS client environment.
     gpu_cap_kb: float = 0.0
     mps_client: tuple[int, int] | None = None
+    mps_slots_full: bool = False
 
     expected: StageDuration | None = None
     area: float = 0.0
@@ -87,6 +88,8 @@ class Worker:
                 record_event(recorder, event)
             elif kind == "mps_ready":
                 self.mps_client = (message["server"], message["pid"])
+            elif kind == "mps_slots_full":
+                self.mps_slots_full = True
             elif kind == "startup_failed":
                 self.finished = StageResult(
                     self.experiment.run_id,

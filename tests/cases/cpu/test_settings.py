@@ -9,7 +9,10 @@ from expman.settings import project_settings
 def test_python_overrides_are_validated_before_any_value_changes(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     with project_settings():
-        expman.set(batches_dir="my-results", poll_interval=2, web_port=0)
+        assert expman.get("mps_clients_per_gpu") == 0
+        expman.set(
+            batches_dir="my-results", poll_interval=2, web_port=0, mps_clients_per_gpu=0
+        )
         assert expman.get("batches_dir") == Path("my-results")
         assert expman.get("poll_interval") == 2.0
         for invalid in (
@@ -17,6 +20,7 @@ def test_python_overrides_are_validated_before_any_value_changes(tmp_path, monke
             {"web_port": True},
             {"worker_threads": 0},
             {"retries": -1},
+            {"mps_clients_per_gpu": -1},
             {"coverage": 1.0},
             {"live_enabled": "false"},
             {"batches_dir": ""},

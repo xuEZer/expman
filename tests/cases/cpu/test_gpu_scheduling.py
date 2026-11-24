@@ -174,6 +174,7 @@ def _worker(**fields):
         "gpu_reserve_kb": 0.0,
         "gpu_used_kb": 0.0,
         "gpu_cap_kb": float("inf"),
+        "mps_slots_full": False,
         "finished": None,
         "limit": None,
     }
@@ -223,6 +224,131 @@ class TestGpuScheduling:
         monkeypatch.setattr(devices, "NvidiaMemory", Memory)
         monkeypatch.setattr(devices, "MeminfoMonitor", Host)
         monkeypatch.setattr(settings, "poll_interval", 0.01)
+
+    @pytest.mark.simulated_gpu
+    @pytest.mark.parametrize("cards", [[0, 1], [0]])
+    def test_mps_startup_rejection_requeues_with_zero_retries(
+        self, tmp_path, monkeypatch, cards
+    ):
+        reject_once = tmp_path / "reject-mps-client"
+        reject_once.touch()
+        monkeypatch.setenv("EXPMAN_TEST_MPS_REJECT_ONCE", str(reject_once))
+        monkeypatch.setattr(settings, "retries", 0)
+        # With a second card, it must be used while the rejected card backs off.
+        monkeypatch.setattr(
+            settings, "mps_retry_interval", 600.0 if len(cards) > 1 else 0.05
+        )
+        batch = make_batch(tmp_path, count=1, devices=cards, delay=0)
+        (result,) = batch.run()
+
+        assert result.status is Status.SUCCEEDED and len(result.attempts) == 1
+        first, second = [
+            event["device"]
+            for event in batch._scheduler.events
+            if event["kind"] == "launch"
+        ]
+        assert {first, second} == set(cards)
+        (stage,) = batch.state.stage_history
+        assert (stage["device"], stage["attempt"]) == (second, 2)
+        log = (
+            batch.experiments[0].output_dir / "attempts/stage-0/1/output.log"
+        ).read_text()
+        assert f"GPU {first} (GPU-test-{first})" in log
+        assert "cuDevicePrimaryCtxRetain: CUDA error 808" in log
+
+    @pytest.mark.parametrize("hard_limit", [0, 2])
+    def test_mps_limit_grows_only_when_an_extra_client_registers(
+        self, tmp_path, monkeypatch, hard_limit
+    ):
+        clock = Mock(return_value=100.0)
+        monkeypatch.setattr("expman.scheduling.scheduler.perf_counter", clock)
+        monkeypatch.setattr(
+            "expman.scheduling.scheduler._kill_group", lambda process: None
+        )
+        monkeypatch.setattr(
+            "expman.resources.limits.memory_limit",
+            Mock(return_value=MemoryLimit((), None, 1024, "none")),
+        )
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            lambda *args, **kwargs: Mock(returncode=0, poll=Mock(return_value=None)),
+        )
+        monkeypatch.setattr(settings, "mps_clients_per_gpu", hard_limit)
+        monkeypatch.setattr(settings, "mps_retry_interval", 10.0)
+        batch = make_batch(tmp_path, count=3, devices=[0, 1])
+        scheduler = GpuScheduler(batch)
+        scheduler.mps.pipe = str(tmp_path)
+        first, refused, extra = batch.experiments
+
+        def launch(run):
+            candidate = Candidate(run.run_id, 0, 1024, 1024, 1024, None)
+            assert scheduler._launch(
+                0, Memory([0]).sample()[0], Host().sample(), candidate
+            )
+            return scheduler.workers[run.run_id]
+
+        def register(worker):
+            message = {
+                "type": "mps_ready",
+                "server": 11,
+                "pid": 100 + batch.experiments.index(worker.experiment),
+            }
+            with patch.object(worker.channel, "drain", return_value=[message]):
+                scheduler._read_workers((worker,))
+            worker.gpu_used_kb = 0.0
+
+        def finish(run):
+            scheduler.workers[run.run_id].process.poll.return_value = 0
+            scheduler._finish(run.run_id)
+
+        first_worker = launch(first)
+        rejected_worker = launch(refused)
+        with (
+            patch.object(
+                first_worker.channel,
+                "drain",
+                return_value=[{"type": "mps_ready", "server": 11, "pid": 99}],
+            ),
+            patch.object(
+                rejected_worker.channel,
+                "drain",
+                return_value=[{"type": "mps_slots_full"}],
+            ),
+        ):
+            # Both replies belong to one tick; processing the refusal first must count the registration.
+            scheduler._read_workers((rejected_worker, first_worker))
+        finish(refused)
+        assert scheduler._mps_slots_left(0) == 0
+        assert scheduler._mps_slots_left(1) == (hard_limit or None)
+        assert not batch.state.failed_attempts(refused.run_id, 0)
+        assert batch.state.stage_elapsed[refused.run_id] == 0
+        assert refused.run_id in batch.store.read_manifest()["queue"]
+
+        finish(first)
+        assert scheduler._mps_slots_left(0) == 1
+        register(launch(refused))
+        assert scheduler._mps_slots_left(0) == 0
+
+        clock.return_value = 111.0
+        assert scheduler._mps_slots_left(0) == 1
+        probe = launch(extra)
+        assert scheduler._mps_slots_left(0) == 0
+        # One client leaves while the extra registration is pending.
+        finish(refused)
+        register(probe)
+        finish(extra)
+        assert scheduler._mps_slots_left(0) == 1
+
+        register(launch(first))
+        clock.return_value = 135.0
+        register(launch(refused))
+        # Two confirmed clients now coexist. Only auto mode may try a third.
+        clock.return_value = 146.0
+        assert scheduler._mps_slots_left(0) == (1 if hard_limit == 0 else 0)
+        finish(first)
+        finish(refused)
+        assert scheduler._mps_slots_left(0) == 2
 
     def test_a_broken_recorder_does_not_drop_the_worker_result(self, tmp_path, caplog):
         batch = make_batch(tmp_path, count=1, devices=[0])
@@ -878,6 +1004,29 @@ class TestGpuScheduling:
             scheduler._launch_available(Memory([0]).sample(), Host().sample())
 
         assert started == [0, 0, 0, 0]
+
+    def test_plan_and_launch_reserve_one_mps_slot_per_worker(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(settings, "mps_clients_per_gpu", 2)
+        batch = make_batch(tmp_path, count=5, devices=[0, 1])
+        scheduler = GpuScheduler(batch)
+        scheduler.workers["running"] = _worker(device=0, stage_index=-1)
+        memory = Memory([0, 1]).sample()
+        host = Host().sample()
+
+        plan = scheduler._launch_plan(memory, host)
+        assert sorted(device for _, device in plan) == [0, 1, 1]
+        candidate = next(candidate for candidate, device in plan if device == 0)
+
+        # A worker already starting on this card consumes its last slot even
+        # before MPS has confirmed its client PID.
+        scheduler.workers["starting"] = _worker(
+            device=0, stage_index=-1, mps_client=None
+        )
+        assert not scheduler._launch(0, memory[0], host, candidate)
+        assert batch.state.next_attempt(candidate.run_id, candidate.stage_index) == 1
+        assert [device for _, device in scheduler._launch_plan(memory, host)] == [1, 1]
 
     def test_tick_plan_combines_memory_and_gpu_stages(self, tmp_path):
         path = tmp_path / "two-stage.yaml"
