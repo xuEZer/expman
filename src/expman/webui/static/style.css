@@ -83,10 +83,10 @@ h2.section { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
 .memory-mark { position: absolute; white-space: nowrap; font: 10px/14px ui-monospace, SFMono-Regular, Menlo, monospace;
   left: clamp(0px, calc(var(--at) - var(--label-width) / 2), calc(100% - var(--label-width))); }
 .resource-used { top: 0; color: var(--actual); }
-.resource-other, .resource-budget { bottom: 0;
-  --other-left: clamp(0px, calc(var(--other-end) - var(--other-width)), calc(100% - var(--other-width) - var(--budget-space))); }
+.resource-other, .resource-allocation { bottom: 0;
+  --other-left: clamp(0px, calc(var(--other-end) - var(--other-width)), calc(100% - var(--other-width) - var(--allocation-space))); }
 .resource-other { left: var(--other-left); color: var(--muted); }
-.resource-budget { color: var(--danger);
+.resource-allocation { color: var(--danger);
   left: clamp(calc(var(--other-left) + var(--other-width) + 1ch), var(--at), calc(100% - var(--label-width))); }
 .seg { position: absolute; top: 0; bottom: 0; }
 .env { position: absolute; top: 0; bottom: 0; border: 1px dashed var(--danger); border-radius: 4px; }
@@ -100,7 +100,7 @@ h2.section { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
 .worker-row + .worker-row { margin-top: 8px; }
 .worker-meter { position: relative; padding-block: 18px; }
 .worker-used { top: 0; }
-.worker-budget { bottom: 0; }
+.worker-allocation { bottom: 0; }
 .gantt { position: relative; }
 .gantt-lane { position: relative; height: 16px; margin-top: 4px; border-radius: 4px; background: var(--track); }
 .gantt-bar { position: absolute; top: 0; bottom: 0; border-radius: 4px; background: var(--running);

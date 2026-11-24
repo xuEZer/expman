@@ -52,9 +52,8 @@ class Defaults:
     # Initial per-stage reservations until usable peak samples exist.
     host_peak_kb_default: int = _number(1024**2)
     gpu_peak_kb_default: int = _number(1024**2)
-    # Requested memory cap = max(capacity_floor_kb, estimated peak * capacity_factor).
+    # Multiplier for host and GPU memory limits based on the estimated peak.
     capacity_factor: float = _number(1.10, (lambda n: n >= 1, "at least 1"))
-    capacity_floor_kb: int = _number(512 * 1024)
     # Threshold for classifying a host-memory peak as having reached its limit.
     capacity_near: float = _number(0.9, _FRACTION)
     poll_interval: float = _number(1.0)

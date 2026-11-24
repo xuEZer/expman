@@ -92,7 +92,7 @@ def test_reuse_only_history_shows_the_empty_timeline():
     assert "暂无带起止时刻的尝试记录" in render([row("reuse", 120, 120, reused=True)])
 
 
-def test_worker_bars_label_used_and_reserved_memory_on_the_same_scale():
+def test_worker_bars_scale_usage_to_the_assigned_limits():
     gib = 1024**2
     html = render_js(
         "workers",
@@ -102,9 +102,15 @@ def test_worker_bars_label_used_and_reserved_memory_on_the_same_scale():
                     "host": {
                         "resident_kb": 4 * gib,
                         "reserved_kb": 2 * gib,
-                        "cap_kb": 8 * gib,
+                        "requested_cap_kb": 8 * gib,
+                        "cap_kb": 6 * gib,
                     },
-                    "gpu": {"used_kb": gib, "budget_kb": 4 * gib, "cap_kb": 8 * gib},
+                    "gpu": {
+                        "used_kb": 5 * gib,
+                        "budget_kb": 3 * gib,
+                        "requested_cap_kb": 4 * gib,
+                        "cap_kb": None,
+                    },
                 }
             ],
         },
@@ -112,26 +118,29 @@ def test_worker_bars_label_used_and_reserved_memory_on_the_same_scale():
 
     assert "<span>内存</span><span>显存</span>" in html
     assert html.count('class="worker-meter"') == 2
-    assert "width:50%;background:var(--other)" in html
+    assert html.count("width:100%;background:var(--other)") == 2
+    assert "width:50%;background:var(--actual)" in html
     assert "width:100%;background:var(--actual)" in html
-    assert "width:100%;background:var(--other)" in html
-    assert "width:25%;background:var(--actual)" in html
-    assert 'class="cap"' not in html
-    assert "8.0 GiB" not in html
-    for label in ("1.0 GiB", "2.0 GiB", "4.0 GiB"):
-        assert label in html
+    assert html.count('class="memory-mark worker-allocation" style="--at:100%') == 2
+    assert html.count("4.0 GiB") == 2
+    assert "5.0 GiB" in html and "8.0 GiB" in html
+    assert all(label not in html for label in ("2.0 GiB", "3.0 GiB", "6.0 GiB"))
 
 
-def test_missing_worker_usage_only_labels_the_reservation():
+def test_missing_worker_values_display_only_the_known_quantity():
+    gib = 1024**2
     html = render_js(
         "workerRow",
         {
-            "host": {"resident_kb": None, "reserved_kb": 0},
+            "host": {"resident_kb": gib, "reserved_kb": 3 * gib, "requested_cap_kb": 0},
+            "gpu": {"used_kb": None, "requested_cap_kb": 2 * gib},
         },
     )
 
-    assert "worker-used" not in html
-    assert html.count("0.0 GiB") == 1
+    assert html.count('class="track ') == 1
+    assert "background:var(--actual)" not in html
+    assert html.count("1.0 GiB") == html.count("2.0 GiB") == 1
+    assert "0.0 GiB" not in html and "3.0 GiB" not in html
 
 
 def test_unknown_memory_and_utilization_are_not_rendered_as_zero():
@@ -144,28 +153,71 @@ def test_unknown_memory_and_utilization_are_not_rendered_as_zero():
     assert 'class="resource-utilization mono">–</span>' in html
 
 
-def test_resource_bar_labels_the_memory_endpoints_and_total_utilization():
+def test_resource_bars_sum_allocations_for_the_host_and_each_gpu():
     gib = 1024**2
     card = {
         "index": 0,
         "total_kb": 100 * gib,
         "other_kb": 20 * gib,
         "expman_actual_kb": 10 * gib,
-        "expman_budget_kb": 40 * gib,
+        "expman_budget_kb": 15 * gib,
         "utilization_percent": 43,
     }
     html = render_js(
         "resources",
-        {"resources": {"devices": [card], "host": {"utilization_percent": 0}}},
+        {
+            "workers": [
+                {
+                    "device": device,
+                    "host": {"requested_cap_kb": host * gib},
+                    "gpu": {"requested_cap_kb": gpu * gib},
+                }
+                for device, host, gpu in [(0, 8, 17), (0, 14, 23), (1, 6, 5)]
+            ],
+            "resources": {
+                "devices": [card, card | {"index": 1}],
+                "host": card | {"utilization_percent": 0},
+            },
+        },
     )
-    assert 'class="env" style="left:20%;width:40%' in html
+    rows = html.split('class="row resource-row"')[1:]
+    assert len(rows) == 3
+    for row_html, amount in zip(rows, (40, 5, 28), strict=True):
+        assert f'class="env" style="left:20%;width:{amount}%' in row_html
+        assert (
+            f'class="memory-mark resource-allocation" style="--at:{20 + amount}%'
+            in row_html
+        )
+        assert f">{amount}.0 GiB</span>" in row_html
     assert "left:20%;width:10%" in html
     assert 'class="memory-mark resource-other" style="--at:20%' in html
     assert 'class="memory-mark resource-used" style="--at:30%' in html
-    assert 'class="memory-mark resource-budget" style="--at:60%' in html
-    assert all(f">{value}.0 GiB</span>" in html for value in (20, 30, 60))
     assert 'class="resource-utilization mono">43%</span>' in html
     assert 'class="resource-utilization mono">0%</span>' in html
+
+
+def test_resource_envelope_handles_overcommit_and_incomplete_allocations():
+    gib = 1024**2
+    reading = {"total_kb": 100 * gib, "other_kb": 80 * gib, "expman_actual_kb": gib}
+    html = render_js(
+        "resources",
+        {
+            "workers": [
+                {"device": 0, "gpu": {"requested_cap_kb": 30 * gib}},
+                {"device": 1, "host": {"requested_cap_kb": gib}},
+                {"device": 1, "gpu": {"requested_cap_kb": gib}},
+            ],
+            "resources": {
+                "devices": [reading | {"index": n} for n in (0, 1)],
+                "host": reading,
+            },
+        },
+    )
+    assert html.count('class="env"') == 1
+    assert 'class="env" style="left:80%;width:20%' in html
+    assert html.count('class="memory-mark resource-allocation"') == 1
+    assert 'class="memory-mark resource-allocation" style="--at:100%' in html
+    assert ">30.0 GiB</span>" in html
 
 
 def test_stale_snapshot_retains_live_group_counts_and_process_state():

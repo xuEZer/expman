@@ -576,17 +576,17 @@ class TestGpuScheduling:
     def test_gpu_admission_charges_the_reserve_under_the_mps_limit(self, tmp_path):
         batch = make_batch(tmp_path, count=2, devices=[0])
         scheduler = GpuScheduler(batch)
-        capacity_kb = 2 * 1024**2
+        estimate_kb = 128 * 1024
 
-        with patch.object(scheduler.stages, "peak", return_value=capacity_kb // 2):
+        with patch.object(scheduler.stages, "peak", return_value=estimate_kb):
             candidates = scheduler.stages.ready_candidates(
-                capacity_kb, scheduler.workers
+                2 * 1024**2, scheduler.workers
             )
 
         assert candidates
-        assert all(item.gpu_reserve_kb == capacity_kb // 2 for item in candidates)
+        assert all(item.gpu_reserve_kb == estimate_kb for item in candidates)
         assert all(
-            item.gpu_cap_kb == capacity_kb // 2 * settings.capacity_factor
+            item.gpu_cap_kb == estimate_kb * settings.capacity_factor
             for item in candidates
         )
 

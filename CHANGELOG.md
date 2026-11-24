@@ -4,6 +4,7 @@
 
 ### Breaking changes
 
+- 移除 `capacity_floor_kb` 设置。worker 的主机内存和显存硬上限按各自的预估峰值 × `capacity_factor`（默认 1.10）计算。
 - `expman run` 省略模块名时，默认导入模块由 `pipeline` 改为 `src.pipeline`。例如，`expman run train baseline` 从实验项目的 `src/pipeline.py` 导入 `train`。使用根目录 `pipeline.py` 的项目可显式运行 `expman run pipeline:train baseline`。恢复批次时，清单中的完整模块路径优先，只有清单仅记录属性名时才使用内置默认模块。
 - 实验 YAML 的目录从 `configs/` 改为 `configs/experiments/`。从实验项目根目录执行 `expman run train baseline` 会读取 `configs/experiments/baseline.yaml`，命令中只需写配置名。YAML 的 `defaults` 按字段路径从 `./configs/` 读取，各条 CLI 命令的项目设置只读取 `./pyproject.toml` 中的 `[tool.expman]`。
 - 非空 `Pipeline` 在构造时检查最后一个 Stage 的 `process()` 定义。叶子须为同步普通方法，只允许自然结束、`return` 和 `return None`。该约束也适用于独立和嵌套的 Pipeline。批次中的标量结果可通过 `ctx.log_metrics()` 保存，模型等产物由实验代码显式写入。尝试和实验结果移除按需读取最终返回值的 `output` 属性。
@@ -55,7 +56,7 @@
 ### Changed
 
 - 共享中间节点的所有使用者成功完成直接后继阶段后，调度器立即回收该节点的快照和元数据。叶子只发布复用所需的元数据，所有仍可能复用该节点的 run 完成后回收。恢复批次时按已保存的进度继续清理。
-- 看板按 `web_interval` 自动刷新总览与批次详情。阶段卡按已完成、运行中、排队中的顺序显示计数。worker 的内存与显存分列展示实际用量和预留量，资源分配区显示整机 CPU 和每张 GPU 的利用率。
+- 看板按 `web_interval` 自动刷新总览与批次详情。阶段卡按已完成、运行中、排队中的顺序显示计数。worker 的内存与显存分列展示实际用量和启动时请求的分配额。资源分配区按主机和每张 GPU 分别汇总分配额，在红色虚线框右端标注合计值，并显示相应的利用率。
 - 显存改用 MPS 单客户端硬上限，启动时核验 PID 与 GPU。worker 在现有主机内存采样线程中一并查询 NVIDIA 客户端显存，CUDA OOM 后按提高的预算重试。
 - 实验配置语法整体替换：`!choice`、顶层 `sweep` 与中间过渡的顶层 `over` 全部移除，改由三个顶层控制键表达——**`combines`** 取一个映射列表，每项是一份稀疏覆盖、逐项各跑一个 Run（配对同级字段），**`grid`** 列出各轴并跑它们的乘积（笛卡尔积），**`scan`** 在自身内部声明参数（文件不必重复书写，写了也会被覆盖）、以每条轴列出的第一个取值为基准点、一次只动一条轴（单参数扫描）。三者共用同一条形状规则：**列表表示该节点取其中一个值，映射表示继续往下走**，并且**可以叠加**：嵌套关系由外向内固定为 `combines` → `grid` → `scan`，Run 集是三层的乘积、内层变化最快；原先 `scan` 的列表形式（整份方案）改由 `combines` 承担。`expand` 段、`baseline` 开关、`over.mode`、以及用 `name` 触发默认查找一并消失，且**不提供任何兼容层或迁移提示**：旧写法要么退化为普通数据字段，要么按 YAML 语法错误被拒。`name` 保持为普通数据字段，查找职责由 `defaults: <name>` 承担。
 - 新增 CLI 命令 `run`、`resume`、`status` 和 `stop`。CLI 创建批次时保存流程定位，恢复时自动导入。

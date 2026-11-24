@@ -38,9 +38,9 @@ class MemoryLimit:
         return self.cap_kb > 0 and self.verified
 
 
-def cap_kb(estimate_kb) -> float:
-    """Apply the configured headroom factor and floor to a host or GPU estimate."""
-    return max(settings.capacity_floor_kb, estimate_kb * settings.capacity_factor)
+def cap_kb(estimate_kb: float) -> float:
+    """Scale the estimated host or GPU peak to get the requested limit in KiB."""
+    return estimate_kb * settings.capacity_factor
 
 
 def _unescape(value: str) -> str:

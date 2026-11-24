@@ -104,7 +104,7 @@ CLI 以当前工作目录作为实验项目根目录。如果该目录有 `pypro
 |---|---|
 | 哪些就绪任务进入候选？ | `StageWork` 按截至当前阶段的配置依赖和 seed 分组，跳过已有 worker 在运行的组，其余每组至多选一个代表。同一阶段先取重试任务，再取首次尝试的任务，两者各自保持就绪队列顺序。每阶段最多选 `candidates_per_stage` 个候选，再按阶段编号轮流取一个送入装箱。[阶段工作量](src/expman/scheduling/_stages.py) |
 | 现在还能放多少作业？ | 主进程读取 `/proc/meminfo` 和 NVIDIA 设备读数，扣除主机保留量及活跃 worker 尚未使用的预算。冷启动时采用配置中的主机和 GPU 初始峰值预算，默认均为 1 GiB。资源不足时暂缓派发，压力持续时按规则减载。[设备采样](src/expman/resources/devices.py) · [容量计算](src/expman/scheduling/_resource.py) |
-| 哪些作业放在哪张卡？ | `pack_candidates` 按估计峰值为候选预留资源。每考虑一个候选，保留代价最低的若干可行方案。主机剩余预算除以本轮派发前的主机预算，每张卡的剩余显存预算除以该卡物理显存总量。将这些比例分别平方后相加，即为方案代价。单个 worker 的主机或 GPU 硬上限另留余量。主机 cgroup 不能核验时可回退到进程用量采样，快照分别记录实际用量、预算和已核验的上限。[装箱逻辑](src/expman/scheduling/_planning.py) |
+| 哪些作业放在哪张卡？ | `pack_candidates` 按估计峰值为候选预留资源。每考虑一个候选，保留代价最低的若干可行方案。主机剩余预算除以本轮派发前的主机预算，每张卡的剩余显存预算除以该卡物理显存总量。将这些比例分别平方后相加，即为方案代价。worker 的主机内存和显存硬上限分别取对应预估峰值 × `capacity_factor`（默认 1.10），显存上限还受所选卡的物理容量限制。主机 cgroup 不能核验时可回退到进程用量采样，快照分别记录实际用量、预算和已核验的上限。[装箱逻辑](src/expman/scheduling/_planning.py) |
 | worker 报了什么？下一步如何处理？ | Worker 封装进程、IPC 消息和资源读数。普通失败按该 Stage 的重试预算处理。CUDA OOM 或主机限额终止用作需求下界，下一次重新估价。调度退出时回收 worker 进程组。[Worker](src/expman/scheduling/_process.py) · [调度循环](src/expman/scheduling/scheduler.py) |
 
 ETA 按剩余的**阶段组**估算。调度器用单调时钟测量每次尝试占用 worker 的时长，历史样本与运行中的计时口径相同。每个顶层 Stage 用同批次实际执行成功的样本估计对数耗时的中心，配置越近权重越大。直接复用结果的阶段跳过采样。留一预测误差用于估计区间，取消尝试的实测时间只参与下界校准。峰值模型使用邻近配置的经验分位数。[峰值模型](src/expman/estimation/memory_model.py)

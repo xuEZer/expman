@@ -148,12 +148,11 @@ def test_memory_limit_without_working_mechanism_is_uncapped():
 
 
 def test_direct_group_is_verified_from_actual_counter_and_limit(tmp_path):
-    requested = limits.cap_kb(2048 * 1024)
-    group = memory_group(tmp_path / "expman-test", cap=int(requested * 1024))
+    group = memory_group(tmp_path / "expman-test", cap=110 * 1024**2)
     with patch.object(limits, "_direct", return_value=group):
-        cap = limits.memory_limit("expman-test", 2048 * 1024)
+        cap = limits.memory_limit("expman-test", 100 * 1024)
     assert cap.verified and cap.capped
-    assert cap.cap_kb == requested
+    assert cap.cap_kb == pytest.approx(110 * 1024)
 
 
 def test_an_attempt_without_its_own_cgroup_reports_process_usage(monkeypatch):

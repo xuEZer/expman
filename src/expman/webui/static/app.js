@@ -201,18 +201,23 @@ function workers(s) {
   return '<div class="card scroll-x">' + head + list.map(workerRow).join("") + "</div>";
 }
 
-function workerMemoryBar(used, budget) {
-  const scale = Math.max(used ?? 0, budget ?? 0);
-  const usedPercent = pctOf(used, scale);
-  const budgetPercent = pctOf(budget, scale);
+function allocationKb(resource) {
+  const kb = resource?.requested_cap_kb;
+  return ok(kb) && kb > 0 ? kb : null;
+}
+
+function workerMemoryBar(used, allocated) {
+  if (allocated === null)
+    return '<div class="worker-meter mono">' + (ok(used) ? gib(used) + ' GiB' : '–') + '</div>';
+  const usedPercent = clamp(pctOf(used, allocated));
   const segments = [
-    { from: 0, size: budgetPercent, color: "var(--other)" },
+    { from: 0, size: 100, color: "var(--other)" },
     { from: 0, size: usedPercent, color: "var(--actual)" },
   ];
   return '<div class="worker-meter">' +
     memoryMark(used, usedPercent, "worker-used") +
     bar(segments, null, "wide") +
-    memoryMark(budget, budgetPercent, "worker-budget") + "</div>";
+    memoryMark(allocated, 100, "worker-allocation") + "</div>";
 }
 
 function workerRow(w) {
@@ -224,8 +229,8 @@ function workerRow(w) {
     '<span class="mono">a' + esc(w.attempt) + "</span>" +
     '<span class="mono">' + esc(w.device) + "</span>" +
     '<span class="mono">' + secs(w.elapsed_seconds) + "</span>" +
-    workerMemoryBar(host.resident_kb, host.reserved_kb) +
-    workerMemoryBar(gpu.used_kb, gpu.budget_kb) + "</div>";
+    workerMemoryBar(host.resident_kb, allocationKb(host)) +
+    workerMemoryBar(gpu.used_kb, allocationKb(gpu)) + "</div>";
 }
 
 function timeline(s) {
@@ -281,41 +286,55 @@ function timeline(s) {
 }
 
 
-function resourceBar(r) {
+function totalAllocation(workers, kind) {
+  let total = 0;
+  for (const worker of workers) {
+    const allocated = allocationKb(worker[kind]);
+    if (allocated === null) return null;
+    total += allocated;
+  }
+  return total;
+}
+
+function resourceBar(r, allocated) {
   const total = r.total_kb;
   const other = r.other_kb;
   const actual = r.expman_actual_kb;
-  const budget = r.expman_budget_kb;
   if (!(total > 0) || !ok(other) || !ok(actual)) return '<span class="faint">–</span>';
-  const start = pctOf(other, total);
+  const start = clamp(pctOf(other, total));
+  const hasAllocation = ok(allocated) && allocated > 0;
+  // The box starts after other processes. Its label is the batch allocation alone.
+  const allocationEnd = hasAllocation ? clamp(pctOf(other + allocated, total)) : start;
   const track = bar([
     { from: 0, size: start, color: "var(--other)" },
     { from: start, size: pctOf(actual, total), color: "var(--actual)" },
-  ], { from: start, size: pctOf(budget, total) }, "wide");
+  ], { from: start, size: allocationEnd - start }, "wide");
   const usedEnd = other + actual;
-  const budgetEnd = other + budget;
-  const hasBudget = ok(budget) && budget > 0;
   // The two lower labels share one line, even when both endpoints are close.
-  const bottomSpace = hasBudget ? gib(budgetEnd).length + 5 : 0;
-  return '<div class="resource-scale" style="--other-end:' + clamp(start) +
-    '%;--other-width:' + (gib(other).length + 4) + 'ch;--budget-space:' + bottomSpace + 'ch">' +
+  const bottomSpace = hasAllocation ? gib(allocated).length + 5 : 0;
+  return '<div class="resource-scale" style="--other-end:' + start +
+    '%;--other-width:' + (gib(other).length + 4) + 'ch;--allocation-space:' + bottomSpace + 'ch">' +
     track + memoryMark(other, start, "resource-other") +
     memoryMark(usedEnd, pctOf(usedEnd, total), "resource-used") +
-    (hasBudget ? memoryMark(budgetEnd, pctOf(budgetEnd, total), "resource-budget") : "") + '</div>';
+    (hasAllocation ? memoryMark(allocated, allocationEnd, "resource-allocation") : "") + '</div>';
 }
 
-function resourceRow(name, r) {
+function resourceRow(name, r, allocated) {
   const stale = ok(r.age_seconds) && r.age_seconds > 2.5 ? " stale" : "";
   const utilization = ok(r.utilization_percent) ? Math.round(r.utilization_percent) + "%" : "–";
   return '<div class="row resource-row"><span class="muted mono">' + esc(name) + '</span>' +
-    '<div class="resource-reading' + stale + '">' + resourceBar(r) + '</div>' +
+    '<div class="resource-reading' + stale + '">' + resourceBar(r, allocated) + '</div>' +
     '<span class="resource-utilization mono' + stale + '">' + utilization + '</span></div>';
 }
 
 function resources(s) {
   const r = s.resources || {};
-  const rows = (r.devices || []).map(card => resourceRow("GPU " + card.index, card));
-  rows.push(resourceRow("CPU", r.host || {}));
+  const workers = s.workers || [];
+  const rows = (r.devices || []).map(card => {
+    const onCard = workers.filter(worker => worker.device === card.index);
+    return resourceRow("GPU " + card.index, card, totalAllocation(onCard, "gpu"));
+  });
+  rows.push(resourceRow("CPU", r.host || {}, totalAllocation(workers, "host")));
   return section("资源分配", '<div class="card">' + rows.join("") + "</div>");
 }
 
