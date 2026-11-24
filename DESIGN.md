@@ -36,7 +36,7 @@ flowchart LR
     V --> UI["独立 Web 服务"]
 ```
 
-1. **创建批次。** `expman run` 按 `module:attr` 导入 Pipeline，省略模块名时从 `pipeline_module` 指定的模块读取属性，默认为 `src.pipeline`。命令把 YAML 展开为一组配置，批次调度代码校验设备和种子，为每份配置创建一个 run 目录，把解析后的 `module:attr` 和初始队列写入批次清单。[CLI](src/expman/cli/commands.py) · [批次调度](src/expman/scheduling/batch.py)
+1. **创建批次。** `expman run` 按 `module:attr` 导入 Pipeline，省略模块名时从 `pipeline_module` 指定的模块读取属性，默认为 `src.pipeline`。命令展开并合并输入 YAML 的配置。全部配置通过设备和种子校验后，创建一个批次，为每份不同的配置创建一个 run 目录，把解析后的 `module:attr` 和初始队列写入批次清单。[CLI](src/expman/cli/commands.py) · [批次调度](src/expman/scheduling/batch.py)
 2. **选择任务。** 主进程取每个 run 当前就绪的顶层阶段。可以共享前缀的成员按组处理。命中缓存时，主进程只读元数据，把指标和共享节点引用写到目标 run，推进它的阶段位置。需要计算时，主进程从各阶段的就绪队列选取候选，再按主机内存和各卡显存余量决定派发哪些任务及其设备。启动 worker 前先持久化该成员的活动状态。[调度循环](src/expman/scheduling/scheduler.py) · [阶段分组](src/expman/scheduling/_stages.py)
 3. **计算一个阶段。** worker 在独立解释器内核验 MPS 客户端，加载用户模块并重建 Experiment。执行第 `i` 个顶层阶段时，第一阶段从初始随机状态和输入 `None` 开始，其余阶段只需从第 `i - 1` 个阶段的快照取得输入和随机状态。目标阶段已有有效 checkpoint 时，从该保存点继续。[worker 入口](src/expman/scheduling/_worker.py) · [Experiment](src/expman/core/experiment.py) · [托管阶段执行](src/expman/core/execution.py)
 4. **收集结果。** worker 通过本地 socket 把完成摘要传给后台调度器。调度器记录历史，释放占用，安排下一阶段或重试。成功的叶子留下完成记录，业务指标保存在 SQLite。`expman status ID` 从批次记录中读取各 run 的状态。[进程间通信](src/expman/scheduling/ipc.py) · [结果对象](src/expman/core/experiment.py)
@@ -59,11 +59,11 @@ flowchart LR
 
 CLI 以当前工作目录作为实验项目根目录。如果该目录有 `pyproject.toml`，CLI 在解析命令行参数前应用其中的 `[tool.expman]` 设置。CLI、调度器、资源采样和看板共用一处设置定义，显式命令行参数可以覆盖对应选项。流程模块在导入时可调用 `expman.set(...)` 覆盖当前进程的值。主进程启动独立 worker 时传入生效的设置。恢复时，重试次数和耗时区间覆盖率取自原批次清单，资源与调度参数采用本次会话的设置。[全局设置](src/expman/settings.py) · [命令入口](src/expman/cli/commands.py) · [worker 入口](src/expman/scheduling/_worker.py)
 
-`expman run` 从 `./configs/experiments/<配置名>.yaml` 读取实验配置，解析命名默认参数，展开各个 run 的配置，并校验整个批次共享的设备列表。[配置加载](src/expman/config/loader.py) · [变体展开](src/expman/config/variants.py) · [批次约束](src/expman/config/schema.py)
+`expman run` 按命令行中配置名首次出现的顺序，从 `./configs/experiments/<配置名>.yaml` 逐个读取文件并独立展开。各文件共用本批次的默认文件缓存，展开结果按文件顺序合并。[配置加载](src/expman/config/loader.py) · [变体展开](src/expman/config/variants.py) · [批次约束](src/expman/config/schema.py)
 
-- 展开按 `combines → grid → scan` 嵌套。`combines` 的每项是对基础参数的一份覆盖。`grid` 做各轴的笛卡尔积。`scan` 先取各轴首值组成基准点，再逐轴改变单个参数。配置解析默认值后按首次出现的顺序去重。
-- 映射节点可以写 `defaults: name`。加载器从当前工作目录读取 `./configs/<字段路径>/<name>.yaml`。字典递归合并，显式值优先，数组和 `null` 整体替换。默认文件缺失会告警，同一文件在一次加载中只提示一次。
-- 每份 Batch 配置要求根部的 `seed` 和相同的 `device` 列表。`seed` 是无符号 32 位整数。依赖声明中的 `True` 表示整个子树，映射可细化到字段或序列下标。若训练读取学习率而准备数据只读取数据集，应由两个 Stage 分别声明。漏掉真正使用的配置项可能让缓存复用错误结果。[配置摘要](src/expman/core/dependencies.py)
+- 展开按 `combines → grid → scan` 嵌套。`combines` 的每项是对基础参数的一份覆盖。`grid` 做各轴的笛卡尔积。`scan` 先取各轴首值组成基准点，再逐轴改变单个参数。默认值解析后，整批按完整配置去重，首次出现的位置决定各 run 在清单中的顺序。
+- 映射节点可以写 `defaults: name`。加载器从当前工作目录读取 `./configs/<字段路径>/<name>.yaml`。字典递归合并，显式值优先，数组和 `null` 整体替换。默认文件缺失时，每个批次对同一路径只提示一次。
+- 每份配置要求根部的 `seed`。同批次各配置的 `device` 列表必须具有相同的编号和顺序。`seed` 是无符号 32 位整数。依赖声明中的 `True` 表示整个子树，映射可细化到字段或序列下标。若训练读取学习率而准备数据只读取数据集，应由两个 Stage 分别声明。漏掉真正使用的配置项可能让缓存复用错误结果。[配置摘要](src/expman/core/dependencies.py)
 
 ## 哪些状态保存在哪里
 

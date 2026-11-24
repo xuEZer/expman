@@ -131,6 +131,29 @@ def test_run_creates_a_named_batch_under_the_output_parent(
     assert ensure_ids(parent) == {0: directory}
 
 
+def test_run_combines_files_into_one_batch_in_argument_order(tmp_path, pipeline_module):
+    configs = tmp_path / "configs" / "experiments"
+    configs.mkdir(parents=True)
+    (configs.parent / "common.yaml").write_text("device: [0]\nseed: 0\n")
+    (configs / "baseline.yaml").write_text("defaults: common\ngrid: {seed: [2, 1]}\n")
+    (configs / "ablation.yaml").write_text(
+        "seed: 0\ndevice: [0]\ngrid: {seed: [1, 3]}\n"
+    )
+
+    assert main(["run", "empty", "baseline", "ablation", "baseline"]) == 0
+    ids = ensure_ids(tmp_path / "batches")
+    assert list(ids) == [0]
+    directory = ids[0]
+    name, timestamp = directory.name.rsplit("_", 1)
+    assert name == "empty_baseline_ablation"
+    assert len(timestamp) == 14 and timestamp.isdigit()
+    batch = wait_for_batch(directory)
+    store = BatchStore(directory)
+    assert [store.load_config(run.run_id) for run in batch.runs] == [
+        {"device": [0], "seed": seed} for seed in (2, 1, 3)
+    ]
+
+
 def test_run_requires_a_config_name(tmp_path, pipeline_module, capsys):
     name = write_config(tmp_path)
     for argument in (
@@ -147,12 +170,23 @@ def test_run_requires_a_config_name(tmp_path, pipeline_module, capsys):
 
 
 def test_run_requires_a_yaml_file_in_experiments(tmp_path, pipeline_module, capsys):
+    first = write_config(tmp_path, "first")
     name = write_config(tmp_path)
     config = tmp_path / "configs" / "experiments" / f"{name}.yaml"
     shutil.copyfile(config, tmp_path / "configs" / config.name)
     config.rename(config.with_suffix(".yml"))
-    assert main(["run", f"{pipeline_module}:empty", name]) != 0
+    assert main(["run", f"{pipeline_module}:empty", first, name]) != 0
     assert "configs/experiments/baseline.yaml" in capsys.readouterr().err
+    assert not (tmp_path / "batches").exists()
+
+
+def test_run_requires_the_same_devices_across_files(tmp_path, pipeline_module, capsys):
+    first = write_config(tmp_path)
+    (tmp_path / "configs" / "experiments" / "other.yaml").write_text(
+        "device: [1]\nseed: 0\n"
+    )
+    assert main(["run", "empty", first, "other"]) != 0
+    assert "device must be the same for every experiment" in capsys.readouterr().err
     assert not (tmp_path / "batches").exists()
 
 

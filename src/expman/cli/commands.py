@@ -2,7 +2,7 @@
 
 The CLI resolves a bare pipeline name in the configured ``pipeline_module``
 (built-in default ``src.pipeline``) or accepts an explicit ``module:attr``.
-The run command reads ``./configs/experiments/<config>.yaml`` for the given config name.
+The run command combines one or more YAMLs from ``./configs/experiments/`` into one batch.
 The run and resume commands return once the background batch has started.
 The batch manifest records the resolved ``module:attr`` for
 ``expman resume``. Each batches directory (default ``./batches/``) has its own
@@ -105,13 +105,14 @@ def _timing(report: RecordedBatch) -> tuple[str, str]:
 def _cmd_run(args: argparse.Namespace) -> tuple[int, _Batch]:
     spec, pipeline = _resolve_pipeline(args.pipeline, settings.pipeline_module)
     attr = spec.rpartition(":")[2]
-    stem = args.config.stem
+    config_files = list(dict.fromkeys(args.configs))
+    config_names = "_".join(path.stem for path in config_files)
     timestamp = strftime("%Y%m%d%H%M%S")
     parent = args.batches_dir if args.batches_dir is not None else settings.batches_dir
-    directory = parent / f"{attr}_{stem}_{timestamp}"
+    directory = parent / f"{attr}_{config_names}_{timestamp}"
     batch = _Batch.create(
         pipeline,
-        _load_configs(args.config),
+        _load_configs(*config_files),
         output_dir=directory,
         pipeline_spec=spec,
     )
@@ -242,10 +243,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"pipeline attribute or 'module:attr' (default module: {settings.pipeline_module})",
     )
     run.add_argument(
-        "config",
+        "configs",
         type=_experiment_yaml,
+        nargs="+",
         metavar="CONFIG",
-        help=f"experiment name, e.g. baseline for ./{EXPERIMENT_CONFIGS_DIR}/baseline.yaml",
+        help=f"one or more experiment names under ./{EXPERIMENT_CONFIGS_DIR}/, without .yaml",
     )
     resume = commands.add_parser("resume", help="resume a batch in the background")
     resume.add_argument("ID", type=int, help="batch ID from expman status")

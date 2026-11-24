@@ -93,17 +93,19 @@ def recorded_totals(directory, batch):
 def test_cuda_batch_reuses_prefix_and_recovers_checkpoint(
     tmp_path, cli_env, gpu_device
 ):
-    config = tmp_path / "configs" / "experiments" / "experiment.yaml"
-    config.parent.mkdir(parents=True)
-    config.write_text(
-        f"device: [{gpu_device}]\nseed: 42\nfactor: 2\ngrid:\n  factor: [2, 3]\n"
-    )
+    configs = tmp_path / "configs" / "experiments"
+    configs.mkdir(parents=True)
+    for factor in (2, 3):
+        (configs / f"scale{factor}.yaml").write_text(
+            f"device: [{gpu_device}]\nseed: 42\nfactor: {factor}\n"
+        )
     subprocess.run(
         [
             *CLI,
             "run",
             f"{__name__}:cuda_pipeline",
-            config.stem,
+            "scale2",
+            "scale3",
             "--batches-dir",
             str(tmp_path),
         ],

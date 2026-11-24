@@ -1,7 +1,7 @@
 """Expand combines, grid and scan in order, then deduplicate resolved configurations."""
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from copy import copy, deepcopy
 from itertools import product
 from typing import Any
@@ -121,7 +121,7 @@ def _scan_variants(document: dict, tree: dict) -> list[dict]:
     return variants
 
 
-def deduplicate(variants: list[dict]) -> list[dict]:
+def deduplicate(variants: Iterable[dict]) -> list[dict]:
     """Drop the configurations that repeat one already produced."""
     unique: list[dict] = []
     seen: set[str] = set()

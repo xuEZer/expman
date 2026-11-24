@@ -346,19 +346,23 @@ def test_defaults_use_working_directory_and_field_keys(root):
     assert _load_configs(str(path)) == [{"items": [{"value": 42}]}]
 
 
-def test_missing_defaults_warn_once_per_file_and_preserve_explicit(root, load):
+def test_missing_defaults_warn_once_across_files_and_preserve_explicit(root):
+    first = write(
+        root,
+        "first.yaml",
+        "seed: 0\nmodel: {defaults: missing, width: 32}\ngrid: {seed: [0, 1, 2]}\n",
+    )
+    second = write(
+        root, "second.yaml", "seed: 3\nmodel: {defaults: missing, width: 32}\n"
+    )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        runs = load("""
-seed: 0
-model: {defaults: missing, width: 32}
-grid:
-  seed: [0, 1, 2]
-""")
+        runs = _load_configs(first, second)
     assert len(caught) == 1
     assert caught[0].category is MissingConfigWarning
     assert str(root / "configs/model/missing.yaml") in str(caught[0].message)
     assert "$.model.defaults" in str(caught[0].message)
+    assert [run["seed"] for run in runs] == [0, 1, 2, 3]
     assert all(run["model"] == {"width": 32} for run in runs)
 
 

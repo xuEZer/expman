@@ -1,6 +1,7 @@
-"""Read experiment YAML, resolve named defaults and expand the run list."""
+"""Resolve named defaults and expand experiment YAML files into one run list."""
 
 import warnings
+from collections.abc import Iterator
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -89,12 +90,13 @@ def _read_yaml(path: Path, *, allow_control: bool) -> dict[str, Any]:
 
 
 class _Defaults:
-    def __init__(self, experiment: Path) -> None:
+    def __init__(
+        self, experiment: Path, cache: dict[Path, dict[str, Any] | None]
+    ) -> None:
         self.experiment = experiment
         self.root = CONFIGS_DIR.resolve()
-        # A cached entry is what _read_yaml returned, or None when the file is
-        # missing.
-        self.cache: dict[Path, dict[str, Any] | None] = {}
+        # All experiments in a batch share defaults. None records a missing file.
+        self.cache = cache
 
     def resolve(
         self,
@@ -169,8 +171,9 @@ class _Defaults:
         return self.cache[target], target
 
 
-def _load_configs(path: str | Path) -> list[dict[str, Any]]:
-    """Resolve defaults and expand an experiment YAML into distinct run configs."""
+def _expand_experiment(
+    path: str | Path, defaults_cache: dict[Path, dict[str, Any] | None]
+) -> Iterator[dict[str, Any]]:
     experiment = Path(path).expanduser().resolve()
     try:
         document = _read_yaml(experiment, allow_control=True)
@@ -185,12 +188,22 @@ def _load_configs(path: str | Path) -> list[dict[str, Any]]:
         if key in document and not isinstance(document[key], expected):
             raise ConfigError(f"{experiment}: {key} must be {description}")
 
-    defaults = _Defaults(experiment)
+    defaults = _Defaults(experiment, defaults_cache)
     combines = document.pop(COMBINES_KEY, None)
     grid = document.pop(GRID_KEY, None)
     scan = document.pop(SCAN_KEY, None)
-    variants = expand(document, combines, grid, scan, defaults.resolve)
-    configs = [defaults.resolve(variant) for variant in variants]
+    for variant in expand(document, combines, grid, scan, defaults.resolve):
+        yield defaults.resolve(variant)
+
+
+def _load_configs(path: str | Path, *more_paths: str | Path) -> list[dict[str, Any]]:
+    """Expand each experiment independently and keep the first occurrence of each config."""
+    defaults_cache: dict[Path, dict[str, Any] | None] = {}
+    configs = deduplicate(
+        config
+        for source in (path, *more_paths)
+        for config in _expand_experiment(source, defaults_cache)
+    )
     if any("device" in cfg for cfg in configs):
         configured_devices(configs)
-    return deduplicate(configs)
+    return configs

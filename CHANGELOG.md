@@ -8,7 +8,7 @@
 - 实验 YAML 的目录从 `configs/` 改为 `configs/experiments/`。从实验项目根目录执行 `expman run train baseline` 会读取 `configs/experiments/baseline.yaml`，命令中只需写配置名。YAML 的 `defaults` 按字段路径从 `./configs/` 读取，各条 CLI 命令的项目设置只读取 `./pyproject.toml` 中的 `[tool.expman]`。
 - 非空 `Pipeline` 在构造时检查最后一个 Stage 的 `process()` 定义。叶子须为同步普通方法，只允许自然结束、`return` 和 `return None`。该约束也适用于独立和嵌套的 Pipeline。批次中的标量结果可通过 `ctx.log_metrics()` 保存，模型等产物由实验代码显式写入。尝试和实验结果移除按需读取最终返回值的 `output` 属性。
 - 移除 Python 的 `Batch(pipeline, cfg)` 和 `Batch.resume(...)` 接口。批次统一通过 `expman run train config` 创建并运行，通过 `expman resume ID` 恢复。缺少流程位置的批次无法通过 CLI 恢复。
-- 批次默认父目录由 `./runs/` 改为 `./batches/`。CLI 各子命令统一使用 `--batches-dir` 指定父目录，移除 `run` 的 `-o` / `--output-dir` 和 `web` 的 `--root`。CLI 新建批次时使用 `<pipeline-attr>_<config-stem>_<YYYYMMDDHHMMSS>` 命名子目录，并打印批次 ID 和目录。时间戳采用本地时间，精确到秒，目录重名时命令报错退出。
+- 批次默认父目录由 `./runs/` 改为 `./batches/`。CLI 各子命令统一使用 `--batches-dir` 指定父目录，移除 `run` 的 `-o` / `--output-dir` 和 `web` 的 `--root`。CLI 以单个配置名新建批次时使用 `<pipeline-attr>_<config-stem>_<YYYYMMDDHHMMSS>` 命名子目录，并打印批次 ID 和目录。时间戳采用本地时间，精确到秒，目录重名时命令报错退出。
 - `status`、`resume` 和 `stop` 的位置参数改为所选父目录中的整数批次 ID。`status` 省略 ID 时显示总览，指定 ID 时显示单批次详情。两种视图默认每两秒刷新一次，按 Ctrl+C 退出查看。批次清单读取失败时，命令报错并退出。`resume` 和 `stop` 要求提供 ID。
 - `run` 和 `resume` 默认在后台执行批次，移除 `--progress` 选项。启动成功后命令打印批次 ID 和目录，以 0 退出。启动失败时返回非零退出码。各 run 的最终状态可通过 `expman status ID` 或 Web 看板查看，后台调度器的输出写入批次目录下的 `batch.log`。
 - 移除 `expman web --read-only` 和 Python 看板服务的 `allow_stop` 参数。所有看板均允许访问者请求停止运行中的批次，`GET /api/health` 的响应也移除了 `stop` 字段。
@@ -18,6 +18,7 @@
 
 ### Added
 
+- `expman run train baseline ablation` 支持将多份实验 YAML 合为一个批次。各文件按输入顺序独立展开，解析默认值后相同配置只运行一次。批次目录名按首次出现的顺序列出所有不同的配置名，如 `train_baseline_ablation_20261124103000`。
 - 批次详情页新增“自动绘图”选项卡。横轴可选配置字段、指标或已有记录的 step，纵轴可多选随横轴变化的指标。按配置取值筛选后，可查看单次训练的曲线，或比较多次训练的均值和样本标准差误差棒。
 - 批次详情页新增“运行情况”和“实验结果”选项卡。结果表列出全部展开配置，按配置显示每个指标最大 step 对应的数值，在展示值新增或改变时按单变量对照更新列顺序，并合并相邻同值单元格。
 - 运行参数集中在 `src/expman/settings.py`。各条 CLI 命令可以共用项目 `pyproject.toml` 的 `[tool.expman]` 配置，Python 调用者可以用 `expman.set(...)` 和 `expman.get(key)` 覆盖或读取当前进程的设置。支持设置批次目录、看板端口、刷新间隔、资源预算和 worker 环境。
