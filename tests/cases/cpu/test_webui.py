@@ -13,8 +13,8 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-import batch_helpers
 import pytest
+from helpers import batches
 
 from expman import Pipeline, Stage, Status, devices
 from expman.cli import main
@@ -25,8 +25,8 @@ from expman.observation.archive import read_batch
 from expman.observation.live import LIVE_FILE, LivePublisher, live_enabled
 from expman.observation.registry import ensure_ids
 from expman.observation.snapshot import SCHEMA, build_snapshot, stage_samples
-from expman.process_control import STOP_FIFO, stop_on_sigterm
 from expman.resources.devices import DeviceMemory, HostMemory
+from expman.scheduling.control import STOP_FIFO, stop_on_sigterm
 from expman.scheduling.parallel_estimation import estimate_parallel
 from expman.scheduling.scheduler import GpuScheduler, Worker
 from expman.settings import settings
@@ -82,7 +82,7 @@ def make_batch(root, *, count=2):
     path.write_text(
         f"device: [0]\nseed: 0\nitem: 0\ngrid:\n  item: {list(range(count))}\n"
     )
-    return batch_helpers.make_batch(Pipeline([Work]), path, output_dir=root / "batch")
+    return batches.make_batch(Pipeline([Work]), path, output_dir=root / "batch")
 
 
 def seed_finished_first(batch, *, duration=2.0):
@@ -1087,7 +1087,7 @@ class TestDashboard:
 def test_web_command_passes_project_defaults_and_cli_overrides(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "pyproject.toml").write_text("[tool.expman]\nweb_port = 9301\n")
-    with patch("expman.cli.serve") as serve_dashboard:
+    with patch("expman.cli.commands.serve") as serve_dashboard:
         assert main(["web"]) == 0
         serve_dashboard.assert_called_with(Path("batches"), host="127.0.0.1", port=9301)
         assert main(["web", "--port", "0", "--batches-dir", "results"]) == 0
@@ -1103,7 +1103,7 @@ def test_nested_progress_flows_from_worker_ipc_to_snapshot(tmp_path):
 
     config = tmp_path / "nested.yaml"
     config.write_text("device: [0]\nseed: 0\nitem: 0\n")
-    batch = batch_helpers.make_batch(
+    batch = batches.make_batch(
         Pipeline([Work, Work]), config, output_dir=tmp_path / "batch"
     )
     scheduler = GpuScheduler(batch)

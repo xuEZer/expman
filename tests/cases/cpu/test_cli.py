@@ -2,19 +2,22 @@
 
 import os
 import shutil
-import signal
 import subprocess
 import sys
 from datetime import datetime
 
 import pytest
+from helpers.batches import wait_for_batch
 
 import expman
-from expman import cli
-from expman.cli import main
+from expman.cli import _background, commands, main
 from expman.observation.registry import ensure_ids
-from expman.process_control import STOP_FIFO, is_running, request_stop, stop_on_sigterm
-from expman.scheduling.batch import _Batch
+from expman.scheduling.control import (
+    STOP_FIFO,
+    is_running,
+    request_stop,
+    stop_on_sigterm,
+)
 from expman.storage.base import run_lock
 from expman.storage.batch import BatchStore
 
@@ -68,11 +71,13 @@ def prepare_batch_only(monkeypatch):
     """Let CLI commands persist a real batch without starting its worker processes."""
     prepared = []
 
-    def capture(batch, **options):
+    def capture(argv):
+        args = commands.build_parser().parse_args(argv)
+        _, batch = args.handler(args)
         prepared.append(batch)
         return 0
 
-    monkeypatch.setattr(cli, "_execute", capture)
+    monkeypatch.setattr(_background, "launch_background", capture)
     return prepared
 
 
@@ -109,7 +114,7 @@ def create_cli_batch(tmp_path, pipeline_module, prepare_batch_only):
 def test_run_creates_a_named_batch_under_the_output_parent(
     tmp_path, pipeline_module, prepare_batch_only, monkeypatch
 ):
-    monkeypatch.setattr(cli, "strftime", datetime(2026, 1, 2, 3, 4, 5).strftime)
+    monkeypatch.setattr(commands, "strftime", datetime(2026, 1, 2, 3, 4, 5).strftime)
     config = write_config(tmp_path, "experiment.large")
     (tmp_path / "configs" / f"{config}.yaml").write_text("invalid: config root copy")
     command = ["run", f"{pipeline_module}:train", config]
@@ -141,13 +146,14 @@ def test_run_requires_a_config_name(tmp_path, pipeline_module, capsys):
     assert not (tmp_path / "batches").exists()
 
 
-def test_run_requires_a_yaml_file_in_experiments(tmp_path, pipeline_module):
+def test_run_requires_a_yaml_file_in_experiments(tmp_path, pipeline_module, capsys):
     name = write_config(tmp_path)
     config = tmp_path / "configs" / "experiments" / f"{name}.yaml"
     shutil.copyfile(config, tmp_path / "configs" / config.name)
     config.rename(config.with_suffix(".yml"))
-    with pytest.raises(expman.ConfigError, match=r"configs/experiments/baseline\.yaml"):
-        main(["run", f"{pipeline_module}:empty", name])
+    assert main(["run", f"{pipeline_module}:empty", name]) != 0
+    assert "configs/experiments/baseline.yaml" in capsys.readouterr().err
+    assert not (tmp_path / "batches").exists()
 
 
 def test_run_rejects_a_config_symlink_outside_experiments(
@@ -216,7 +222,7 @@ def test_project_defaults_apply_across_cli_processes_and_explicit_arguments_win(
         '[tool.expman]\npipeline_module = "workflows"\nbatches_dir = "project-batches"\n'
     )
     (tmp_path / "workflows.py").write_text(
-        "from expman import Pipeline\ntrain = Pipeline([])\n"
+        "from expman import Pipeline\nprint('loading train')\ntrain = Pipeline([])\n"
     )
     cli = [sys.executable, "-m", "expman"]
     for options, parent in [
@@ -228,21 +234,28 @@ def test_project_defaults_apply_across_cli_processes_and_explicit_arguments_win(
         )
         directory = ensure_ids(tmp_path / parent)[0]
         store = BatchStore(directory)
-        assert "Batch ID: 0" in stdout and f"Batch directory: {directory}" in stdout
-        assert ": succeeded" in stdout
+        assert stdout.splitlines() == ["Batch ID: 0", f"Batch directory: {directory}"]
+        assert [run.state for run in wait_for_batch(directory).runs] == ["succeeded"]
+        assert (directory / "batch.log").read_text().splitlines().count(
+            "loading train"
+        ) == 1
         assert store.read_manifest()["pipeline_spec"] == "workflows:train"
 
     project.write_text(project.read_text().replace('"workflows"', '"different"'))
     store = BatchStore(ensure_ids(tmp_path / "project-batches")[0])
     experiments = store.read_manifest()["experiments"]
     stdout = subprocess.check_output([*cli, "resume", "0"], cwd=tmp_path, text=True)
-    assert f"{experiments[0]['run_id']}: succeeded" in stdout
+    assert "Batch ID: 0" in stdout
+    assert [run.state for run in wait_for_batch(store.directory).runs] == ["succeeded"]
+    assert (store.directory / "batch.log").read_text().splitlines().count(
+        "loading train"
+    ) == 2
     assert store.read_manifest()["experiments"] == experiments
 
 
 @pytest.mark.simulated_gpu
-def test_run_and_resume_report_terminal_failure_to_the_shell(
-    tmp_path, pipeline_module, capsys
+def test_background_run_records_stage_failure_after_successful_launch(
+    tmp_path, pipeline_module
 ):
     (tmp_path / "pyproject.toml").write_text("[tool.expman]\nretries = 0\n")
     config = write_config(tmp_path, "failing", fail=True)
@@ -256,23 +269,21 @@ def test_run_and_resume_report_terminal_failure_to_the_shell(
                 str(tmp_path),
             ]
         )
-        == 1
+        == 0
     )
-    assert ": failed" in capsys.readouterr().out
-    assert main(["resume", "0", "--batches-dir", str(tmp_path)]) == 1
-    assert ": failed" in capsys.readouterr().out
+    directory = ensure_ids(tmp_path)[0]
+    assert [run.state for run in wait_for_batch(directory).runs] == ["failed"]
+    assert main(["resume", "0", "--batches-dir", str(tmp_path)]) == 0
+    assert [run.state for run in wait_for_batch(directory).runs] == ["failed"]
 
 
 def test_competing_cli_resume_preserves_the_owners_stop_channel(
-    tmp_path, monkeypatch, pipeline_module
+    tmp_path, create_cli_batch
 ):
-    previous_handler = signal.getsignal(signal.SIGTERM)
-
-    def attempt_resume(batch):
-        output = batch.output_dir
+    output = create_cli_batch("owned", tmp_path)
+    with run_lock(output), stop_on_sigterm(output):
         endpoint = output / STOP_FIFO
         inode = endpoint.stat().st_ino
-        assert is_running(output)
         challenger = subprocess.run(
             [
                 sys.executable,
@@ -292,22 +303,6 @@ def test_competing_cli_resume_preserves_the_owners_stop_channel(
         assert "already running" in challenger.stderr
         assert endpoint.stat().st_ino == inode and is_running(output)
 
-    monkeypatch.setattr(_Batch, "_start_live", attempt_resume)
-    assert (
-        main(
-            [
-                "run",
-                f"{pipeline_module}:empty",
-                write_config(tmp_path),
-                "--batches-dir",
-                str(tmp_path),
-            ]
-        )
-        == 0
-    )
-    assert not (ensure_ids(tmp_path)[0] / STOP_FIFO).exists()
-    assert signal.getsignal(signal.SIGTERM) == previous_handler
-
 
 @pytest.fixture
 def watch_status(monkeypatch, capsys):
@@ -322,7 +317,7 @@ def watch_status(monkeypatch, capsys):
             if after_first_frame is not None:
                 after_first_frame()
 
-        monkeypatch.setattr(cli, "sleep", on_refresh)
+        monkeypatch.setattr(commands, "sleep", on_refresh)
         capsys.readouterr()
         assert main(["status", *args]) == 0
         assert len(frames) == 2
@@ -482,7 +477,9 @@ def test_an_old_stop_writer_cannot_interrupt_the_next_execution(tmp_path):
         os.close(fd)
 
 
-def test_resolution_rejects_malformed_and_mistyped_specs(pipeline_module):
+def test_resolution_rejects_malformed_and_mistyped_specs(
+    pipeline_module, prepare_batch_only
+):
     for malformed in (":train", f"{pipeline_module}:"):
         with pytest.raises(SystemExit, match="module:attr"):
             main(["run", malformed, "unused"])

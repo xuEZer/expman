@@ -10,7 +10,7 @@
 - 移除 Python 的 `Batch(pipeline, cfg)` 和 `Batch.resume(...)` 接口。批次统一通过 `expman run train config` 创建并运行，通过 `expman resume ID` 恢复。缺少流程位置的批次无法通过 CLI 恢复。
 - 批次默认父目录由 `./runs/` 改为 `./batches/`。CLI 各子命令统一使用 `--batches-dir` 指定父目录，移除 `run` 的 `-o` / `--output-dir` 和 `web` 的 `--root`。CLI 新建批次时使用 `<pipeline-attr>_<config-stem>_<YYYYMMDDHHMMSS>` 命名子目录，并打印批次 ID 和目录。时间戳采用本地时间，精确到秒，目录重名时命令报错退出。
 - `status`、`resume` 和 `stop` 的位置参数改为所选父目录中的整数批次 ID。`status` 省略 ID 时显示总览，指定 ID 时显示单批次详情。两种视图默认每两秒刷新一次，按 Ctrl+C 退出查看。批次清单读取失败时，命令报错并退出。`resume` 和 `stop` 要求提供 ID。
-- 移除 `run` 和 `resume` 的 `--progress` 选项。运行期间可在另一终端用 `expman status` 或 Web 看板查看状态。
+- `run` 和 `resume` 默认在后台执行批次，移除 `--progress` 选项。启动成功后命令打印批次 ID 和目录，以 0 退出。启动失败时返回非零退出码。各 run 的最终状态可通过 `expman status ID` 或 Web 看板查看，后台调度器的输出写入批次目录下的 `batch.log`。
 - 移除 `expman web --read-only` 和 Python 看板服务的 `allow_stop` 参数。所有看板均允许访问者请求停止运行中的批次，`GET /api/health` 的响应也移除了 `stop` 字段。
 - 批次清单 `batch.pkl` 使用 v2 格式。旧批次如需续跑，请使用创建它的代码环境。用当前代码从头运行时，`expman run` 会创建按时间戳命名的新批次目录。
 - `expman run module:attr config` 要求该属性是 `Pipeline` 实例。原先导出阶段列表或零参工厂的模块，可分别写成 `train = Pipeline(stages)` 或 `train = make_pipeline()`，再用 `expman run module:train config` 启动。
@@ -78,7 +78,6 @@
 
 ### Fixed
 
-- CLI 的 `run` 和 `resume` 在批次有最终失败的 run 时返回退出码 1，同时打印各 run 的结果。
 - 条件依赖按每个阶段声明的完整路径和值进行分组、共享快照和恢复断点，避免不同实验得到同一份错误结果。配置轴展开保持 YAML 别名独立，默认参数逐层合并后校验设备列表。
 - 混合容量 GPU 按各卡显存安排任务，因 cgroup 硬上限终止的 worker 按核验到的限额重新估价。ETA 会在任务完成后清零剩余组数，并在资源采样失败时暂停使用空闲槽位。
 - 看板按最近可用的批次记录显示运行状态、历史组数和内存预算，时间区间的舍入与 CLI 一致。

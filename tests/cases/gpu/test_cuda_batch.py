@@ -1,7 +1,6 @@
 """End-to-end CLI tests on a reserved physical CUDA/MPS device."""
 
 import os
-import shlex
 import sqlite3
 import subprocess
 import sys
@@ -9,10 +8,11 @@ from pathlib import Path
 from time import monotonic, sleep
 
 import pytest
+from helpers.batches import wait_for_batch
 
 from expman import Pipeline, Stage
 from expman.observation.registry import ensure_ids
-from expman.observation.status import RecordedBatch
+from expman.scheduling.control import is_running, request_stop
 
 
 class SumSquares(Stage):
@@ -50,13 +50,19 @@ class PauseAfterCheckpoint(Stage):
     def process(self, data, ctx):
         import torch
 
+        checkpoint = Path(ctx.cfg["ready"])
         total = data if ctx.checkpoint_state is None else ctx.checkpoint_state
         for step in ctx.resume_range(0, 2):
             total += torch.tensor(step + 10, device="cuda").item()
             ctx.checkpoint(step + 1, total)
             if step == 0:
-                Path(ctx.cfg["ready"]).touch()
+                checkpoint.touch()
                 sleep(120)
+        deadline = monotonic() + 60
+        while not checkpoint.with_suffix(".release").exists():
+            if monotonic() >= deadline:
+                raise TimeoutError("the resumed CLI did not release the stage")
+            sleep(0.1)
         ctx.log_metrics({"total": total})
 
 
@@ -104,10 +110,11 @@ def test_cuda_batch_reuses_prefix_and_recovers_checkpoint(
         cwd=tmp_path,
         env=cli_env,
         check=True,
-        timeout=150,
+        capture_output=True,
+        timeout=30,
     )
     directory = ensure_ids(tmp_path)[0]
-    batch = RecordedBatch.read(directory)
+    batch = wait_for_batch(directory, timeout=150)
     assert [run.state for run in batch.runs] == ["succeeded", "succeeded"]
     expected = [sum(i * i for i in range(256)) * factor for factor in (2, 3)]
     assert recorded_totals(directory, batch) == expected
@@ -141,23 +148,37 @@ def test_stop_and_resume_from_a_committed_cuda_checkpoint(
     config.write_text(f"device: [{gpu_device}]\nseed: 42\nready: {ready}\n")
     parent = tmp_path / "training batches"
     where = {"cwd": tmp_path, "env": cli_env}
-    owner = subprocess.Popen(
-        [
-            *CLI,
-            "run",
-            f"{__name__}:pause_pipeline",
-            config.stem,
-            "--batches-dir",
-            str(parent),
-        ],
-        stderr=subprocess.PIPE,
-        text=True,
-        **where,
-    )
+    # Give the launcher a real controlling terminal, then disconnect it
+    # before waiting for the training stage to publish its checkpoint.
+    master, slave = os.openpty()
+    with os.fdopen(master, "rb"), os.fdopen(slave, "rb") as terminal:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import fcntl, os, sys, termios; "
+                "fcntl.ioctl(0, termios.TIOCSCTTY, 0); "
+                "os.execv(sys.executable, sys.argv[1:])",
+                *CLI,
+                "run",
+                f"{__name__}:pause_pipeline",
+                config.stem,
+                "--batches-dir",
+                str(parent),
+            ],
+            **where,
+            stdin=terminal,
+            stdout=terminal,
+            stderr=terminal,
+            start_new_session=True,
+            check=True,
+            timeout=30,
+        )
+    directory = ensure_ids(parent)[0]
     try:
         deadline = monotonic() + 60
         while not ready.exists():
-            assert owner.poll() is None, "the batch exited before its checkpoint"
+            assert is_running(directory), "the batch exited before its checkpoint"
             assert monotonic() < deadline, "the worker did not publish a checkpoint"
             sleep(0.1)
         subprocess.run(
@@ -166,27 +187,28 @@ def test_stop_and_resume_from_a_committed_cuda_checkpoint(
             check=True,
             timeout=15,
         )
-        _, stderr = owner.communicate(timeout=30)
-        assert owner.returncode == 143
+        wait_for_batch(directory)
     finally:
-        if owner.poll() is None:
-            owner.kill()
-            owner.wait(timeout=10)
+        if is_running(directory):
+            request_stop(directory)
+            wait_for_batch(directory)
 
-    hint = next(
-        line
-        for line in stderr.splitlines()
-        if line.startswith("Stopped; resume with: ")
-    )
-    resume = shlex.split(hint.removeprefix("Stopped; resume with: "))
-    assert resume == ["expman", "resume", "0", "--batches-dir", str(parent)]
-    directory = ensure_ids(parent)[0]
     cache = directory / "cache"
     assert not list(cache.glob("*/root/*/*.pkl"))
     assert len(list(cache.rglob("snapshot.pkl"))) == 1
 
-    subprocess.run([*CLI, *resume[1:]], **where, check=True, timeout=90)
-    batch = RecordedBatch.read(directory)
+    try:
+        subprocess.run(
+            [*CLI, "resume", "0", "--batches-dir", str(parent)],
+            **where,
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert is_running(directory)
+    finally:
+        ready.with_suffix(".release").touch()
+    batch = wait_for_batch(directory, timeout=90)
     (run,) = batch.runs
     assert [attempt["status"] for attempt in run.attempts] == ["cancelled", "succeeded"]
     assert recorded_totals(directory, batch) == [

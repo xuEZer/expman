@@ -8,9 +8,9 @@ from pathlib import Path
 from time import monotonic, perf_counter, sleep
 from unittest.mock import Mock, patch
 
-import batch_helpers
 import pytest
 import yaml
+from helpers import batches
 
 from expman import ConfigError, Pipeline, Stage, Status, devices, environment
 from expman.core.context import RunContext
@@ -192,9 +192,7 @@ def make_batch(root, *, count=3, devices=None, **options):
     }
     path = root / "experiments.yaml"
     path.write_text(yaml.safe_dump(cfg) + f"grid:\n  item: {list(range(count))}\n")
-    return batch_helpers.make_batch(
-        Pipeline([GpuWork]), path, output_dir=root / "batch"
-    )
+    return batches.make_batch(Pipeline([GpuWork]), path, output_dir=root / "batch")
 
 
 def warm(batch, *, gpu_process_peak_kb=1024, peak_kb=4096):
@@ -317,7 +315,7 @@ class TestGpuScheduling:
             scheduler._finish(run.run_id)
             assert not batch.store.read_manifest()["active_gpu"]
 
-        resumed = batch_helpers.restore_batch(batch.pipeline, batch.output_dir)
+        resumed = batches.restore_batch(batch.pipeline, batch.output_dir)
         assert list(resumed.state.queue) == [run.run_id]
         assert resumed.state.next_attempt(run.run_id, 0) == 3
         assert resumed.results[0].status is (
@@ -345,7 +343,7 @@ class TestGpuScheduling:
         try:
             stage = import_module(module_name).ReadSettings
             pipeline = Pipeline([stage])
-            batch = batch_helpers.make_batch(
+            batch = batches.make_batch(
                 pipeline,
                 {"device": [0], "seed": 0, "marker": str(tmp_path / "settings")},
                 output_dir=tmp_path / "batch",
@@ -354,7 +352,7 @@ class TestGpuScheduling:
             # keeps the retry count it recorded when it was created.
             monkeypatch.setattr(settings, "query_timeout", 5.0)
             monkeypatch.setattr(settings, "retries", 0)
-            resumed = batch_helpers.restore_batch(pipeline, batch.output_dir)
+            resumed = batches.restore_batch(pipeline, batch.output_dir)
             (result,) = resumed.run()
             assert result.status is Status.SUCCEEDED
             assert (tmp_path / "settings").read_text() == "(5.0, 4)"
@@ -410,7 +408,7 @@ class TestGpuScheduling:
             (item.run_id, step, step) for item in results for step in (0, 1)
         )
         assert batch.recorder.events
-        resumed = batch_helpers.restore_batch(Pipeline([GpuWork]), batch.output_dir)
+        resumed = batches.restore_batch(Pipeline([GpuWork]), batch.output_dir)
         assert resumed.run() == results
         assert resumed.devices == (0, 1)
         assert GpuScheduler(resumed).peaks.ceiling_kb > 0
@@ -422,7 +420,7 @@ class TestGpuScheduling:
             f"device: [0]\nseed: 0\nmarkers: {tmp_path}\noffset: 10\nitem: 1\n"
             "grid:\n  item: [1, 2]\n"
         )
-        batch = batch_helpers.make_batch(
+        batch = batches.make_batch(
             Pipeline([Prepare, Consume]), path, output_dir=tmp_path / "two-stages"
         )
 
@@ -466,7 +464,7 @@ class TestGpuScheduling:
             f"device: [0]\nseed: 0\nmarkers: {tmp_path}\nitem: 2\noffset: 3\n"
             "grid:\n  offset: [3, invalid]\n"
         )
-        batch = batch_helpers.make_batch(
+        batch = batches.make_batch(
             Pipeline([Prepare, Consume]), path, output_dir=tmp_path / "batch"
         )
 
@@ -484,7 +482,7 @@ class TestGpuScheduling:
     def test_resume_finishes_cache_cleanup_after_the_last_success(self, tmp_path):
         pipeline = Pipeline([Prepare, Consume])
         directory = tmp_path / "batch"
-        batch = batch_helpers.make_batch(
+        batch = batches.make_batch(
             pipeline,
             {
                 "device": [0],
@@ -507,7 +505,7 @@ class TestGpuScheduling:
         orphan = saved.parent.with_name("f" * 32)
         orphan.mkdir()
         (orphan / "snapshot.pkl").write_bytes(b"unpublished snapshot")
-        resumed = batch_helpers.restore_batch(pipeline, directory)
+        resumed = batches.restore_batch(pipeline, directory)
         assert not resumed.state.queue and not resumed.state.active_gpu
         assert resumed.results[0].status is Status.SUCCEEDED
         with patch.object(GpuScheduler, "_launch") as launch:
@@ -609,7 +607,7 @@ class TestGpuScheduling:
             f"device: [0]\nseed: 0\nmarkers: {tmp_path}\noffset: 0\nunused: 1\n"
             "grid:\n  unused: [1, 2, 3]\n"
         )
-        batch = batch_helpers.make_batch(
+        batch = batches.make_batch(
             Pipeline([SharedWork, Consume]), path, output_dir=tmp_path / "groups"
         )
         scheduler = GpuScheduler(batch)
@@ -648,7 +646,7 @@ class TestGpuScheduling:
             "grid:\n"
             "  Baseline: [B1, B2]\n  predictor: [p1, p2]\n"
         )
-        batch = batch_helpers.make_batch(
+        batch = batches.make_batch(
             Pipeline([ConditionalWork]), path, output_dir=tmp_path / "conditional"
         )
         scheduler = GpuScheduler(batch)
@@ -682,7 +680,7 @@ class TestGpuScheduling:
         path.write_text(
             "device: [0]\nseed: 0\nleft: 1\nright: 2\nwhich: left\ngrid:\n  which: [left, right]\n"
         )
-        batch = batch_helpers.make_batch(
+        batch = batches.make_batch(
             Pipeline([Select, Combine]), path, output_dir=tmp_path / "batch"
         )
         scheduler = GpuScheduler(batch)
@@ -886,7 +884,7 @@ class TestGpuScheduling:
             "crash: false\nwait_for_release: false\ndelay: 0\n"
             "item: 0\ngrid:\n  item: [0, 1, 2, 3, 4, 5, 6, 7]\n"
         )
-        batch = batch_helpers.make_batch(
+        batch = batches.make_batch(
             Pipeline([GpuWork, GpuWork]), path, output_dir=tmp_path / "plan"
         )
         for experiment in batch.experiments[4:]:
@@ -920,7 +918,7 @@ class TestGpuScheduling:
             "combines: [{unused: 1}, {unused: 2}, {offset: 2}]\n"
         )
         pipeline = Pipeline([SharedWork, Consume])
-        batch = batch_helpers.make_batch(pipeline, path, output_dir=output_dir)
+        batch = batches.make_batch(pipeline, path, output_dir=output_dir)
         seeded = Experiment(
             pipeline,
             {"seed": 0},
@@ -990,7 +988,7 @@ class TestGpuScheduling:
             pid = int((tmp_path / f"{result.run_id}.started").read_text())
             with pytest.raises(ProcessLookupError):
                 os.kill(pid, 0)
-        resumed = batch_helpers.restore_batch(Pipeline([GpuWork]), batch.output_dir)
+        resumed = batches.restore_batch(Pipeline([GpuWork]), batch.output_dir)
         results = resumed.run()
         assert all(item.status is Status.SUCCEEDED for item in results)
         # The state attribute comes from the checkpoint, not a re-executed loop.
@@ -1033,7 +1031,7 @@ class TestGpuScheduling:
 
     @pytest.mark.simulated_gpu
     def test_cuda_oom_takes_priority_over_nearby_host_threshold(self, tmp_path):
-        batch = batch_helpers.make_batch(
+        batch = batches.make_batch(
             Pipeline([CudaOomOnce]),
             {"device": [0], "seed": 0},
             output_dir=tmp_path / "cuda-oom",
@@ -1369,17 +1367,15 @@ class TestDevice:
     def test_device_and_seed_are_required_before_creating_output(self, tmp_path):
         root = tmp_path
         with pytest.raises(ConfigError, match="device is required"):
-            batch_helpers.make_batch(
-                Pipeline([]), {"seed": 0}, output_dir=root / "no-device"
-            )
+            batches.make_batch(Pipeline([]), {"seed": 0}, output_dir=root / "no-device")
         with pytest.raises(ValueError, match="seed is required"):
-            batch_helpers.make_batch(
+            batches.make_batch(
                 Pipeline([]), {"device": [0]}, output_dir=root / "no-seed"
             )
         with pytest.raises(ValueError, match="seed is required"):
             Experiment(Pipeline([]), {}, output_dir=root / "experiment-no-seed")
         with pytest.raises(ConfigError, match="nonempty"):
-            batch_helpers.make_batch(
+            batches.make_batch(
                 Pipeline([]),
                 {"device": [], "seed": 0},
                 output_dir=root / "empty-device",
@@ -1392,7 +1388,7 @@ class TestDevice:
     @pytest.mark.parametrize("value", [0, [True], [-1], [0, 0]])
     def test_invalid_device_values_are_rejected(self, tmp_path, value):
         with pytest.raises(ConfigError):
-            batch_helpers.make_batch(
+            batches.make_batch(
                 Pipeline([]),
                 {"device": value, "seed": 0},
                 output_dir=tmp_path / "unused",

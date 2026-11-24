@@ -8,7 +8,7 @@
 
 从一次实验看，`Stage.process` 完成一步计算，`Pipeline` 定义这些步骤的顺序。一份具体配置对应一个 `Experiment`。直接调用 `Pipeline.run` 可以在当前进程运行这条流程。
 
-批次通过 `expman run` 创建并启动，通过 `expman resume ID` 恢复。调度器把每个需要计算的顶层 Stage 派发到独立工作进程，并负责 GPU 分配、资源限制和重试。匹配的已完成前缀可直接复用。运行环境要求 **Linux 与支持 MPS 的 NVIDIA GPU**（需要 `nvidia-smi`、`nvidia-cuda-mps-control` 和 CUDA 驱动）。每份实验配置必须显式提供 `device`（GPU 编号列表）和根部 `seed`。各配置使用同一份物理 GPU 列表。
+批次通过 `expman run` 在后台启动，通过 `expman resume ID` 在后台恢复。调度器把每个需要计算的顶层 Stage 派发到独立工作进程，并负责 GPU 分配、资源限制和重试。匹配的已完成前缀可直接复用。运行环境要求 **Linux 与支持 MPS 的 NVIDIA GPU**（需要 `nvidia-smi`、`nvidia-cuda-mps-control` 和 CUDA 驱动）。每份实验配置必须显式提供 `device`（GPU 编号列表）和根部 `seed`。各配置使用同一份物理 GPU 列表。
 
 接手源码可从批次创建、派发一个阶段、保存结果这三步读起。[架构与源码阅读顺序](DESIGN.md)
 
@@ -234,15 +234,15 @@ class ModelSummary(Stage[None, None]):
 summary = Pipeline([ModelSummary])
 ```
 
-从项目根目录运行 `expman run summary experiment`。命令从 `src.pipeline` 导入 `summary`，为展开后的 8 份配置各创建一个 run，并在开始调度时打印批次 ID 和目录。
+从项目根目录运行 `expman run summary experiment`。命令从 `src.pipeline` 导入 `summary`，为展开后的 8 份配置各创建一个 run。后台批次启动成功后，终端打印批次 ID 和目录，随即返回命令提示符。关闭这个终端后，批次仍会继续运行。
 
 示例中的 `-> None` 让 Pyright 可以在编辑时指出 `return 0` 等类型错误。注解可选，`Pipeline([ModelSummary])` 会直接检查叶子方法的定义，因此方法的 Python 源码须可读取。若叶子需要保存模型，可以写 `save_model(model)` 后自然结束。`return save_model(model)` 属于返回表达式，会在构造 Pipeline 时被拒绝。
 
 - 第一个阶段收到 `None`。后续阶段从直接前驱的快照读取输入和随机状态。叶子用 `ctx.log_metrics()` 保存数值指标，并将模型权重等产物显式写入文件。多个 run 复用同一个叶子时，叶子只需执行一次，框架会把数值指标复制给各 run，因此模型文件应保存在这些 run 都可访问的位置。
 - 普通阶段失败会记录错误，在该顶层阶段的预算内重新入队。默认额外重试一次。在流程模块中调用 `expman.set(retries=0)` 可关闭普通失败的重试，取消和资源限额触发的重新调度单独处理。
 - 重试保留 `run_id`。`ctx.attempt` 是当前顶层阶段的尝试编号，从 1 开始。`ctx.cfg` 深层只读，跨尝试的业务状态由 `ctx.checkpoint()` 显式保存。
-- 中断主进程会结束调度并回收 worker。业务代码在 worker 内抛出 `KeyboardInterrupt` 或 `SystemExit` 时，该阶段记作取消并重新入队。
-- 命令结束时按配置展开顺序打印各 run 的 ID 和最终状态。`expman status ID` 可查看该批次各 run 的阶段和尝试记录。
+- `expman stop ID` 请求后台调度器停止并回收 worker。业务代码在 worker 内抛出 `KeyboardInterrupt` 或 `SystemExit` 时，该阶段记作取消并重新入队。
+- `expman status ID` 显示该批次各 run 的状态、阶段和尝试记录。
 
 每次实际计算使用独立 worker。尝试摘要保存错误类型和消息。对文件、数据库或外部服务的写入可能在重试时再次发生，由业务代码处理。
 
@@ -259,10 +259,10 @@ train = Pipeline([LoadData, Train, Eval])
 ```
 
 ```bash
-# 新建批次，打印 ID 和批次目录的绝对路径
+# 在后台启动批次，打印 ID 和批次目录的绝对路径
 expman run train baseline
 
-# 在另一终端查看 ./batches/ 的总览，每个批次占一行
+# 查看 ./batches/ 的总览，每个批次占一行，按 Ctrl+C 退出查看
 expman status
 
 # 查看批次 0 的详情，每个 run 占一行
@@ -271,10 +271,10 @@ expman status 0
 # 在独立看板中查看 ./batches/ 下的批次
 expman web
 
-# 停止批次 0，运行进程收到 SIGTERM 后保存状态，以退出码 143 结束
+# 请求后台批次 0 保存状态并停止
 expman stop 0
 
-# 从停止处恢复批次 0，根据 manifest 导入流程并校验阶段顺序、类名和可获取的模块源码摘要
+# 批次停止后，在后台恢复批次 0
 expman resume 0
 ```
 
@@ -283,8 +283,8 @@ expman resume 0
 - `expman status --batches-dir results` 显示 `results/` 下所有批次的总览。`expman status 0 --batches-dir results` 显示批次 0 中每个 run 的状态、阶段和尝试记录。两种视图默认每两秒刷新一次，批次结束后也会继续刷新。在运行 `status` 的终端按 Ctrl+C 只会退出查看。若批次清单无法读取，命令报错并结束刷新。
 - `stop` 和 `resume` 都要求提供批次 ID。在自定义目录中操作时使用同一父目录，例如 `expman stop 0 --batches-dir results`、`expman resume 0 --batches-dir results`。
 - `expman delete 1` 删除批次 `1` 的整个目录（含运行结果和检查点）及其 ID 登记记录。自定义父目录时可用 `expman delete 1 --batches-dir results`。运行中的批次须先用 `stop` 请求停止，等运行进程退出后再删除。手动移走批次目录后，登记表仍保留该 ID，直到用 `delete` 清除记录。
-- `run` 和 `resume` 持有批次执行锁时会打开 `stop.fifo`。同一系统用户运行的 CLI 或看板可通过它探测批次是否仍在运行。向管道写入停止请求后，Linux 内核向持有读端的批次进程发送 SIGTERM。
-- `run` 和 `resume` 启动时打印批次 ID 和目录，执行结束后打印每个 run 的最终状态。批次全部成功时退出码为 0，有 run 最终失败时为 1，收到停止请求并中断时为 143。
+- `run` 和 `resume` 的退出码表示启动结果。后台调度器取得执行锁、打开停止管道并通过启动检查后，命令打印批次 ID 和目录，以 0 退出。启动失败时，终端显示启动日志和错误，命令以非零状态退出。启动成功时，调度器把启动和运行日志追加到批次目录的 `batch.log`。可用 `expman status ID` 查看实验的最终状态。
+- 后台调度器在持有批次执行锁期间监听 `stop.fifo`。同一系统用户运行的 CLI 或看板可通过它探测批次是否仍在运行。向管道写入停止请求后，Linux 内核向持有读端的批次进程发送 SIGTERM。
 - `expman web` 启动独立看板。可用 `--host` 指定绑定地址（默认仅回环），用 `--port` 指定端口（默认 `8765`，`0` 由系统分配，端口被占时默认最多尝试连续 10 个端口）。详见[运行看板](#运行看板)。
 
 ## 全局设置
@@ -457,7 +457,7 @@ with sqlite3.connect("file:metrics.sqlite3?mode=ro", uri=True) as db:
 
 ## 耗时与剩余时间
 
-运行期间可在另一终端用 `expman status ID` 查看该批次的耗时与剩余时间。时间采用 `DD:HH:MM`，例如 `00:00:35` 表示 35 分钟。批次累计运行时间跨 resume 延续，两次运行之间的停机时间排除在外。批次按 `timing_save_interval`（默认 5 秒）保存累计时间与当前可用的 ETA，正常收尾时也会保存。进程意外退出时，以最近一次成功写入的记录为准。
+运行期间可用 `expman status ID` 查看该批次的耗时与剩余时间。时间采用 `DD:HH:MM`，例如 `00:00:35` 表示 35 分钟。批次累计运行时间跨 resume 延续，两次运行之间的停机时间排除在外。批次按 `timing_save_interval`（默认 5 秒）保存累计时间与当前可用的 ETA，正常收尾时也会保存。进程意外退出时，以最近一次成功写入的记录为准。
 
 整批 ETA 按同一批次、同一顶层 Stage 的 worker 实测耗时估算。调度器用单调时钟计量任务占用 worker 的时长，包含进程启动后的初始化开销。每次实际执行成功都会产生一条耗时样本，直接复用结果的阶段跳过采样。更新 ETA 时，调度器将同阶段的新样本和各任务已经运行的时长一起用于估算剩余时间。即使某个任务超过先前预计的上界，也能继续估算。
 

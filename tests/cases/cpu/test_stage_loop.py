@@ -3,7 +3,7 @@
 import random
 
 import pytest
-from batch_helpers import make_batch
+from helpers.batches import make_batch
 
 from expman import Pipeline, Stage, Status
 from expman.core.context import RunContext

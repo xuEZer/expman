@@ -2,13 +2,25 @@
 
 expman 把一条 Python 实验流程应用到多份配置上，在一台 Linux 主机的 NVIDIA GPU 上调度这些实验，并保存足够的信息供中断后继续运行。用户编写每个阶段的计算逻辑。框架决定哪个阶段现在可以运行、运行在哪张卡上，以及 retry 或 resume 时应从哪里开始。安装、命令参数和可运行示例见 [README](README.md)。
 
+## 目录与职责
+
+| 源码目录 | 负责的工作 |
+|---|---|
+| [cli/](src/expman/cli/) | 解析命令，启动后台批次，在终端展示状态。 |
+| [config/](src/expman/config/) | 加载实验 YAML，展开并校验每份配置。 |
+| [core/](src/expman/core/) | 定义 Pipeline、Stage 和 Experiment，执行阶段并向用户代码提供运行上下文。 |
+| [scheduling/](src/expman/scheduling/) | 管理批次生命周期，调度 worker，接收批次停止请求。 |
+| [resources/](src/expman/resources/) 和 [estimation/](src/expman/estimation/) | 前者读取设备资源、管理 MPS 和资源限制，后者根据历史样本估计内存、显存和耗时。 |
+| [storage/](src/expman/storage/) | 读写批次清单、阶段快照、共享缓存和指标。 |
+| [observation/](src/expman/observation/) 和 [webui/](src/expman/webui/) | 前者整理实时状态、历史记录和实验结果，后者通过 HTTP 和网页展示这些数据。 |
+
 ## 从一次实验读起
 
 假设实验包含“准备数据 → 训练”两个阶段，配置文件列出两种学习率。这个例子里有一个 **Batch**（整批实验）、两个 **run**（各自对应一个 `Experiment`、一份具体配置和一个稳定的 `run_id`）。两个 run 都要完成训练。**调度单元是某个 run 的一个顶层 Stage**，worker 只负责该阶段的一次尝试。若准备数据声明只依赖数据配置，两份配置在同一种子下可以共享准备好的数据。
 
 ```mermaid
 flowchart LR
-    CLI["expman run / expman resume"] --> B["批次调度与 BatchState"]
+    CLI["expman run / expman resume"] -->|后台启动| B["批次调度与 BatchState"]
     CFG["YAML 展开的配置"] --> B
     B --> G["GpuScheduler 主进程"]
     G -->|派发一个顶层阶段| W["worker 独立解释器"]
@@ -24,10 +36,10 @@ flowchart LR
     V --> UI["独立 Web 服务"]
 ```
 
-1. **创建批次。** `expman run` 按 `module:attr` 导入 Pipeline，省略模块名时从 `pipeline_module` 指定的模块读取属性，默认为 `src.pipeline`。命令把 YAML 展开为一组配置，批次调度代码校验设备和种子，为每份配置创建一个 run 目录，把解析后的 `module:attr` 和初始队列写入批次清单。[CLI](src/expman/cli.py) · [批次调度](src/expman/scheduling/batch.py)
+1. **创建批次。** `expman run` 按 `module:attr` 导入 Pipeline，省略模块名时从 `pipeline_module` 指定的模块读取属性，默认为 `src.pipeline`。命令把 YAML 展开为一组配置，批次调度代码校验设备和种子，为每份配置创建一个 run 目录，把解析后的 `module:attr` 和初始队列写入批次清单。[CLI](src/expman/cli/commands.py) · [批次调度](src/expman/scheduling/batch.py)
 2. **选择任务。** 主进程取每个 run 当前就绪的顶层阶段。可以共享前缀的成员按组处理。命中缓存时，主进程只读元数据，把指标和共享节点引用写到目标 run，推进它的阶段位置。需要计算时，主进程从各阶段的就绪队列选取候选，再按主机内存和各卡显存余量决定派发哪些任务及其设备。启动 worker 前先持久化该成员的活动状态。[调度循环](src/expman/scheduling/scheduler.py) · [阶段分组](src/expman/scheduling/_stages.py)
 3. **计算一个阶段。** worker 在独立解释器内核验 MPS 客户端，加载用户模块并重建 Experiment。执行第 `i` 个顶层阶段时，第一阶段从初始随机状态和输入 `None` 开始，其余阶段只需从第 `i - 1` 个阶段的快照取得输入和随机状态。目标阶段已有有效 checkpoint 时，从该保存点继续。[worker 入口](src/expman/scheduling/_worker.py) · [Experiment](src/expman/core/experiment.py) · [托管阶段执行](src/expman/core/execution.py)
-4. **收集结果。** worker 通过本地 socket 把完成摘要传给主进程。主进程记录历史，释放占用，安排下一阶段或重试。成功的叶子留下完成记录，业务指标保存在 SQLite。调度结束后，CLI 按配置展开顺序打印每个 run 的 ID 和最终状态。[进程间通信](src/expman/scheduling/ipc.py) · [结果对象](src/expman/core/experiment.py)
+4. **收集结果。** worker 通过本地 socket 把完成摘要传给后台调度器。调度器记录历史，释放占用，安排下一阶段或重试。成功的叶子留下完成记录，业务指标保存在 SQLite。`expman status ID` 从批次记录中读取各 run 的状态。[进程间通信](src/expman/scheduling/ipc.py) · [结果对象](src/expman/core/experiment.py)
 
 ## 定义一条流程
 
@@ -45,7 +57,7 @@ flowchart LR
 
 ## 框架设置与实验配置
 
-CLI 以当前工作目录作为实验项目根目录。如果该目录有 `pyproject.toml`，CLI 在解析命令行参数前应用其中的 `[tool.expman]` 设置。CLI、调度器、资源采样和看板共用一处设置定义，显式命令行参数可以覆盖对应选项。流程模块在导入时可调用 `expman.set(...)` 覆盖当前进程的值。主进程启动独立 worker 时传入生效的设置。恢复时，重试次数和耗时区间覆盖率取自原批次清单，资源与调度参数采用本次会话的设置。[全局设置](src/expman/settings.py) · [命令入口](src/expman/cli.py) · [worker 入口](src/expman/scheduling/_worker.py)
+CLI 以当前工作目录作为实验项目根目录。如果该目录有 `pyproject.toml`，CLI 在解析命令行参数前应用其中的 `[tool.expman]` 设置。CLI、调度器、资源采样和看板共用一处设置定义，显式命令行参数可以覆盖对应选项。流程模块在导入时可调用 `expman.set(...)` 覆盖当前进程的值。主进程启动独立 worker 时传入生效的设置。恢复时，重试次数和耗时区间覆盖率取自原批次清单，资源与调度参数采用本次会话的设置。[全局设置](src/expman/settings.py) · [命令入口](src/expman/cli/commands.py) · [worker 入口](src/expman/scheduling/_worker.py)
 
 `expman run` 从 `./configs/experiments/<配置名>.yaml` 读取实验配置，解析命名默认参数，展开各个 run 的配置，并校验整个批次共享的设备列表。[配置加载](src/expman/config/loader.py) · [变体展开](src/expman/config/variants.py) · [批次约束](src/expman/config/schema.py)
 
@@ -60,6 +72,7 @@ CLI 以当前工作目录作为实验项目根目录。如果该目录有 `pypro
 | 位置 | 内容和使用者 |
 |---|---|
 | `batch.pkl`、`timing.pkl` | 批次清单保存流程的导入位置和签名、重试次数和耗时区间覆盖率、队列、活动成员、阶段游标、尝试摘要和阶段历史。`timing.pkl` 单独记录批次累计墙钟时间和当前 ETA，估计区间未知时存为空值。 |
+| `batch.log` | 启动成功后记录调度器在启动和运行期间的标准输出和错误输出。恢复批次时继续追加。 |
 | `experiments/<run_id>/config.pkl`、`rng_initial.pkl` | 具体配置。worker 需要执行该 run 的阶段 0 时才创建或读取初始随机状态文件。 |
 | `experiments/<run_id>/stages/<位置>/` | `status.pkl` 记录阶段状态，`checkpoint.pkl` 保存最近的中间进度，`completed.pkl` 记录阶段完成。共享中间结果通过引用定位，嵌套阶段的完成快照保存在本 run。每次 Pipeline 调用所在路径还有用于校验定义的 `pipeline.pkl`。 |
 | `cache/<key>/<父节点>/<节点>/` | 中间节点的 `snapshot.pkl` 保存输出、业务状态和随机状态，`metadata.pkl` 保存供复用的依赖、指标和耗时。叶子只发布 `metadata.pkl`。 |
@@ -106,7 +119,7 @@ ETA 按剩余的**阶段组**估算。调度器用单调时钟测量每次尝试
 
 CLI 和 Web 看板共用所选批次父目录下的 `.batches.sqlite3`，默认位置是 `./batches/.batches.sqlite3`。每个父目录独立分配批次 ID，每次选择登记表中最小的空闲非负整数。手动移除批次目录后，登记表仍保留该 ID。`expman delete ID` 在清除批次文件后释放登记记录，运行中的批次受执行锁保护。[批次登记](src/expman/observation/registry.py)
 
-`expman status` 定期枚举当前父目录中的批次。`expman status ID` 通过登记表定位该批次，重读其运行记录并刷新详情。两种视图按 `status_interval` 刷新，默认为两秒。按 Ctrl+C 退出查看。`resume` 和 `stop` 使用同一登记表定位批次。[命令入口](src/expman/cli.py)
+`expman status` 定期枚举当前父目录中的批次。`expman status ID` 通过登记表定位该批次，重读其运行记录并刷新详情。两种视图按 `status_interval` 刷新，默认为两秒。按 Ctrl+C 退出查看。`resume` 和 `stop` 使用同一登记表定位批次。[命令入口](src/expman/cli/commands.py)
 
 `expman status` 与归档页面从批次文件重建状态。实验主进程另有旁路线程，把在锁内读到的调度状态和阶段完成组数整理为实时快照并原子写入 `live.json`，写入失败不会中断实验。`expman web` 在独立进程内通过 HTTP 和 SSE 提供这些数据。读取端在批次停止管道可连接且快照足够新鲜时标为实时。历史快照早于最新批次清单或快照不可用时，从持久化记录重建。页面查询不会触发训练或资源调度。[归档读取](src/expman/observation/status.py) · [快照构建](src/expman/observation/snapshot.py) · [来源判定](src/expman/observation/archive.py) · [Web 服务](src/expman/webui/server.py)
 
@@ -116,11 +129,11 @@ CLI 和 Web 看板共用所选批次父目录下的 `.batches.sqlite3`，默认�
 
 当 X 轴为 `step` 或有 step 历史的指标时，浏览器用重复的 `metric` 参数请求所有带 step 指标的历史，以便筛选 Y 轴。服务端在同一 SQLite 读事务中读取各指标的最新值和所请求的历史，补写较早的 step 也可以更新曲线。浏览器以 JavaScript Number 读取步数，超过 `2^53 − 1` 时可能将相邻步数视为相同。变量控制通过比较不同 run 在同一 X 处的 Y 值生成。指标作横轴时，单条轨迹或多条完全重合的轨迹保留观测顺序。需要汇总时，浏览器按 X 计算均值，在该指标的相关控制变量保留多个取值且观测值有差异时绘制误差棒。[选轴与刷新](src/expman/webui/static/plot-panel.js) · [聚合与绘图](src/expman/webui/static/plot.js)
 
-`expman run` 和 `expman resume` 在持有批次执行锁期间监听 `stop.fifo`。`expman stop` 和看板的“停止实验”按钮共用同一条停止管道。请求写入后，内核向持有读端的进程发送 SIGTERM，调度器收尾并保存进度。[进程控制](src/expman/process_control.py)
+`expman run` 和 `expman resume` 在独立会话中启动批次。后台调度器取得执行锁、打开 `stop.fifo` 并通过启动检查后，CLI 向终端打印批次 ID 和目录，返回成功。启动期间的错误由 CLI 报给调用者。`expman stop` 和看板的“停止实验”按钮共用同一条停止管道。请求写入后，内核向持有读端的后台调度器发送 SIGTERM，调度器收尾并保存进度。[后台启动](src/expman/cli/_background.py) · [进程控制](src/expman/scheduling/control.py)
 
 | 你遇到的现象 | 建议先读的行为测试 |
 |---|---|
-| 输入输出、事件父子关系或停止位置异常 | [Pipeline 测试](tests/cpu/test_pipeline.py) |
-| retry 后跑错步、状态冲突或随机序列改变 | [断点与恢复测试](tests/cpu/test_stage_loop.py) · [RNG 测试](tests/cpu/test_randomness.py) |
-| 配置数量或合并结果与预期不同 | [配置展开测试](tests/cpu/test_config.py) |
-| 想验证真实的 CLI → MPS → CUDA 计算，以及重试、主动停止与恢复 | [真卡批次测试](tests/gpu/test_cuda_batch.py) |
+| 输入输出、事件父子关系或停止位置异常 | [Pipeline 测试](tests/cases/cpu/test_pipeline.py) |
+| retry 后跑错步、状态冲突或随机序列改变 | [断点与恢复测试](tests/cases/cpu/test_stage_loop.py) · [RNG 测试](tests/cases/cpu/test_randomness.py) |
+| 配置数量或合并结果与预期不同 | [配置展开测试](tests/cases/cpu/test_config.py) |
+| 想验证真实的 CLI → MPS → CUDA 计算，以及重试、主动停止与恢复 | [真卡批次测试](tests/cases/gpu/test_cuda_batch.py) |

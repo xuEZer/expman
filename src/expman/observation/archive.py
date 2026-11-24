@@ -18,7 +18,7 @@ from expman.observation.snapshot import (
     stage_samples,
 )
 from expman.observation.status import RecordedBatch
-from expman.process_control import is_running
+from expman.scheduling.control import is_running
 from expman.settings import settings
 from expman.storage.base import StorageError
 

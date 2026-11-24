@@ -31,7 +31,8 @@ where = ["src"]
 expman = ["py.typed", "webui/static/*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests/cases"]
+pythonpath = ["tests"]
 addopts = "-q"
 markers = ["simulated_gpu: requires the test CUDA driver and simulated NVIDIA commands"]
 

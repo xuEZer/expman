@@ -1,7 +1,7 @@
 """Framework-set worker environment: the thread ceiling and the HF mirror."""
 
 import pytest
-from batch_helpers import make_batch
+from helpers.batches import make_batch
 
 from expman import Pipeline, Stage, environment
 from expman.settings import settings

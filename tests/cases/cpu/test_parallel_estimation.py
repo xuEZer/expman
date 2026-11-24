@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from batch_helpers import make_batch, restore_batch
+from helpers.batches import make_batch, restore_batch
 
 from expman import Pipeline, Stage, Status
 from expman.core.events import ExecutionEvent, ProgressEvent

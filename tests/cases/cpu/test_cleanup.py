@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from batch_helpers import make_batch, restore_batch
+from helpers.batches import make_batch, restore_batch
 
 from expman import Pipeline, Stage, Status, cleanup
 from expman.scheduling._prefixes import PrefixReclaimer

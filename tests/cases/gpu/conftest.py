@@ -1,7 +1,7 @@
 """Pytest integration for the real CUDA/MPS suite."""
 
 import pytest
-from gpu_allocation import reserve_card
+from helpers.gpu_allocation import reserve_card
 
 
 @pytest.fixture(scope="session")

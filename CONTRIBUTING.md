@@ -29,7 +29,7 @@ CI 的真卡测试使用 `expman-gpu` 标签。该标签用于每个作业独立
 
 ## 真实 GPU 验证
 
-提交 hook 自动运行 `tests/cpu/` 和 `tests/gpu/`。后者需要 Linux、NVIDIA 驱动、MPS，以及与驱动兼容的 CUDA 版 PyTorch。
+提交 hook 自动运行 `tests/cases/` 下的全部用例。`cpu/` 下的用例可在 CPU 上运行，`gpu/` 下的用例需要 Linux、NVIDIA 驱动、MPS 和兼容的 CUDA 版 PyTorch。两个目录各自通过 `conftest.py` 管理运行环境。创建、恢复和等待批次的函数以及真卡预留工具位于 `tests/helpers/`。
 
 提交 hook 中的 Pyright 和 pytest 均使用 `uv run --no-sync`，保留项目环境中已安装的 PyTorch。
 

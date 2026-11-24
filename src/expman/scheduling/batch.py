@@ -1,6 +1,7 @@
 """Create, run and reopen a durable batch of experiment configurations."""
 
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 from threading import Event, RLock, Thread
 from time import monotonic
@@ -16,7 +17,7 @@ from expman.core.randomness import validate_seed
 from expman.core.recorders import InMemoryRecorder
 from expman.estimation.estimate import TimeEstimate, valid_seconds, validate_coverage
 from expman.observation.cleanup import clean_locked
-from expman.process_control import stop_on_sigterm
+from expman.scheduling.control import stop_on_sigterm
 from expman.scheduling.environment import validate as validate_environment
 from expman.scheduling.state import BatchState, LiveObservations
 from expman.settings import settings
@@ -269,8 +270,10 @@ class _Batch:
         while not stopped.wait(settings.timing_save_interval):
             self._update_timing()
 
-    def run(self) -> tuple[ExperimentResult, ...]:
-        """Execute the batch while accepting CLI and dashboard stop requests."""
+    def run(
+        self, *, on_started: Callable[[], None] | None = None
+    ) -> tuple[ExperimentResult, ...]:
+        """Execute the batch, signaling readiness under its execution lock."""
         from expman.scheduling.scheduler import GpuScheduler
 
         with run_lock(self.output_dir), stop_on_sigterm(self.output_dir):
@@ -290,7 +293,10 @@ class _Batch:
             timer.start()
             live = self._start_live()
             try:
-                if not self.pipeline.stages:
+                scheduler = GpuScheduler(self) if self.pipeline.stages else None
+                if on_started is not None:
+                    on_started()
+                if scheduler is None:
                     with self._state_lock:
                         while self.state.queue:
                             self.record_attempt(
@@ -298,7 +304,7 @@ class _Batch:
                             )
                         self._save()
                     return self.results
-                results = GpuScheduler(self).run()
+                results = scheduler.run()
                 if all(run.status is Status.SUCCEEDED for run in results):
                     clean_locked(self.output_dir, self.store.serializer)
                 return results

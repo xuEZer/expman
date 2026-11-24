@@ -21,7 +21,7 @@ from expman.observation.archive import read_batch, summarize
 from expman.observation.registry import ensure_ids
 from expman.observation.results import read_plot, read_results
 from expman.observation.snapshot import SCHEMA
-from expman.process_control import request_stop
+from expman.scheduling.control import request_stop
 from expman.settings import settings
 from expman.webui.result_layout import layout_results
 
