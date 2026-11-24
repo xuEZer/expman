@@ -155,13 +155,6 @@ class Worker:
         self.progress_forecast = forecast
 
     def update_resources(self, message) -> None:
-        if "gpu_used_kb" in message:
-            used = message["gpu_used_kb"]
-            if _memory_value(used):
-                self.gpu_used_kb = used
-                self.gpu_process_peak_kb = max(self.gpu_process_peak_kb or 0, used)
-            else:
-                self.gpu_used_kb = None
         current, peak = message.get("host_current_kb"), message.get("host_peak_kb")
         if _memory_value(current) and _memory_value(peak):
             self.resident_kb = current

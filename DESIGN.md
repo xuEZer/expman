@@ -27,7 +27,7 @@ flowchart LR
     W --> E["Experiment.run_stage"]
     E --> P["Pipeline 与 ManagedStages"]
     P --> U["用户 Stage.process"]
-    W -->|事件、资源采样、完成摘要| G
+    W -->|事件、主机内存采样、完成摘要| G
     P --> D["批次目录中的阶段快照与指标"]
     G --> M["批次清单与运行时间"]
     B --> L["实时快照 live.json"]
@@ -98,7 +98,7 @@ CLI 以当前工作目录作为实验项目根目录。如果该目录有 `pypro
 
 ## 调度器如何使用 GPU 和主机内存
 
-单个 run 按阶段推进，多个 run 可以并发，不同阶段尝试可落在不同卡上。一次尝试用 GPU UUID 绑定一张可见卡，业务代码可使用 `cuda:0`。Linux 上的 MPS 服务、主机内存限制和显存采样各有独立实现。[MPS 客户端核验](src/expman/resources/mps.py) · [主机 cgroup](src/expman/resources/limits.py) · [每进程显存采样](src/expman/resources/gpu_memory.py)
+单个 run 按阶段推进，多个 run 可以并发，不同阶段尝试可落在不同卡上。一次尝试用 GPU UUID 绑定一张可见卡，业务代码可使用 `cuda:0`。worker 向调度器上报已核验的 MPS 客户端 PID 和自己的主机内存采样。批次调度器按 GPU UUID 将客户端分组，每轮对有活跃客户端的卡各执行一次 `nvidia-smi --query-compute-apps`，按 PID 读取同卡各 worker 的当前显存用量。缺少有效读数时，当前用量记为未知，历史峰值保留本次尝试已采到的最大值。阶段结束后，worker 保持 CUDA 上下文，直到调度器完成这张卡的最后一次阶段采样再退出。[MPS 客户端核验](src/expman/resources/mps.py) · [主机 cgroup](src/expman/resources/limits.py) · [进程显存采样](src/expman/resources/gpu_memory.py)
 
 | 调度时的问题 | 对应源码 |
 |---|---|

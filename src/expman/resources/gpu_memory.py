@@ -1,15 +1,14 @@
-"""Driver-reported GPU usage for the current MPS client."""
+"""Driver-reported process memory for one GPU."""
 
 import math
-import os
 import subprocess
 
 from expman.resources import devices
 from expman.settings import settings
 
 
-def sample(uuid: str, *, timeout: float | None = None) -> float | None:
-    """Current KiB for our PID on our GPU. Missing driver counters stay unknown."""
+def sample(uuid: str) -> dict[int, float]:
+    """Return current KiB by PID, omitting processes without a usable reading."""
     try:
         result = subprocess.run(
             [
@@ -21,14 +20,19 @@ def sample(uuid: str, *, timeout: float | None = None) -> float | None:
             check=True,
             capture_output=True,
             text=True,
-            timeout=settings.query_timeout if timeout is None else timeout,
+            timeout=settings.query_timeout,
         )
-        pid = str(os.getpid())
-        for line in result.stdout.splitlines():
-            process, mib = (value.strip() for value in line.split(","))
-            if process == pid:
-                kib = float(mib) * 1024
-                return kib if math.isfinite(kib) and kib >= 0 else None
-    except (OSError, subprocess.SubprocessError, ValueError):
-        pass
-    return None
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return {}
+
+    readings = {}
+    for line in result.stdout.splitlines():
+        try:
+            process, mib = line.split(",")
+            pid = int(process)
+            kib = float(mib) * 1024
+        except ValueError:
+            continue
+        if pid > 0 and math.isfinite(kib) and kib >= 0:
+            readings[pid] = kib
+    return readings

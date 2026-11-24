@@ -472,6 +472,7 @@ with sqlite3.connect("file:metrics.sqlite3?mode=ro", uri=True) as db:
 
 - `device` 是整批共用的物理 GPU 编号列表。调度器通过设备 UUID 为每个 worker 设置一张可见卡，业务代码可以使用 `cuda:0`。worker 在运行用户代码之前建立 CUDA 主上下文并核验 MPS 注册。只做 CPU 计算的 Stage 也会建立该上下文。
 - 调度器每轮采集主机可用内存与设备空闲显存，扣除主机预留量和已有 worker 尚未占用的预算，再选择可同时运行的任务。主机默认预留 1 GiB。没有相应峰值样本时，主机和显存的初始预算分别由 `host_peak_kb_default` 和 `gpu_peak_kb_default` 决定，均默认为 1 GiB。[资源默认值](src/expman/settings.py)
+- 同一卡上的 worker 共用一次进程显存查询。每轮采样时，批次调度器只查询有活跃 MPS 客户端的卡，按客户端 PID 更新各 worker 的当前显存用量，并记录每次尝试采到的最高值。
 - 同一阶段内，重试任务优先进入候选，其余任务按就绪队列顺序选取。调度器轮流从各阶段取候选，再根据剩余主机内存和各卡剩余显存选择本轮派发的组合。
 - 调度器按预估峰值为 worker 预留资源。主机内存和显存的硬上限分别按对应的预估峰值 × `capacity_factor` 计算，系数默认为 1.10。例如，预估峰值为 200 MiB 时，预留 200 MiB，硬上限为 220 MiB。显存上限受所选 GPU 的物理容量限制，通过 MPS 以整 MiB 请求。主机使用可用的 cgroup 机制施加内存上限。缺少独立 cgroup 读数时，worker 尝试读取自身的 RSS 和历史峰值。快照分别记录资源预算、实际用量和已核验的上限。
 - 调度器根据采样结果决定是否暂停派发或减载。被确认为资源限额导致的失败会重新估价并入队。每次尝试的标准输出和错误输出位于 `experiments/<run_id>/attempts/stage-<index>/<attempt>/output.log`。

@@ -13,7 +13,7 @@ from time import monotonic
 from expman.core.context import _error_message
 from expman.core.events import Status
 from expman.core.experiment import Experiment, StageResult
-from expman.resources import gpu_memory, mps
+from expman.resources import mps
 from expman.resources.limits import (
     attempt_cgroup,
     cap_matches_request,
@@ -58,7 +58,7 @@ def _own_usage():
     return values["VmRSS"], values["VmHWM"]
 
 
-def _resource_snapshot(directory, query_timeout=None):
+def _resource_snapshot(directory):
     unit = os.environ.get("EXPMAN_CGROUP_UNIT")
     directory = attempt_cgroup(directory, unit)
     host = None if directory is None else usage(directory)
@@ -85,11 +85,6 @@ def _resource_snapshot(directory, query_timeout=None):
         diagnostic = "kernel memory limit is missing, unlimited, or exceeds the request"
     return {
         "timestamp": monotonic(),
-        "gpu_used_kb": gpu_memory.sample(
-            os.environ["CUDA_VISIBLE_DEVICES"], timeout=query_timeout
-        )
-        if "CUDA_MPS_PINNED_DEVICE_MEM_LIMIT" in os.environ
-        else None,
         "host_current_kb": None if host is None else host[0],
         "host_peak_kb": None if host is None else host[1],
         "host_usage_source": source,
@@ -113,14 +108,14 @@ def _resource_cgroup():
     return actual
 
 
-def _report_resources(channel, stop, interval, query_timeout):
+def _report_resources(channel, stop, interval):
     last_diagnostic = None
 
     def report():
         nonlocal last_diagnostic
         # systemd placement may not be ready at process creation; retry discovery
         # on every tick instead of freezing a missing/shared group forever.
-        snapshot = _resource_snapshot(_resource_cgroup(), query_timeout)
+        snapshot = _resource_snapshot(_resource_cgroup())
         diagnostic = snapshot["host_usage_error"]
         if diagnostic and diagnostic != last_diagnostic:
             print(
@@ -172,12 +167,7 @@ def main():
     resource_stopped = threading.Event()
     resource_thread = threading.Thread(
         target=_report_resources,
-        args=(
-            channel,
-            resource_stopped,
-            settings.poll_interval,
-            settings.query_timeout,
-        ),
+        args=(channel, resource_stopped, settings.poll_interval),
         daemon=True,
     )
     resource_thread.start()
@@ -229,24 +219,25 @@ def main():
                 if result.status.value != "succeeded"
                 else experiment._store.completed((stage_index,), metadata_only=True)
             )
-            with suppress(OSError):
-                channel.send(
-                    {
-                        "type": "finished",
-                        "result": result,
-                        "stage": stage_index,
-                        "dependencies": None
-                        if completed is None
-                        else completed.get("config_dependencies"),
-                        "reused": bool(
-                            completed is not None
-                            and completed.get("shared_reused", False)
-                        ),
-                    }
-                )
     finally:
         resource_stopped.set()
         resource_thread.join()
+    with suppress(OSError):
+        channel.send(
+            {
+                "type": "finished",
+                "result": result,
+                "stage": stage_index,
+                "dependencies": None
+                if completed is None
+                else completed.get("config_dependencies"),
+                "reused": bool(
+                    completed is not None and completed.get("shared_reused", False)
+                ),
+            }
+        )
+        # Keep the CUDA context visible until the scheduler has sampled this GPU.
+        channel.socket.recv(1)
 
 
 if __name__ == "__main__":

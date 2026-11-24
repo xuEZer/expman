@@ -6,7 +6,8 @@ import socket
 import subprocess
 import sys
 import warnings
-from collections import deque
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
 from time import perf_counter, sleep, time
@@ -18,6 +19,7 @@ from expman.core.dependencies import stage_dependencies
 from expman.core.events import Status
 from expman.core.experiment import StageResult
 from expman.estimation.memory_model import PeakCeiling
+from expman.resources import gpu_memory
 from expman.resources.mps import MpsService
 from expman.scheduling._planning import pack_candidates
 from expman.scheduling._prefixes import PrefixReclaimer
@@ -75,6 +77,29 @@ class GpuScheduler:
     def _note(self, kind, **fields):
         """Record one scheduling event for the dashboard; never a decision input."""
         self.events.append({"at": time(), "kind": kind, **fields})
+
+    def _sample_gpu_memory(self, queries: ThreadPoolExecutor) -> None:
+        """Share one process table per active GPU across its verified MPS clients."""
+        clients: dict[str, list[tuple[int, Worker]]] = defaultdict(list)
+        for worker in self.workers.values():
+            if worker.uuid is not None and worker.mps_client is not None:
+                clients[worker.uuid].append((worker.mps_client[1], worker))
+
+        for workers, readings in zip(
+            clients.values(), queries.map(gpu_memory.sample, clients), strict=True
+        ):
+            for pid, worker in workers:
+                used = readings.get(pid)
+                worker.gpu_used_kb = used
+                if used is not None:
+                    worker.gpu_process_peak_kb = max(
+                        worker.gpu_process_peak_kb or 0, used
+                    )
+                if worker.finished is not None and worker.channel is not None:
+                    # The final host report precedes "finished". EOF releases the
+                    # worker after this GPU query, even when its PID was missing.
+                    worker.channel.socket.close()
+                    worker.channel = None
 
     def _account(self):
         now = perf_counter()
@@ -700,6 +725,7 @@ class GpuScheduler:
         )
 
     def run(self):
+        queries = ThreadPoolExecutor(max_workers=max(1, len(self.batch.devices)))
         try:
             self.prefixes.reclaim_saved()
             while self.batch.state.queue or self.workers:
@@ -709,6 +735,7 @@ class GpuScheduler:
                         self._finish(run_id)
                 if not self.batch.state.queue and not self.workers:
                     break
+                self._sample_gpu_memory(queries)
                 self._account()
                 # Both readings are rechecked every tick: a stale ratio never
                 # admits work, and an unreadable one keeps every card closed.
@@ -737,4 +764,5 @@ class GpuScheduler:
                     )
             raise
         finally:
+            queries.shutdown()
             self.mps.close()

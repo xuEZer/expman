@@ -3,6 +3,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from pathlib import Path
 from time import monotonic, perf_counter, sleep
@@ -15,6 +16,7 @@ from helpers import batches
 from expman import ConfigError, Pipeline, Stage, Status, devices, environment
 from expman.core.context import RunContext
 from expman.core.experiment import Experiment, StageResult
+from expman.resources import gpu_memory
 from expman.resources.devices import (
     DeviceMemory,
     HostMemory,
@@ -1089,6 +1091,45 @@ class TestGpuScheduling:
         with patch.object(scheduler, "_finish") as finish:
             scheduler._relieve(Memory([0]).sample(), Host().sample())
         finish.assert_not_called()
+
+    def test_gpu_sampling_shares_one_pid_table_per_active_card(self, tmp_path):
+        batch = make_batch(tmp_path, count=4, devices=[0, 1, 2])
+        scheduler = GpuScheduler(batch)
+        clients = [(0, 101), (0, 102), (1, 103), (2, None)]
+        for run, (device, pid) in zip(batch.experiments, clients, strict=True):
+            scheduler.workers[run.run_id] = Worker(
+                Mock(),
+                run,
+                device,
+                f"GPU-test-{device}",
+                0.0,
+                mps_client=(99, pid) if pid is not None else None,
+            )
+        first, missing, other_card, pending = scheduler.workers.values()
+        missing.gpu_used_kb = missing.gpu_process_peak_kb = 18
+        missing.finished = StageResult(
+            missing.experiment.run_id, 0, 1, Status.SUCCEEDED, 0
+        )
+        final_channel = Mock()
+        missing.channel = final_channel
+        first.gpu_process_peak_kb = 12
+        tables = {
+            "GPU-test-0": {99: 9000, 101: 7},
+            "GPU-test-1": {102: 500, 103: 5},
+        }
+        with (
+            patch.object(
+                gpu_memory, "sample", side_effect=tables.__getitem__
+            ) as sample,
+            ThreadPoolExecutor(max_workers=2) as queries,
+        ):
+            scheduler._sample_gpu_memory(queries)
+        assert sorted(call.args[0] for call in sample.call_args_list) == sorted(tables)
+        assert (first.gpu_used_kb, first.gpu_process_peak_kb) == (7, 12)
+        assert (missing.gpu_used_kb, missing.gpu_process_peak_kb) == (None, 18)
+        final_channel.socket.close.assert_called_once_with()
+        assert (other_card.gpu_used_kb, other_card.gpu_process_peak_kb) == (5, 5)
+        assert pending.gpu_used_kb is None
 
     def test_unknown_gpu_usage_blocks_only_that_card(self, tmp_path):
         scheduler = GpuScheduler(make_batch(tmp_path, count=1))
