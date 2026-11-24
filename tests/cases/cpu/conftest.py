@@ -31,6 +31,10 @@ def nvidia_test_tools(tmp_path_factory):
 read -r cmd
 case "$cmd" in
 ps)
+ if [ -f "$EXPMAN_TEST_CLIENTS/fail-mps-ps-once" ]; then
+  rm "$EXPMAN_TEST_CLIENTS/fail-mps-ps-once"
+  exit 1
+ fi
  echo "$PPID" >> "$EXPMAN_TEST_CLIENTS/$CUDA_VISIBLE_DEVICES"
  echo "$PPID 1 2 $CUDA_VISIBLE_DEVICES";;
 quit|terminate_client*) exit 0;;

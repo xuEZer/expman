@@ -45,6 +45,7 @@ class Worker:
     gpu_cap_kb: float = 0.0
     mps_client: tuple[int, int] | None = None
     mps_slots_full: bool = False
+    mps_registration_error: str | None = None
 
     expected: StageDuration | None = None
     area: float = 0.0
@@ -90,6 +91,8 @@ class Worker:
                 self.mps_client = (message["server"], message["pid"])
             elif kind == "mps_slots_full":
                 self.mps_slots_full = True
+            elif kind == "mps_registration_error":
+                self.mps_registration_error = message["detail"]
             elif kind == "startup_failed":
                 self.finished = StageResult(
                     self.experiment.run_id,

@@ -50,7 +50,14 @@ def test_mps_verification_requires_our_pid_on_our_device(query, monkeypatch):
     pid = os.getpid()
     for row in ("", f"{pid + 1} 1 2 GPU-abcd", f"{pid} 1 2 GPU-other"):
         query.return_value.stdout = row
-        with pytest.raises(RuntimeError, match="did not register"):
+        with pytest.raises(mps.MpsRegistrationError, match="did not register"):
             mps.verify_client()
     query.return_value.stdout = f"{pid} 1 2 GPU-abcd"
     mps.verify_client()
+
+
+def test_mps_query_timeout_is_a_registration_error(query, monkeypatch):
+    monkeypatch.setattr(mps, "_retain_primary_context", lambda: None)
+    query.side_effect = subprocess.TimeoutExpired(mps.CONTROL, 10)
+    with pytest.raises(mps.MpsRegistrationError, match="timed out"):
+        mps.verify_client()

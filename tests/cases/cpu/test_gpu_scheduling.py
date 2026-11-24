@@ -175,6 +175,7 @@ def _worker(**fields):
         "gpu_used_kb": 0.0,
         "gpu_cap_kb": float("inf"),
         "mps_slots_full": False,
+        "mps_registration_error": None,
         "finished": None,
         "limit": None,
     }
@@ -226,13 +227,18 @@ class TestGpuScheduling:
         monkeypatch.setattr(settings, "poll_interval", 0.01)
 
     @pytest.mark.simulated_gpu
-    @pytest.mark.parametrize("cards", [[0, 1], [0]])
+    @pytest.mark.parametrize(
+        ("cards", "failure"), [([0, 1], "808"), ([0], "808"), ([0], "ps")]
+    )
     def test_mps_startup_rejection_requeues_with_zero_retries(
-        self, tmp_path, monkeypatch, cards
+        self, tmp_path, monkeypatch, cards, failure
     ):
-        reject_once = tmp_path / "reject-mps-client"
-        reject_once.touch()
-        monkeypatch.setenv("EXPMAN_TEST_MPS_REJECT_ONCE", str(reject_once))
+        if failure == "808":
+            reject_once = tmp_path / "reject-mps-client"
+            reject_once.touch()
+            monkeypatch.setenv("EXPMAN_TEST_MPS_REJECT_ONCE", str(reject_once))
+        else:
+            (tmp_path / "fail-mps-ps-once").touch()
         monkeypatch.setattr(settings, "retries", 0)
         # With a second card, it must be used while the rejected card backs off.
         monkeypatch.setattr(
@@ -254,7 +260,11 @@ class TestGpuScheduling:
             batch.experiments[0].output_dir / "attempts/stage-0/1/output.log"
         ).read_text()
         assert f"GPU {first} (GPU-test-{first})" in log
-        assert "cuDevicePrimaryCtxRetain: CUDA error 808" in log
+        if failure == "808":
+            assert "cuDevicePrimaryCtxRetain: CUDA error 808" in log
+        else:
+            assert "nvidia-cuda-mps-control" in log
+            assert batch._scheduler._mps_capacity == {}
 
     @pytest.mark.parametrize("hard_limit", [0, 2])
     def test_mps_limit_grows_only_when_an_extra_client_registers(

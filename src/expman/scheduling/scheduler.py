@@ -697,7 +697,7 @@ class GpuScheduler:
         _close_stdin(worker.process)
         self._read_workers((worker,))
         device = worker.device
-        if worker.mps_slots_full:
+        if worker.mps_slots_full or worker.mps_registration_error is not None:
             with self.batch._state_lock:
                 self._release_worker(run_id, worker)
                 # Keep this startup's attempt number and log. No Stage ran.
@@ -708,7 +708,11 @@ class GpuScheduler:
                     stage_index=worker.stage_index,
                     stage_attempt=worker.stage_attempt,
                     device=device,
-                    detail="MPS 客户端名额已满（CUDA 808），任务已回队",
+                    detail=(
+                        "MPS 客户端名额已满（CUDA 808），任务已回队"
+                        if worker.mps_slots_full
+                        else f"MPS 注册检查失败，任务已回队。{worker.mps_registration_error}"
+                    ),
                 )
                 self.batch._save()
             return

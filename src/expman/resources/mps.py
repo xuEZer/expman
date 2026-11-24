@@ -15,6 +15,10 @@ class MpsClientLimitReached(RuntimeError):
     """CUDA refused a new client because the device's MPS client slots are full."""
 
 
+class MpsRegistrationError(RuntimeError):
+    """The MPS process query could not confirm this worker's registration."""
+
+
 class MpsService:
     """One private pipe directory for this batch, across all configured GPUs."""
 
@@ -148,9 +152,17 @@ def _retain_primary_context():
 def verify_client():
     """Check MPS membership before importing or executing user code."""
     _retain_primary_context()
-    result = subprocess.run(
-        [CONTROL], input="ps\n", capture_output=True, text=True, check=True, timeout=10
-    )
+    try:
+        result = subprocess.run(
+            [CONTROL],
+            input="ps\n",
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise MpsRegistrationError(str(error)) from error
     pid = str(os.getpid())
     uuid = os.environ["CUDA_VISIBLE_DEVICES"]
     # R570 prints only a prefix of the UUID in the DEVICE column.
@@ -164,7 +176,7 @@ def verify_client():
             and uuid.startswith(fields[3])
         ):
             return int(fields[2])
-    raise RuntimeError(f"MPS did not register worker PID {pid} on {uuid}")
+    raise MpsRegistrationError(f"MPS did not register worker PID {pid} on {uuid}")
 
 
 if __name__ == "__main__":

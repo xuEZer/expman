@@ -162,6 +162,8 @@ def main():
         )
         if isinstance(error, mps.MpsClientLimitReached):
             channel.send({"type": "mps_slots_full"})
+        elif isinstance(error, mps.MpsRegistrationError):
+            channel.send({"type": "mps_registration_error", "detail": str(error)})
         else:
             channel.send(
                 {
