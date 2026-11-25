@@ -34,64 +34,6 @@ def render_js(function, payload):
     return json.loads(result.stdout)
 
 
-def render(rows, *, elapsed=300.0, marks=()):
-    return render_js(
-        "timeline",
-        {"gantt": rows, "batch": {"elapsed_seconds": elapsed, "session_marks": marks}},
-    )
-
-
-def row(run, start, end, *, reused=False, status="succeeded", attempt=1):
-    return {
-        "run": run,
-        "stage_index": 0,
-        "stage": "Work",
-        "attempt": attempt,
-        "start_seconds": start,
-        "end_seconds": end,
-        "status": status,
-        "reused": reused,
-    }
-
-
-def test_serial_attempts_share_one_lane_and_cache_hits_do_not_extend_the_axis():
-    html = render(
-        [
-            row("first", 120, 140),
-            row("second", 150, 170),
-            row("reuse", 350, 350, reused=True),
-        ],
-        elapsed=200,
-    )
-
-    assert html.count('class="gantt-lane"') == 1
-    assert html.count('class="gantt-bar ') == 2
-    assert "left:60%;width:10%" in html
-    assert "left:75%;width:10%" in html
-
-
-def test_overlaps_and_a_running_retry_use_their_real_lanes():
-    html = render(
-        [
-            row("retry", 120, 180, status="cancelled"),
-            row("other", 150, 200),
-            row("retry", 210, 300, status="running", attempt=2),
-        ],
-        marks=[205],
-    )
-
-    assert html.count('class="gantt-lane"') == 2
-    assert html.count('class="gantt-bar ') == 3
-    assert 'class="gantt-bar warn"' in html
-    assert "retry · Work a2" in html
-    assert "left:70%;width:30%" in html
-    assert 'class="gantt-fold"' in html
-
-
-def test_reuse_only_history_shows_the_empty_timeline():
-    assert "暂无带起止时刻的尝试记录" in render([row("reuse", 120, 120, reused=True)])
-
-
 def test_worker_bars_scale_usage_to_the_assigned_limits():
     gib = 1024**2
     html = render_js(

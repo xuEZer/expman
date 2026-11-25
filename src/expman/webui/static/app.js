@@ -14,8 +14,6 @@ const state = {
 const KIND = { launch: "启动", finish: "结束", reuse: "复用", shed: "撤销", probe: "探测" };
 const STATUS_TEXT = { running: "运行中", stopped: "已停止", finished: "已完成", failed: "有失败" };
 const STATUS_CLASS = { running: "ok", stopped: "warn", finished: "", failed: "bad" };
-// Each Gantt bar uses the status of its own attempt, including live attempts.
-const BAR_CLASS = { succeeded: "ok", failed: "bad", cancelled: "warn" };
 const SOURCE_TEXT = {
   last: "最近一次采样",
   archive: "持久化记录",
@@ -233,59 +231,6 @@ function workerRow(w) {
     workerMemoryBar(gpu.used_kb, allocationKb(gpu)) + "</div>";
 }
 
-function timeline(s) {
-  const attempts = (s.gantt || []).filter((r) => !r.reused);
-  const marks = (s.batch && s.batch.session_marks) || [];
-  if (!attempts.length)
-    return '<div class="card empty">暂无带起止时刻的尝试记录</div>';
-  // Use batch elapsed time or the latest recorded end, whichever is greater.
-  // Both exclude downtime between invocations. Fold marks show resume points.
-  const span = Math.max(
-    ...[attempts.map((r) => r.end_seconds), (s.batch || {}).elapsed_seconds || 0]
-      .flat().filter(ok), 0,
-  );
-  if (!ok(span) || span <= 0)
-    return '<div class="card empty">批次才开始，还没有可画的时间线</div>';
-  // Attempts are sorted by start time. Reuse the first lane whose previous
-  // attempt has ended, adding a lane when every existing one is occupied.
-  const lanes = [];
-  attempts.forEach((r) => {
-    const start = Math.max(0, r.start_seconds);
-    let lane = lanes.findIndex((free) => free <= start + 1e-9);
-    if (lane === -1) { lane = lanes.length; lanes.push(0); }
-    lanes[lane] = r.end_seconds;
-    r._lane = lane;
-  });
-  const bars = attempts.map((r) => {
-    const left = pctOf(r.start_seconds, span);
-    const raw = pctOf(r.end_seconds - r.start_seconds, span);
-    // Keep very short attempts visible.
-    const width = Math.max(raw, 0.4);
-    const cls = "gantt-bar " + (BAR_CLASS[r.status] || "");
-    const label = esc(r.run);
-    return '<span class="' + cls + '" style="left:' + left + "%;width:" + width + '%" title="' +
-      esc(r.run) + " · " + esc(r.stage || "S" + r.stage_index) + " a" + esc(r.attempt) +
-      " · " + secs(r.start_seconds) + "～" + secs(r.end_seconds) + '">' + label + "</span>";
-  });
-  const body = lanes.map((_, lane) => {
-    const here = bars.filter((_, i) => attempts[i]._lane === lane).join("");
-    return '<div class="gantt-lane">' + here + "</div>";
-  }).join("");
-  const folds = marks.filter((m) => m > 0 && m < span).map((m) =>
-    '<span class="gantt-fold" style="left:' + pctOf(m, span) + '%" title="此处中断过，之后恢复"></span>'
-  ).join("");
-  const ticks = [0, 0.25, 0.5, 0.75, 1].map((fraction) => {
-    const text = fraction === 0 ? "0" : compact(span * fraction);
-    const place = fraction === 0
-      ? ""
-      : fraction === 1 ? ";transform:translateX(-100%)" : ";transform:translateX(-50%)";
-    return '<span class="tl-tick" style="left:' + fraction * 100 + "%" + place + '">' + esc(text) + "</span>";
-  }).join("");
-  return '<div class="card"><div class="gantt">' + body +
-    '<div class="gantt-axis">' + ticks + folds + "</div></div></div>";
-}
-
-
 function totalAllocation(workers, kind) {
   let total = 0;
   for (const worker of workers) {
@@ -365,7 +310,6 @@ function statusBody(detail) {
   let html = tiles(detail) + stages(detail);
   html += section("运行中的尝试",
     live ? workers(detail) : '<div class="card empty">没有实时 worker 数据</div>');
-  html += section("并发时间线", timeline(detail));
   html += live ? resources(detail) : unavailable("资源分配", "没有实时采样");
   html += live ? events(detail) : unavailable("调度事件", "没有实时事件");
   return html;
