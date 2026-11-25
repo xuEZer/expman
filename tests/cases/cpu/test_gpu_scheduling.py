@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -60,8 +61,8 @@ class GpuWork(Stage):
             if index == 0:
                 (root / f"{ctx.run_id}.started").write_text(str(os.getpid()))
                 state["saved"] += 1
-                (root / f"{ctx.run_id}.checkpoint").touch()
                 ctx.checkpoint(index + 1, state)
+                (root / f"{ctx.run_id}.checkpoint").touch()
                 continue
             if ctx.cfg["crash"]:
                 os._exit(7)
@@ -69,7 +70,7 @@ class GpuWork(Stage):
                 ctx.log_metrics({"train": {"loss": step}}, step=step)
             try:
                 if ctx.attempt == 1:
-                    deadline = monotonic() + 5
+                    deadline = monotonic() + 30
                     while (
                         ctx.cfg["wait_for_release"] and not (root / "release").exists()
                     ):
@@ -160,6 +161,15 @@ class Host:
     def sample(self):
         # Roomy in bytes, with no swap in use: the reading admits launches.
         return HostMemory(64 * 1024**2, 48 * 1024**2, 0, 0)
+
+
+@pytest.fixture
+def no_host_memory_limit(monkeypatch):
+    """Exercise scheduler decisions with real workers and no per-worker cgroup."""
+    monkeypatch.setattr(
+        "expman.resources.limits.memory_limit",
+        lambda unit, estimate: MemoryLimit((), None, 0, "none"),
+    )
 
 
 def _worker(**fields):
@@ -1111,7 +1121,9 @@ class TestGpuScheduling:
         assert not list((output_dir / "cache").rglob("*.pkl"))
 
     @pytest.mark.simulated_gpu
-    def test_unexpected_process_exit_exhausts_one_retry(self, tmp_path):
+    def test_unexpected_process_exit_exhausts_one_retry(
+        self, tmp_path, no_host_memory_limit
+    ):
         batch = make_batch(tmp_path, count=1, devices=[0], crash=True)
         (result,) = batch.run()
         assert result.status is Status.FAILED
@@ -1205,27 +1217,36 @@ class TestGpuScheduling:
         assert first["gpu_process_peak_kb"] == 0
         assert first["gpu_retry_floor_kb"] > 0
 
-    def test_nearing_unverified_host_limit_does_not_mask_a_worker_crash(self, tmp_path):
+    @pytest.mark.parametrize("verified", [False, True])
+    def test_near_limit_sample_depends_on_worker_outcome(self, tmp_path, verified):
         scheduler = GpuScheduler(make_batch(tmp_path, count=1))
         worker = _worker(
-            limit=MemoryLimit((), None, 100.0, "none"),
+            limit=MemoryLimit((), None, 100.0, "systemd", verified=verified),
             peak_kb=99.0,
             memory_events={},
             cap_hit=False,
         )
         worker.process.returncode = 7
         assert scheduler._cap_report(worker) == (False, 99.0)
+        worker.finished = StageResult("run", 0, 1, Status.FAILED, 0.0, "ValueError")
+        worker.process.returncode = 0
+        assert scheduler._cap_report(worker) == (False, 99.0)
+        worker.finished = StageResult("run", 0, 1, Status.SUCCEEDED, 0.0)
+        assert scheduler._cap_report(worker) == (verified, 99.0)
 
-    @pytest.mark.parametrize(("peak", "refusal"), [(95.0, {}), (0.0, {"oom_kill": 1})])
+    @pytest.mark.parametrize(
+        ("peak", "refusal", "returncode"),
+        [(95.0, {}, 0), (0.0, {"oom_kill": 1}, 7), (0.0, {}, -signal.SIGKILL)],
+    )
     def test_host_cap_retry_uses_kernel_limit_even_if_usage_sample_was_missed(
-        self, tmp_path, peak, refusal
+        self, tmp_path, peak, refusal, returncode
     ):
         batch = make_batch(tmp_path, count=1)
         scheduler = GpuScheduler(batch)
         run_id = batch.state.queue[0]
         batch.state.start(run_id, 0, 0)
         worker = Worker(
-            Mock(returncode=7),
+            Mock(returncode=returncode),
             batch.by_id[run_id],
             0,
             "GPU-test-0",
@@ -1235,10 +1256,15 @@ class TestGpuScheduling:
             peak_kb=peak,
             memory_events=refusal,
         )
+        if returncode == 0:
+            worker.finished = StageResult(
+                run_id, 0, 1, Status.FAILED, 0.0, "MemoryError"
+            )
         scheduler.workers[run_id] = worker
         with patch("expman.scheduling.scheduler._kill_group"):
             scheduler._finish(run_id)
         row = batch.state.stage_history[-1]
+        assert batch.by_id[run_id].result.attempts[-1].error_type == "MemoryLimit"
         assert row["status"] == Status.CANCELLED.value
         assert row["peak_kb"] == peak
         assert row["host_retry_floor_kb"] == 100.0
@@ -1436,97 +1462,69 @@ class TestGpuScheduling:
         assert results[0].status is Status.SUCCEEDED
 
     @pytest.mark.simulated_gpu
-    def test_host_memory_pressure_sheds_newest_attempt_and_refills_on_recovery(
-        self, tmp_path
+    @pytest.mark.parametrize(
+        ("cards", "query_fails"),
+        [([0, 1], False), ([0], True)],
+        ids=["low-host-memory", "failed-host-query"],
+    )
+    def test_host_pressure_sheds_newest_attempt_and_refills_on_recovery(
+        self, tmp_path, no_host_memory_limit, recwarn, cards, query_fails
     ):
-        batch = warm(
-            make_batch(
-                tmp_path, count=2, devices=[0, 1], delay=0, wait_for_release=True
-            )
+        batch = make_batch(
+            tmp_path, count=2, devices=cards, delay=0, wait_for_release=True
         )
-        dropped = []
-        held = []
-        cards = []
-        original = Host.sample
-
-        def pressure(monitor):
-            active = list(batch.state.active_gpu)
-            if (
-                not dropped
-                and len(active) == 2
-                and all((tmp_path / f"{key}.checkpoint").exists() for key in active)
-            ):
-                dropped.append(active[-1])
-                cards.extend(batch.state.active_gpu.values())
-                return HostMemory(1000, 5, 0, 0)
-            if dropped and not (tmp_path / "release").exists():
-                held.append(len(batch.state.active_gpu))
-                if len(held) >= 5:
-                    (tmp_path / "release").touch()
-            return original(monitor)
-
-        with (
-            patch.object(settings, "host_reserve_kb", 2 * 1024**2),
-            patch.object(Host, "sample", pressure),
-        ):
-            results = batch.run()
-        assert dropped
-        # Two workers were active, so the shed worker could otherwise have been
-        # replaced immediately; host pressure must hold every refill globally.
-        assert len(cards) == 2
-        # The next healthy reading refills without waiting for the survivor.
-        assert max(held) > min(held)
-        shed = [
-            result
-            for result in results
-            if result.attempts[0].error_type == "MemoryPressure"
-        ]
-        assert shed
-        for result in shed:
-            assert result.attempts[0].status is Status.CANCELLED
-            assert result.status is Status.SUCCEEDED
-            assert len(result.attempts) == 2
-        assert all(item.status is Status.SUCCEEDED for item in results)
-
-    @pytest.mark.simulated_gpu
-    def test_failed_host_query_sheds_newest_attempt_and_pauses_launches(self, tmp_path):
-        batch = warm(make_batch(tmp_path, count=2, devices=[0], delay=0.05))
-        original = Host.sample
+        release = tmp_path / "release"
+        original_sample = Host.sample
         original_launch = GpuScheduler._launch
-        launches = []
-        failures = 0
-        failed_tick = False
+        pressure_readings = []
+        healthy = True
 
-        def counted(scheduler, device, memory, host, candidate):
-            if failed_tick:
-                pytest.fail("a failed query launched work in the same tick")
-            launches.append(device)
-            return original_launch(scheduler, device, memory, host, candidate)
-
-        def failing(monitor):
-            nonlocal failed_tick, failures
-            if failures < 2 and batch.state.active_gpu:
-                failures += 1
-                failed_tick = True
+        def sample(monitor):
+            nonlocal healthy
+            active = tuple(batch.state.active_gpu)
+            if not pressure_readings and (
+                len(active) != 2
+                or not all(
+                    (tmp_path / f"{run_id}.checkpoint").exists() for run_id in active
+                )
+            ):
+                return original_sample(monitor)
+            healthy = len(pressure_readings) >= 2
+            if healthy:
+                return original_sample(monitor)
+            pressure_readings.append(active)
+            if query_fails:
                 raise MemoryObservationError("meminfo unavailable")
-            failed_tick = False
-            return original(monitor)
+            return HostMemory(1000, 5, 0, 0)
+
+        def launch(scheduler, device, memory, host, candidate):
+            assert healthy, "launched a worker while the host reading was unhealthy"
+            launched = original_launch(scheduler, device, memory, host, candidate)
+            if launched and pressure_readings:
+                oldest, newest = pressure_readings[0]
+                assert candidate.run_id == newest and oldest in scheduler.workers
+                release.touch()  # The survivor can finish once the retry starts.
+            return launched
 
         with (
-            patch.object(Host, "sample", failing),
-            patch.object(GpuScheduler, "_launch", counted),
-            pytest.warns(RuntimeWarning),
+            patch.object(Host, "sample", sample),
+            patch.object(GpuScheduler, "_launch", launch),
         ):
             results = batch.run()
-        assert failures == 2
-        shed = [
-            attempt
-            for result in results
-            for attempt in result.attempts
-            if attempt.error_type == "MemoryPressure"
-        ]
-        assert 1 <= len(shed) <= 2
-        assert all(item.status is Status.SUCCEEDED for item in results)
+
+        assert len(pressure_readings) == 2
+        oldest, newest = pressure_readings[0]
+        assert pressure_readings[1] == (oldest,)
+        assert release.exists()
+        warned = any("meminfo unavailable" in str(w.message) for w in recwarn)
+        assert warned == query_fails
+        assert all(result.status is Status.SUCCEEDED for result in results)
+        attempts = {result.run_id: result.attempts for result in results}
+        assert len(attempts[oldest]) == 1
+        cancelled, succeeded = attempts[newest]
+        assert cancelled.status is Status.CANCELLED
+        assert cancelled.error_type == "MemoryPressure"
+        assert succeeded.status is Status.SUCCEEDED
 
     @pytest.mark.simulated_gpu
     def test_failed_memory_query_pauses_launches_without_stopping_the_batch(

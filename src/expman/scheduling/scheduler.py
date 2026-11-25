@@ -284,7 +284,7 @@ class GpuScheduler:
         return max(running, key=lambda run_id: running[run_id].started)
 
     def _cap_report(self, worker):
-        """Return the cgroup result last reported by the worker over IPC."""
+        """Classify host limit evidence using the worker's result and cgroup."""
         exit_events = {} if worker.limit is None else limits.events(worker.limit.cgroup)
         capped = (
             worker.cap_hit
@@ -293,13 +293,17 @@ class GpuScheduler:
         )
         peak = worker.peak_kb
         if not capped and worker.limit is not None and worker.limit.capped:
-            # A peak that reached the limit, or a SIGKILL with no recorded cause,
-            # is this attempt's cap rather than an unrelated crash: the counters on
-            # the kill path can miss the window, and the remedy is the same.
-            effective_cap = worker.host_limit_kb or worker.limit.cap_kb
-            capped = limits.near_cap(peak, effective_cap) or (
-                worker.process.returncode == -signal.SIGKILL
-            )
+            result = worker.finished
+            if result is None:
+                # An OOM kill can precede the final cgroup sample.
+                capped = worker.process.returncode == -signal.SIGKILL
+            elif (
+                result.status is Status.SUCCEEDED or result.error_type == "MemoryError"
+            ):
+                # A near-limit sample informs sizing for completed work and
+                # corroborates a reported allocation failure.
+                effective_cap = worker.host_limit_kb or worker.limit.cap_kb
+                capped = limits.near_cap(peak, effective_cap)
         return capped, peak
 
     def _shed(self, run_id, kind, device=None):

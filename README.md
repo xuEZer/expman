@@ -478,7 +478,7 @@ with sqlite3.connect("file:metrics.sqlite3?mode=ro", uri=True) as db:
 - 同一卡上的 worker 共用一次进程显存查询。每轮采样时，批次调度器只查询有活跃 MPS 客户端的卡，按客户端 PID 更新各 worker 的当前显存用量，并记录每次尝试采到的最高值。
 - 同一阶段内，重试任务优先进入候选，其余任务按就绪队列顺序选取。调度器轮流从各阶段取候选，再根据剩余主机内存和各卡剩余显存选择本轮派发的组合。
 - 调度器按预估峰值为 worker 预留资源。主机内存和显存的硬上限分别按对应的预估峰值 × `capacity_factor` 计算，系数默认为 1.10。例如，预估峰值为 200 MiB 时，预留 200 MiB，硬上限为 220 MiB。显存上限受所选 GPU 的物理容量限制，通过 MPS 以整 MiB 请求。主机使用可用的 cgroup 机制施加内存上限。缺少独立 cgroup 读数时，worker 尝试读取自身的 RSS 和历史峰值。快照分别记录资源预算、实际用量和已核验的上限。
-- 调度器根据采样结果决定是否暂停派发或减载。被确认为资源限额导致的失败会重新估价并入队。每次尝试的标准输出和错误输出位于 `experiments/<run_id>/attempts/stage-<index>/<attempt>/output.log`。
+- 调度器根据采样结果决定是否暂停派发或减载。资源限额导致的失败会重新估价并入队。若 cgroup 没有记录内存拒绝，worker 主动以非零状态退出或 Stage 抛出普通业务异常时，按 Stage 的重试次数处理，即使内存峰值接近上限也是如此。每次尝试的标准输出和错误输出位于 `experiments/<run_id>/attempts/stage-<index>/<attempt>/output.log`。
 - worker 通过 pickle 接收 Pipeline。请在可导入的模块顶层定义 Stage 类，并把 Pipeline 实例赋给 `expman run` 指定的模块属性。worker 的标准输入用于检测父进程退出。
 
 ## 随机种子与随机状态恢复
