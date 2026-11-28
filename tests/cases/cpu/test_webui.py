@@ -902,6 +902,9 @@ class TestDashboard:
             status, _, headers = self.get(url)
             assert status == 200 and headers["ETag"]
             conditional = Request(url, headers={"If-None-Match": headers["ETag"]})
+            metrics.log(second, (0,), 0, 1, [('["score"]', 99.0), ('["loss"]', 4.0)])
+            assert self.get(conditional)[:2] == (304, b"")
+            assert layout.call_count == initial_calls + 2
             metrics.log(second, (0,), None, 2, [('["score"]', 5.0)])
             dashboard.refresh()
             status, content, _ = self.get(conditional)

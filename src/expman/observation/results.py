@@ -108,6 +108,7 @@ def _metrics(
     rows: dict[str, _Row],
     plot_keys: dict[tuple[str, str], str] | None = None,
 ) -> tuple[list[_Column], set[str]]:
+    """Read summary values for the table or latest values for the plot catalog."""
     stepped: set[str] = set()
     if connection is None:
         return [], stepped
@@ -118,17 +119,25 @@ def _metrics(
             "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='metrics'"
         ).fetchone():
             return [], stepped
-        # Summary metrics use step -1, below every explicit step.
-        for run_id, stage_json, metric_json, step, value in connection.execute(
-            """WITH latest AS (
-                   SELECT run_id, stage_path, metric_path, MAX(step) AS step
-                   FROM metrics
-                   GROUP BY run_id, stage_path, metric_path
-               )
-               SELECT run_id, stage_path, metric_path, step, value
-               FROM latest JOIN metrics USING (run_id, stage_path, metric_path, step)
-               ORDER BY run_id, stage_path, metric_path"""
-        ):
+        if plot_keys is None:
+            # MetricStore uses -1 for values logged without an explicit step.
+            query = """
+                SELECT run_id, stage_path, metric_path, step, value
+                FROM metrics WHERE step = -1
+                ORDER BY run_id, stage_path, metric_path
+            """
+        else:
+            query = """
+                WITH latest AS (
+                    SELECT run_id, stage_path, metric_path, MAX(step) AS step
+                    FROM metrics
+                    GROUP BY run_id, stage_path, metric_path
+                )
+                SELECT run_id, stage_path, metric_path, step, value
+                FROM latest JOIN metrics USING (run_id, stage_path, metric_path, step)
+                ORDER BY run_id, stage_path, metric_path
+            """
+        for run_id, stage_json, metric_json, step, value in connection.execute(query):
             if run_id not in rows:
                 continue
             stage, metric = (
@@ -193,9 +202,8 @@ def read_results(
 ) -> tuple[list[_Column], list[_Column], list[_Row]]:
     """Read one sparse row per manifest run, in YAML expansion order.
 
-    Missing cells have no key. Each stage and metric path supplies one column,
-    using the highest recorded step for each run in the caller's database
-    snapshot. Pass None until the first metric database exists.
+    Only metrics logged without a step supply columns. Missing summary values
+    have no key. Pass None until the first metric database exists.
     """
     variables, rows = _config_rows(directory)
     metrics, _ = _metrics(connection, rows)

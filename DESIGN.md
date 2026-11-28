@@ -131,7 +131,7 @@ CLI 和 Web 看板共用所选批次父目录下的 `.batches.sqlite3`，默认�
 
 “实验结果”和“自动绘图”共用最近访问的 16 个批次的缓存。每批可保留结果表和最近一次请求的绘图数据。`experiments/` 目录条目变化、指标库文件被创建、移除或替换，或同一只读连接的 `PRAGMA data_version` 显示有新提交时，服务端会在下次请求时重读数据。浏览器刷新时带上对应响应的 ETag，内容相同则返回 HTTP 304。[Web 服务](src/expman/webui/server.py)
 
-结果表按 run ID 关联配置与 SQLite 指标，对每个 run、阶段和指标取最大 step 对应的值。展示数据变化时，服务端通过单变量对照重新计算依赖和列顺序。绘图接口 `GET /api/batch/<ID>/plot` 共用这套对照逻辑，通过阶段路径和指标路径标识一条指标，并返回它是否有显式 step。[结果读取](src/expman/observation/results.py) · [依赖判断](src/expman/observation/metric_relations.py) · [结果表排序](src/expman/webui/result_layout.py)
+结果表按 run ID 关联全部配置与 SQLite 中 `step = -1` 的汇总值，仅为写过汇总值的指标建列。展示数据变化时，服务端通过单变量对照重新计算依赖和列顺序。绘图接口 `GET /api/batch/<ID>/plot` 共用这套对照逻辑，通过阶段路径和指标路径标识一条指标，并返回它是否有显式 step。[结果读取](src/expman/observation/results.py) · [依赖判断](src/expman/observation/metric_relations.py) · [结果表排序](src/expman/webui/result_layout.py)
 
 当 X 轴为 `step` 或有 step 历史的指标时，浏览器用重复的 `metric` 参数请求所有带 step 指标的历史，以便筛选 Y 轴。服务端在同一 SQLite 读事务中读取各指标的最新值和所请求的历史，补写较早的 step 也可以更新曲线。浏览器以 JavaScript Number 读取步数，超过 `2^53 − 1` 时可能将相邻步数视为相同。变量控制通过比较不同 run 在同一 X 处的 Y 值生成。指标作横轴时，单条轨迹或多条完全重合的轨迹保留观测顺序。需要汇总时，浏览器按 X 计算均值，在该指标的相关控制变量保留多个取值且观测值有差异时绘制误差棒。[选轴与刷新](src/expman/webui/static/plot-panel.js) · [聚合与绘图](src/expman/webui/static/plot.js)
 
